@@ -1,0 +1,30 @@
+# 统一换行符：仓库里一律 LF，检出时按平台决定。
+# 不写这个的话，Windows 上提交会把 LF 变成 CRLF，diff 里整文件都算改动。
+* text=auto eol=lf
+
+# 二进制：绝不做换行符转换
+*.ico  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.exe  binary
+*.dll  binary
+*.zip  binary
+*.7z   binary
+
+# 这些文件在 Git 里保持 LF，避免 Windows 上编辑后产生噪音 diff
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.cjs   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.ps1   text eol=crlf
+
+# 语言统计：把文档和锁文件排除，让 GitHub 的语言条更准确
+package-lock.json linguist-generated=true
+docs/**           linguist-documentation=true

@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <!--
+    渲染页 CSP。逐项都是"关掉一类能力"，不留默认放行：
+      default-src 'none'        未列出的全部禁止（含 connect-src —— 本页面不需要任何网络请求，
+                                所有网络都由主进程代劳；于是即使页面被注入也发不出数据）
+      script-src 'self'         只跑自带脚本；没有 unsafe-inline / unsafe-eval
+      style-src 'self' 'unsafe-inline'  —— 必须留 inline：界面大量使用 style="…" 属性
+      img-src 'self' data:      图标是程序化生成的内联 PNG
+      base-uri 'none'           防注入 <base href> 把相对脚本路径指到外部
+      form-action 'none'        防注入表单把数据 POST 出去
+      object-src / frame-src / worker-src / media-src / manifest-src 'none'  一律不用
+    （frame-ancestors 在 meta 里无效，只作占位说明；本程序不加载任何外部页面。）
+  -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'; worker-src 'none'; media-src 'none'; manifest-src 'none';" />
+  <title>LLM Gateway</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- ============ 顶栏 ============ -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" id="brandLogo"></span>
+      <span class="brand-name">LLM Gateway</span>
+      <span class="brand-ver" id="brandVer"></span>
+    </div>
+
+    <div class="topbar-mid">
+      <span class="pill" id="statusPill"><i class="dot"></i><span id="statusText">载入中…</span></span>
+      <span class="topbar-meta" id="endpointText"></span>
+    </div>
+
+    <div class="topbar-actions">
+      <button class="btn btn-ghost" id="btnOpenData" title="打开数据目录">数据目录</button>
+      <button class="btn btn-primary" id="btnStart">启动</button>
+      <button class="btn" id="btnStop">停止</button>
+      <button class="btn" id="btnRestart">重启</button>
+    </div>
+  </header>
+
+  <!-- ============ 未保存提示条 ============ -->
+  <div class="dirtybar hidden" id="dirtyBar">
+    <span class="dirty-icon">●</span>
+    <span id="dirtyText">配置有未保存的更改</span>
+    <span class="spacer"></span>
+    <button class="btn btn-ghost" id="btnDiscard">放弃更改</button>
+    <button class="btn btn-primary" id="btnSaveConfig">保存并生效 (Ctrl+S)</button>
+  </div>
+
+  <div class="layout">
+    <!-- ============ 左侧导航 ============ -->
+    <nav class="sidenav" id="sidenav">
+      <button class="nav-item active" data-view="dashboard">
+        <svg viewBox="0 0 24 24"><path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg>
+        <span>概览</span>
+      </button>
+      <button class="nav-item" data-view="providers">
+        <svg viewBox="0 0 24 24"><path d="M4 6h16v2H4V6zm0 5h16v2H4v-2zm0 5h10v2H4v-2zm13 0h3v2h-3v-2zm0-5h3v2h-3v-2z"/></svg>
+        <span>供应商</span><em class="nav-badge" id="navCountProviders"></em>
+      </button>
+      <button class="nav-item" data-view="models">
+        <svg viewBox="0 0 24 24"><path d="M12 2 3 7v10l9 5 9-5V7l-9-5zm0 2.3 6.5 3.6L12 11.5 5.5 7.9 12 4.3zM5 9.6l6 3.3v6.5l-6-3.3V9.6zm8 9.8v-6.5l6-3.3v6.5l-6 3.3z"/></svg>
+        <span>模型</span><em class="nav-badge" id="navCountModels"></em>
+      </button>
+      <button class="nav-item" data-view="clients">
+        <svg viewBox="0 0 24 24"><path d="M4 4h16v12H4V4zm0 14h7v2H4v-2zm9 0h7v2h-7v-2zM6 6v8h12V6H6z"/></svg>
+        <span>客户端接入</span>
+      </button>
+      <button class="nav-item" data-view="settings">
+        <svg viewBox="0 0 24 24"><path d="M19.14 12.94a7.5 7.5 0 0 0 .06-.94 7.5 7.5 0 0 0-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.62l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.03 7.03 0 0 0-1.63-.94l-.36-2.54a.5.5 0 0 0-.49-.42h-3.84a.5.5 0 0 0-.49.42l-.36 2.54c-.59.24-1.13.56-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L2.68 8.86a.5.5 0 0 0 .12.62l2.03 1.58c-.04.31-.06.62-.06.94s.02.63.06.94l-2.03 1.58a.5.5 0 0 0-.12.62l1.92 3.32c.13.22.39.3.6.22l2.39-.96c.5.38 1.04.7 1.63.94l.36 2.54c.04.24.25.42.49.42h3.84c.24 0 .45-.18.49-.42l.36-2.54c.59-.24 1.13-.56 1.63-.94l2.39.96c.22.08.47 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.62l-2.03-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z"/></svg>
+        <span>设置</span>
+      </button>
+      <button class="nav-item" data-view="logs">
+        <svg viewBox="0 0 24 24"><path d="M4 4h16v16H4V4zm2 3v2h12V7H6zm0 4v2h12v-2H6zm0 4v2h8v-2H6z"/></svg>
+        <span>日志</span>
+      </button>
+      <div class="nav-foot">
+        <button class="nav-item" data-view="help">
+          <svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 15h-2v-2h2v2zm1.8-6.3-.9.9c-.6.6-.9 1.1-.9 2.4h-2v-.5c0-1 .4-1.9 1-2.5l1.2-1.2c.4-.3.6-.8.6-1.3a2 2 0 1 0-4 0H8a4 4 0 1 1 6.8 2.2z"/></svg>
+          <span>使用帮助</span>
+        </button>
+      </div>
+    </nav>
+
+    <!-- ============ 内容区 ============ -->
+    <main class="content" id="content">
+
+      <!-- ---------- 概览 ---------- -->
+      <section class="view active" id="view-dashboard">
+        <div class="grid grid-3">
+          <div class="card stat-card">
+            <div class="stat-label">网关状态</div>
+            <div class="stat-value"><i class="dot lg" id="dashDot"></i><span id="dashStatus">—</span></div>
+            <div class="stat-sub" id="dashHint">—</div>
+          </div>
+          <div class="card stat-card">
+            <div class="stat-label">供应商 / 模型</div>
+            <div class="stat-value"><span id="dashProviders">0</span><span class="stat-sep">/</span><span id="dashModels">0</span></div>
+            <div class="stat-sub" id="dashProvidersSub">—</div>
+          </div>
+          <div class="card stat-card">
+            <div class="stat-label">账户池</div>
+            <div class="stat-value" id="dashAccounts">—</div>
+            <div class="stat-sub" id="dashProxy">—</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>接入信息</h2><span class="hint">点任意一行即复制</span></div>
+          <div class="kv-list" id="dashEndpoints"></div>
+          <div class="row-inline" style="margin-top:12px;">
+            <button class="btn" id="btnRegenKey">重新生成统一 Key</button>
+            <button class="btn" id="btnCopyAll">复制全部接入信息</button>
+            <span class="hint" id="regenHint">重新生成后需要重跑「客户端接入」，否则旧配置会 401。</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>账户池与冷却</h2><button class="btn btn-ghost" id="btnRefreshHealth">刷新</button></div>
+          <div id="healthBox"><div class="empty">网关未运行，暂无数据。</div></div>
+        </div>
+      </section>
+
+      <!-- ---------- 供应商 ---------- -->
+      <section class="view" id="view-providers">
+        <div class="card">
+          <div class="card-head">
+            <h2>供应商</h2>
+            <div class="head-actions">
+              <input type="search" id="pvSearch" class="input search" placeholder="搜索 id / 地址 / 模型…" />
+              <button class="btn" id="btnTestAll">测试全部连通性</button>
+              <button class="btn btn-primary" id="btnAddProvider">＋ 添加供应商</button>
+            </div>
+          </div>
+          <p class="hint block">
+            路由顺序 = <b>priority 升序</b>，同一 priority 内按<b>列表顺序</b>（可直接拖拽调整）。
+            拖动只改数组顺序，不改 priority —— 跨优先级调序请改 priority 数字。
+          </p>
+          <div class="prov-list" id="provList"></div>
+          <div class="empty hidden" id="provEmpty">还没有供应商。点右上角「＋ 添加供应商」开始。</div>
+        </div>
+      </section>
+
+      <!-- ---------- 模型 ---------- -->
+      <section class="view" id="view-models">
+        <div class="card">
+          <div class="card-head">
+            <h2>模型总览</h2>
+            <div class="head-actions">
+              <input type="search" id="mdSearch" class="input search" placeholder="搜索模型名…" />
+              <label class="chk"><input type="checkbox" id="mdOnlyVision" /> 只看支持图片</label>
+            </div>
+          </div>
+          <p class="hint block">这是<b>客户端能选到的模型清单</b>（网关只认这里出现过的逻辑模型名）。只有一家提供的模型会有单点风险标记。</p>
+          <div class="table-wrap"><table class="tbl" id="modelTable">
+            <thead><tr><th>逻辑模型名</th><th>提供方</th><th>图片</th><th>上下文</th><th>最大输出</th></tr></thead>
+            <tbody></tbody>
+          </table></div>
+          <div class="empty hidden" id="modelEmpty">没有任何启用的供应商声明了模型。</div>
+        </div>
+      </section>
+
+      <!-- ---------- 客户端接入 ---------- -->
+      <section class="view" id="view-clients">
+        <div class="card">
+          <div class="card-head"><h2>客户端接入</h2><button class="btn btn-ghost" id="btnRedetect">重新检测</button></div>
+          <p class="hint block">
+            一键把本网关写入各客户端的配置。<b>每次写入前都会先备份原文件</b>（<code>.bak-llmgateway</code>），
+            随时可一键恢复。写入前请先「预览」，看清到底改了什么。
+          </p>
+          <div class="client-grid" id="clientGrid"></div>
+        </div>
+      </section>
+
+      <!-- ---------- 设置 ---------- -->
+      <section class="view" id="view-settings">
+        <div class="card">
+          <div class="card-head"><h2>网关</h2></div>
+          <div class="form-grid">
+            <label>端口</label>
+            <div class="field">
+              <input type="number" id="stPort" class="input short" min="1" max="65535" />
+              <span class="hint">改动后需保存并重启网关</span>
+            </div>
+            <label>调用策略</label>
+            <div class="field">
+              <select id="stRouting" class="input">
+                <option value="failover">主备（按优先级，故障切换）</option>
+                <option value="round-robin">负载均衡（多供应商轮询分摊）</option>
+              </select>
+            </div>
+            <label>客户端仿真</label>
+            <div class="field">
+              <select id="stProfile" class="input">
+                <option value="">关闭（透传客户端标识，OpenAI 协议）</option>
+                <option value="claude">Claude Code（Anthropic 协议）</option>
+                <option value="codex">Codex（OpenAI 协议）</option>
+                <option value="cline">Cline（OpenAI 协议 + 身份头）</option>
+              </select>
+              <span class="hint">决定发往上游的请求头形态，也决定写入 dsh 时的协议（claude → Anthropic）</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>网络代理</h2></div>
+          <div class="form-grid">
+            <label>启用代理</label>
+            <div class="field">
+              <label class="switch"><input type="checkbox" id="stProxyEnabled" /><span></span></label>
+              <span class="hint">部分上游（需翻墙的中转）必须走代理</span>
+            </div>
+            <label>代理地址</label>
+            <div class="field"><input type="text" id="stProxyUrl" class="input" placeholder="http://127.0.0.1:7890" /></div>
+            <label>直连域名</label>
+            <div class="field">
+              <input type="text" id="stNoProxy" class="input" placeholder="a.com, b.com（逗号分隔，支持后缀）" />
+              <span class="hint">这些域名绕过代理。<b>127.0.0.1 / localhost 恒直连</b>（本机自检绝不走代理）</span>
+            </div>
+            <label>强制走代理</label>
+            <div class="field">
+              <input type="text" id="stForceProxy" class="input" placeholder="（可选）即使在内置直连清单里也强制走代理" />
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>应用</h2></div>
+          <div class="form-grid">
+            <label>启动时自动启动网关</label>
+            <div class="field"><label class="switch"><input type="checkbox" id="stAutoGw" /><span></span></label></div>
+            <label>关闭窗口时最小化到托盘</label>
+            <div class="field">
+              <label class="switch"><input type="checkbox" id="stMinTray" /><span></span></label>
+              <span class="hint">关掉后点 × 直接退出（网关也随之停止）</span>
+            </div>
+            <label>开机自启</label>
+            <div class="field"><label class="switch"><input type="checkbox" id="stAutoApp" /><span></span></label></div>
+            <label>开发者工具</label>
+            <div class="field"><label class="switch"><input type="checkbox" id="stDevTools" /><span></span></label></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>配置文件</h2></div>
+          <div class="kv-list" id="cfgPaths"></div>
+          <div class="row-inline" style="margin-top:12px;">
+            <button class="btn" id="btnImportCfg">从既有安装导入</button>
+            <button class="btn" id="btnImportFile">从文件导入…</button>
+            <button class="btn" id="btnExportCfg">导出配置…</button>
+            <button class="btn btn-ghost" id="btnRawJson">高级：直接编辑 JSON</button>
+          </div>
+          <div class="hidden" id="rawJsonBox" style="margin-top:12px;">
+            <textarea id="rawJson" class="code" rows="16" spellcheck="false"></textarea>
+            <div class="row-inline" style="margin-top:8px;">
+              <button class="btn btn-primary" id="btnRawApply">校验并应用</button>
+              <button class="btn btn-ghost" id="btnRawReload">放弃</button>
+              <span class="hint" id="rawHint"></span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ---------- 日志 ---------- -->
+      <section class="view" id="view-logs">
+        <div class="card fill">
+          <div class="card-head">
+            <h2>网关日志</h2>
+            <div class="head-actions">
+              <input type="search" id="logFilter" class="input search" placeholder="过滤关键字…" />
+              <label class="chk"><input type="checkbox" id="logAutoScroll" checked /> 自动滚动</label>
+              <button class="btn btn-ghost" id="btnLogClear">清屏</button>
+              <button class="btn btn-ghost" id="btnLogFile">打开日志文件</button>
+            </div>
+          </div>
+          <pre class="log" id="logBox"></pre>
+        </div>
+      </section>
+
+      <!-- ---------- 帮助 ---------- -->
+      <section class="view" id="view-help">
+        <div class="card">
+          <div class="card-head"><h2>怎么用</h2></div>
+          <ol class="help-list">
+            <li><b>配供应商</b>：在「供应商」页添加至少一家，填 Base URL 与 API Key，并把它的模型 ID 填进模型映射表。
+              不知道模型 ID 可以点编辑面板里的「拉取上游模型目录」。</li>
+            <li><b>启动网关</b>：右上角「启动」。状态变成绿色「运行中」即就绪。</li>
+            <li><b>接入客户端</b>：去「客户端接入」页，选目标 → 预览 → 写入。</li>
+            <li><b>排查</b>：任何"为什么走了这家 / 为什么失败"都能在「日志」页看到，每次请求都有一行 <code>[route]</code>。</li>
+          </ol>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>端点约定（最容易填错的地方）</h2></div>
+          <table class="tbl">
+            <thead><tr><th>客户端</th><th>Base URL</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td>Claude Code</td><td><code>http://127.0.0.1:&lt;端口&gt;</code></td><td><b>不带 /v1</b>，客户端自己拼 /v1/messages</td></tr>
+              <tr><td>Codex</td><td><code>http://127.0.0.1:&lt;端口&gt;/v1</code></td><td><b>要带 /v1</b>，Codex 在后面拼 /responses</td></tr>
+              <tr><td>dsh</td><td>由程序自动决定</td><td>协议跟随「客户端仿真」设置</td></tr>
+              <tr><td>OpenCode / Aider / 其它</td><td><code>http://127.0.0.1:&lt;端口&gt;/v1</code></td><td>OpenAI 兼容一律带 /v1</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>协议支持</h2></div>
+          <ul class="help-list">
+            <li><code>POST /v1/chat/completions</code> — OpenAI Chat Completions</li>
+            <li><code>POST /v1/responses</code> — OpenAI Responses（含取回 / 取消 / 删除 / input_items 子路由）</li>
+            <li><code>POST /v1/messages</code> — Anthropic Messages</li>
+            <li><code>GET /v1/models</code> · <code>GET /health</code></li>
+          </ul>
+          <p class="hint block">同一模型可配多家上游：按 priority 路由 + 自动故障切换 + 分级熔断 + 账户池轮换 + SSE 透传 + 密钥打码，三种协议行为一致。</p>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- ============ 供应商编辑面板（右侧抽屉） ============ -->
+  <div class="drawer-mask hidden" id="editorMask"></div>
+  <aside class="drawer hidden" id="editorDrawer">
+    <div class="drawer-head">
+      <h3 id="editorTitle">供应商配置</h3>
+      <button class="icon-btn" id="btnEditorClose" title="关闭">✕</button>
+    </div>
+    <div class="drawer-body" id="editorBody"></div>
+    <div class="drawer-foot">
+      <button class="btn btn-danger" id="btnEditorDelete">删除供应商</button>
+      <span class="spacer"></span>
+      <button class="btn btn-ghost" id="btnEditorCancel">取消</button>
+      <button class="btn btn-primary" id="btnEditorApply">应用</button>
+    </div>
+  </aside>
+
+  <!-- ============ 预览 / 结果弹窗 ============ -->
+  <div class="modal-mask hidden" id="modalMask">
+    <div class="modal" id="modal">
+      <div class="modal-head">
+        <h3 id="modalTitle">预览</h3>
+        <button class="icon-btn" id="btnModalClose">✕</button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-foot" id="modalFoot"></div>
+    </div>
+  </div>
+
+  <!-- ============ Toast ============ -->
+  <div class="toasts" id="toasts"></div>
+
+  <script src="js/core.js"></script>
+  <script src="js/dashboard.js"></script>
+  <script src="js/providers.js"></script>
+  <script src="js/models.js"></script>
+  <script src="js/clients.js"></script>
+  <script src="js/settings.js"></script>
+  <script src="js/logs.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,65 @@
+{
+  "name": "llm-gateway",
+  "productName": "LLM Gateway",
+  "version": "0.5.0",
+  "description": "通用桌面版 LLM 网关：多供应商统一代理（OpenAI / Anthropic / Responses 三协议）+ 一键写入 dsh / Claude Code / Codex 等客户端",
+  "main": "src/main.js",
+  "private": true,
+  "license": "MIT",
+  "author": "xuxue04403",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xuxue04403/llm-gateway.git"
+  },
+  "homepage": "https://github.com/xuxue04403/llm-gateway#readme",
+  "bugs": {
+    "url": "https://github.com/xuxue04403/llm-gateway/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "electron .",
+    "test": "node tests/unit.js && node tests/writers.test.js && node tests/edge.test.js && node tests/security.test.js && node tests/renderer.test.js && node tests/gateway.test.js",
+    "check": "node --check src/main.js && node --check src/gateway-manager.js && node --check src/writers/index.js",
+    "parity": "node scripts/check-engine-parity.mjs",
+    "icon": "node scripts/make-icon.mjs",
+    "portable": "node scripts/build-portable.mjs",
+    "pack": "node scripts/make-icon.mjs && electron-builder --dir",
+    "dist": "node scripts/make-icon.mjs && electron-builder --win nsis portable"
+  },
+  "devDependencies": {
+    "electron": "45.0.0-alpha.6",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.llmgateway.desktop",
+    "productName": "LLM Gateway",
+    "files": [
+      "src/**/*",
+      "renderer/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "win": {
+      "icon": "assets/llm-gateway.ico",
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "artifactName": "LLMGateway-${version}-${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "LLMGateway-Portable-${version}-x64.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "LLMGateway-Setup-${version}-x64.${ext}"
+    },
+    "directories": {
+      "output": "dist"
+    }
+  }
+}

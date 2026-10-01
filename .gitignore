@@ -1,0 +1,15 @@
+node_modules/
+out/
+dist/
+data/
+*.log
+
+# 运行/测试产物
+out/_smoke-data/
+out/_test-leak-settings.yaml
+
+# 备份（可能含真实密钥）
+*.bak-llmgateway
+*.bak-llmgateway-before-restore
+*.bak-import
+*.bak-broken
