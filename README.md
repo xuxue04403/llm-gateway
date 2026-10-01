@@ -1,5 +1,10 @@
 # LLM Gateway
 
+[![Release](https://img.shields.io/github/v/release/xuxue04403/llm-gateway?label=%E4%B8%8B%E8%BD%BD&color=2ea043)](https://github.com/xuxue04403/llm-gateway/releases/latest)
+[![License](https://img.shields.io/github/license/xuxue04403/llm-gateway?color=blue)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-253%20passed-2ea043)](#测试与校验)
+[![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4)](#下载)
+
 通用桌面版 LLM 网关。把十几种上游模型服务（OpenAI / Anthropic / 各家中转）聚合成**一个本地端点 + 一把 Key**，
 并支持**一键写入** dsh / Claude Code / Codex / iFlow / OpenCode 等客户端的配置。
 
@@ -7,7 +12,35 @@
 
 ---
 
-## 快速开始
+## 下载
+
+到 **[Releases](https://github.com/xuxue04403/llm-gateway/releases/latest)** 页面下载，三种形态按需选：
+
+| 文件 | 适合 | 数据位置 |
+|---|---|---|
+| `LLMGateway-Portable-<版本>-x64.exe` | **单文件绿色版**：丢进 U 盘或任意目录双击就跑 | exe 同级的 `data\` |
+| `LLMGateway-Setup-<版本>-x64.exe` | 安装版：可选安装目录、带开始菜单项 | 安装目录下的 `data\` |
+| `LLM-Gateway-<版本>.zip` | 绿色目录压缩包：解压即用，便于团队分发 | 目录内的 `data\` |
+
+**不需要预装 Node.js，也不需要 .NET 或任何运行库。** Windows x64。
+
+> 从 Releases 下载的 exe 建议核对 SHA256 —— 每个 Release 的说明里都附了校验和：
+> ```powershell
+> Get-FileHash .\LLMGateway-Portable-0.5.0-x64.exe -Algorithm SHA256
+> ```
+
+### 三步跑起来
+
+1. 双击运行 → 左侧「**供应商**」→ 添加你的上游：填 **Base URL** + **API Key**
+2. 点「**⚡ 一键获取全部模型**」→ 勾选要用的 → 应用到模型表
+3. 顶栏点「**启动网关**」→ 再到「**客户端接入**」页选目标 → **预览** 看 diff → **写入**
+
+首次启动会**自动尝试导入** dsh-app / DSH 桌面助手已有的 `gateway.config.json`（那里面是你的真实供应商与密钥），
+找不到就是空配置，自己加即可。
+
+---
+
+## 从源码构建
 
 ```powershell
 # 开发运行（源码树）
@@ -26,7 +59,12 @@ npm run portable
 #   out\LLM-Gateway-<版本>.zip                分发用 zip
 
 npm run icon     # 仅生成图标（程序化绘制，零外部素材）
+
+npm test         # 253 项测试，应全绿
+npm run parity   # 引擎差异校验：38 处声明改动、0 处未声明
 ```
+
+要求 Node.js ≥ 20。
 
 两种绿色形态都满足"免安装"，按需选：
 
@@ -254,6 +292,22 @@ scripts/               引擎一致性校验 / 绿色目录打包
   里重写了几十行纯函数，并用测试钉死"与引擎 `--write-dsh` 的实际输出一致"——代价远小于破坏"零差异"这个可验证性。
 - **配置编辑用内存工作副本**，点「保存并生效」才落盘并重启网关。有未保存改动时，写入客户端会明确警告
   （写入读的是磁盘上的配置）。
+
+---
+
+## 已知边界
+
+写在这里是为了让你**少踩坑**，不是为了免责。
+
+| 边界 | 说明 |
+|---|---|
+| **`timeoutMs` 硬上限 600000（10 分钟）** | 这不是"够不够用"，而是**下溢**：`setTimeout` 的延时上限是 2^31-1，超出的值会被 Node 悄悄改成 **1ms**。一旦配上这种值，该模型每个请求瞬间被 abort，而 AbortError 明确不重试 → 反复失败最终把**整家熔断**。配置校验会直接拒掉超限值。 |
+| **无法伪装 TLS / HTTP 客户端指纹** | 程序跑在 Node 上。少数上游在连接层做指纹校验，这类拒绝换 Key、换账户、重试**全都没用**，而且继续打只会加剧风控。程序会识别出来、停止重试并说明原因 —— 但做不到"骗过去"。这是已知上限。 |
+| **`/models` 目录不保证完整** | 有些中转的目录里没有实际可用的模型，也有实际可用却不在目录里的。所以「一键获取」拿到的清单**只是参考**，真实可用性要靠「测试」或实测超时。 |
+| **参数拿不到就留空，不编数字** | 上游只回 `{id, object, created, owned_by}` 时，我们**不知道**上下文长度。填一个看起来合理的值会让客户端真的按那个数字发包（有前车之鉴：某次写入因拿不到值而退回默认 1024000，等于向上游虚报 5 倍上下文）。这些模型会在界面上单独列出来由你决定。 |
+| **符号链接目标未验证** | 开发机上没有管理员权限，`fs.symlinkSync` 返回 EPERM，未能测试"目标是指向别处的符号链接"时的行为。 |
+| **只在 Windows x64 上验证过** | 代码里的路径处理做了跨平台考量，但 macOS / Linux 未测试。 |
+| **一个模型坏掉不该拖垮整家** | 这是设计目标，也已用测试钉死（地区受限 403 只算"这家不提供该模型"，不熔断、不冷却账户）。但上游若返回**措辞不同**的拒绝，可能仍被当成整家故障 —— 遇到请在「日志」页搜 `breaker OPEN`，把上游原文附在 Issue 里。 |
 
 ---
 
