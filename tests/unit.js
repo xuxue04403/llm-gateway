@@ -797,6 +797,56 @@ t('图标：ICO 容器结构正确（PNG-in-ICO，多尺寸条目）', () => {
   }
 });
 
+t('界面品牌标记：index.html 的内联 SVG 必须与 src/icon.js 的几何**逐点一致**', () => {
+  // 为什么要有这条：界面左上角那个方块曾经是"纯 CSS 渐变"，与应用图标毫无关系 ——
+  // 换图标时它纹丝不动（用户实测发现）。现在改成内联 SVG 复刻图标，
+  // 但"两处必须同步"光靠注释是守不住的（我写完那句注释之后自己还是漏改过一次）。
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
+  const icon = require('../src/icon');
+  const G = icon.GEOMETRY;
+
+  const svg = /<svg class="logo"[\s\S]*?<\/svg>/.exec(html);
+  assert.ok(svg, 'index.html 里应有 <svg class="logo"> 品牌标记');
+  const s = svg[0];
+  const flat = s.replace(/\s+/g, ' ');
+
+  // 100 单位视图盒 → 归一化坐标 ×100；去掉浮点尾巴便于比对
+  const n = (v) => String(Math.round(v * 1000) / 1000);
+  const P = G.PAD * 100;
+  const side = (1 - 2 * G.PAD) * 100;
+
+  assert.strictEqual(n(0), '0');
+  assert.ok(flat.includes(`x="${n(P)}" y="${n(P)}"`), '方块起点应为 PAD（' + n(P) + '）');
+  assert.ok(flat.includes(`width="${n(side)}" height="${n(side)}"`), '方块边长应为 ' + n(side));
+  assert.ok(flat.includes(`rx="${n(G.TILE_R * 100)}"`), '圆角半径应为 ' + n(G.TILE_R * 100));
+  assert.ok(flat.includes(`stroke-width="${n(G.STEM_R * 200)}"`), '笔画宽度应为 ' + n(G.STEM_R * 200));
+
+  // 三条胶囊：M x1 y1 L x2 y2
+  const caps = [...flat.matchAll(/<path d="M([\d.]+) ([\d.]+) L([\d.]+) ([\d.]+)"\/>/g)]
+    .map((m) => m.slice(1).map(Number));
+  assert.strictEqual(caps.length, G.CAPS.length, '胶囊数量应与 icon.js 一致');
+  G.CAPS.forEach((c, i) => {
+    const want = [c[0] * 100, c[1] * 100, c[2] * 100, c[3] * 100].map((v) => Number(n(v)));
+    assert.deepStrictEqual(caps[i], want, '第 ' + (i + 1) + ' 条胶囊坐标不一致');
+  });
+
+  // 箭头三角：tip(tipX,tipY)，底边 x = (tipX-w)，上下 y = tipY ± h
+  const tri = /<path d="M([\d.]+) ([\d.]+) L([\d.]+) ([\d.]+) L([\d.]+) ([\d.]+) Z" fill="#fff"\/>/.exec(flat);
+  assert.ok(tri, '应有箭头三角路径');
+  const A = G.ARROW;
+  const wantTri = [A.tipX * 100, A.tipY * 100, (A.tipX - A.w) * 100, (A.tipY - A.h) * 100, (A.tipX - A.w) * 100, (A.tipY + A.h) * 100]
+    .map((v) => Number(n(v)));
+  assert.deepStrictEqual(tri.slice(1).map(Number), wantTri, '箭头三角坐标不一致');
+
+  // 渐变两端：brand 与"压暗 GRADIENT_DARKEN"，与 icon.js 的 darken() 同口径
+  const stops = [...flat.matchAll(/stop-color="(#[0-9a-f]{6})"/gi)].map((m) => m[1].toLowerCase());
+  assert.strictEqual(stops.length, 2, '应有两个渐变色标');
+  const hex = (rgb) => '#' + rgb.map((c) => c.toString(16).padStart(2, '0')).join('');
+  assert.strictEqual(stops[0], hex(icon.COLORS.brand), '渐变的亮端应等于 COLORS.brand');
+  const dark = icon.COLORS.brand.map((c) => Math.round(c * (1 - G.GRADIENT_DARKEN)));
+  assert.strictEqual(stops[1], hex(dark), '渐变的暗端应等于 brand 压暗 ' + G.GRADIENT_DARKEN);
+});
+
 t('图标：PNG 编码合法（签名 + IHDR 尺寸 + IEND 结尾）', () => {
   const icon = require('../src/icon');
   const png = icon.iconPngBuffer(48, icon.COLORS.ready);

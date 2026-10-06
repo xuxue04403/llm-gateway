@@ -135,7 +135,7 @@ function renderIcon(size, rgb) {
   const w = size; const h = size;
   const rgba = new Uint8Array(w * h * 4);
   const top = rgb || COLORS.brand;
-  const bot = darken(top, 0.38);
+  const bot = darken(top, GRADIENT_DARKEN);
   const half = 0.5 - PAD;
   const samples = SS * SS;
 
@@ -224,4 +224,18 @@ const COLORS = {
   safe: [240, 155, 60],       // 需要留意
 };
 
-module.exports = { pngFromPixels, renderIcon, iconDataURL, iconPngBuffer, iconIcoBuffer, COLORS };
+const GRADIENT_DARKEN = 0.38;
+
+/**
+ * 几何常量导出 —— **不是为了外部调用，是为了让"界面品牌标记与图标一致"可被机器校验**。
+ *
+ * `renderer/index.html` 里有一份等价的内联 SVG（同一套归一化坐标 ×100）。
+ * 两处必须同步，否则界面左上角会和 exe / 托盘图标长得不一样。
+ * 我写下那句"改图标时必须同时改这里"的注释之后，自己还是漏改过一次 ——
+ * 所以 tests/unit.js 里有一条测试逐点比对这两份几何。
+ */
+const GEOMETRY = { PAD, TILE_R, STEM_R, CAPS, ARROW, GRADIENT_DARKEN };
+
+module.exports = {
+  pngFromPixels, renderIcon, iconDataURL, iconPngBuffer, iconIcoBuffer, COLORS, GEOMETRY,
+};

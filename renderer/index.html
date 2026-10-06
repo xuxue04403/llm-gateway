@@ -23,7 +23,27 @@
   <!-- ============ 顶栏 ============ -->
   <header class="topbar">
     <div class="brand">
-      <span class="logo" id="brandLogo"></span>
+      <!-- 品牌标记 = 应用图标本身。
+           几何与 src/icon.js 逐点对应（同一套归一化坐标 ×100）：
+             方块 x/y=3.5 边长 93 rx=22.5；渐变 #3b82f6 → 压暗 38%；
+             三条胶囊 stroke-width=10.4 圆头；箭头三角 tip(81.5,50)、底边 x=64、半高 16.8。
+           ⚠ 改图标时必须同时改这里，否则界面左上角会与 exe / 托盘图标不一致
+             （旧版这里是一块纯 CSS 渐变方块，换图标时它不会跟着变）。 -->
+      <svg class="logo" id="brandLogo" viewBox="0 0 100 100" width="20" height="20" role="img" aria-label="LLM Gateway">
+        <defs>
+          <linearGradient id="brandLogoGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stop-color="#3b82f6"/>
+            <stop offset="1" stop-color="#255199"/>
+          </linearGradient>
+        </defs>
+        <rect x="3.5" y="3.5" width="93" height="93" rx="22.5" fill="url(#brandLogoGrad)"/>
+        <g stroke="#fff" stroke-width="10.4" stroke-linecap="round" fill="none">
+          <path d="M21.5 27.2 L47.8 50"/>
+          <path d="M21.5 72.8 L47.8 50"/>
+          <path d="M46 50 L64.5 50"/>
+        </g>
+        <path d="M81.5 50 L64 33.2 L64 66.8 Z" fill="#fff"/>
+      </svg>
       <span class="brand-name">LLM Gateway</span>
       <span class="brand-ver" id="brandVer"></span>
     </div>

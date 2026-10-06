@@ -51,10 +51,11 @@ code { font-family: var(--mono); font-size: 12px; background: #0c1017; padding: 
 }
 .topbar button, .topbar input { -webkit-app-region: no-drag; }
 .brand { display: flex; align-items: center; gap: 8px; }
-.logo {
-  width: 20px; height: 20px; border-radius: 6px;
-  background: linear-gradient(135deg, #3b82f6, #8b5cf6);
-}
+/* 品牌标记=应用图标本身（内联 SVG，见 index.html）。
+   这里只负责尺寸与对齐 —— 底色/字形全部由 SVG 画，别再往这儿加 background，
+   否则会和 SVG 叠成"两层"。旧版是一块纯 CSS 渐变方块（#3b82f6→#8b5cf6），
+   与应用图标毫无关系，换图标时它不会跟着变。 */
+.logo { width: 20px; height: 20px; display: block; flex: none; }
 .brand-name { font-weight: 600; letter-spacing: .3px; }
 .brand-ver { color: var(--text-mute); font-size: 11px; }
 .topbar-mid { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; }
