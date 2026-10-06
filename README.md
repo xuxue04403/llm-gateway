@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/llm-gateway.png" width="120" alt="LLM Gateway 图标"></p>
+
 # LLM Gateway
 
 [![Release](https://img.shields.io/github/v/release/xuxue04403/llm-gateway?label=%E4%B8%8B%E8%BD%BD&color=2ea043)](https://github.com/xuxue04403/llm-gateway/releases/latest)
