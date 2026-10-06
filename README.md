@@ -6,7 +6,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4)](#下载)
 
 通用桌面版 LLM 网关。把十几种上游模型服务（OpenAI / Anthropic / 各家中转）聚合成**一个本地端点 + 一把 Key**，
-并支持**一键写入** dsh / Claude Code / Codex / iFlow / OpenCode 等客户端的配置。
+并支持**一键写入** dsh / Claude Code / Codex / OpenCode 等客户端的配置。
 
 从 `dsh-app` 的模型网关部分拆分而来，网关引擎**逐行未改**（可用脚本验证，见下文「引擎零差异」）。
 
@@ -123,9 +123,12 @@ npm run parity   # 引擎差异校验：38 处声明改动、0 处未声明
 | **dsh** | `~/.dsh/settings.yaml` + `.credentials.yaml` | 由「客户端仿真」决定 | `claude` → `http://127.0.0.1:PORT`（不带 /v1）；其余 → 带 /v1 |
 | **Claude Code** | `~/.claude/settings.json` 的 `env` 段 | `http://127.0.0.1:PORT`（**不带 /v1**） | 客户端自己拼 `/v1/messages`；写成带 /v1 会变 `/v1/v1/messages` → 404 |
 | **Codex** | `~/.codex/config.toml`（+ `auth.json`） | `http://127.0.0.1:PORT/v1`（**要带**） | Codex 把 `/responses` 拼在其后 |
-| **iFlow CLI** | `~/.iflow/settings.json` | `http://127.0.0.1:PORT/v1` | 会把 OAuth 登录切成 API Key 模式 |
 | **OpenCode** | `~/.config/opencode/opencode.json` | `http://127.0.0.1:PORT/v1` | 新增一个 `@ai-sdk/openai-compatible` provider |
-| **通用** | `<数据目录>\clients\` | 两种都生成 | 环境变量脚本 + 端点速查，覆盖 Aider / Continue / Cline / Roo / Chatbox 等 |
+| **通用** | `<数据目录>\clients\` | 两种都生成 | 环境变量脚本 + 端点速查，覆盖 Aider / Continue / Cline / Roo / Chatbox / Qoder CLI 等 |
+
+> **iFlow CLI 已于 2026-04 停止服务**（官方 2026-03-20 停止维护、04-17 正式关闭，API 与模型库同步关停），
+> 因此不再作为写入目标。若你此前用它写入过，备份仍在 `~/.iflow/settings.json.bak-llmgateway`，
+> 那是一份普通 JSON，手工改回 `.iflow/settings.json` 即可。官方建议迁往 Qoder —— 用上面的「通用」端点即可接。
 
 ### 三条硬保障
 
@@ -273,7 +276,7 @@ src/
     util.js            原子写 / 备份 / 恢复 / 脱敏 / 最小 TOML 定点编辑
     models.js          从网关配置推导"客户端能选到的模型清单"
     target-dsh.js      交给引擎的 --write-dsh 执行
-    target-claude-code.js / target-codex.js / target-iflow.js / target-opencode.js / target-envscript.js
+    target-claude-code.js / target-codex.js / target-opencode.js / target-envscript.js
   probe.js             供应商连通性探测（直连 / HTTP 代理隧道，零依赖）
   datadir.js           数据目录解析 + 从既有安装导入配置
   settings.js / logger.js / crash-report.js / icon.js / paths.js / winutil.js / fs-safe.js

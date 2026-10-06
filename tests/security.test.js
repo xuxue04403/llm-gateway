@@ -17,7 +17,6 @@ const util = require('../src/writers/util');
 const logger = require('../src/logger');
 const codex = require('../src/writers/target-codex');
 const claude = require('../src/writers/target-claude-code');
-const iflow = require('../src/writers/target-iflow');
 const opencode = require('../src/writers/target-opencode');
 const envscript = require('../src/writers/target-envscript');
 const writers = require('../src/writers');
@@ -243,7 +242,6 @@ t('write:apply 的契约：writers.apply 必须**永远返回 Promise**（dsh �
 t('空 Key：apply 不得把用户原有凭据写成空串（这是不可逆的破坏）', async () => {
   const cases = [
     ['claude-code', '.claude/settings.json', { env: { ANTHROPIC_AUTH_TOKEN: 'sk-user-原有的可用凭据', ANTHROPIC_BASE_URL: 'https://real.example/' }, language: 'Chinese' }],
-    ['iflow', '.iflow/settings.json', { apiKey: 'sk-user-原有的可用凭据', baseUrl: 'https://apis.iflow.cn/v1', language: 'zh-CN' }],
     ['opencode', '.config/opencode/opencode.json', { provider: { other: { options: { apiKey: 'sk-user-原有的可用凭据' } } }, theme: 'dark' }],
   ];
   for (const [id, rel, content] of cases) {
@@ -299,11 +297,10 @@ t('脱敏：scrubDeepSecrets 深扫对象/数组，任意层级的密钥都被�
   assert.strictEqual(out.files[1].before[0], 'nested');
 });
 
-t('脱敏：预览不得把**其它客户端**的明文密钥送到渲染层（iFlow / opencode / codex 的 before）', () => {
+t('脱敏：预览不得把**其它客户端**的明文密钥送到渲染层（opencode / codex 的 before）', () => {
   const other = 'sk-user-OTHER-CLIENT-SECRET-1234567890';
   logger.registerSecret(other);
   const cases = [
-    ['iflow', '.iflow/settings.json', { apiKey: other, searchApiKey: 'as_' + 'd'.repeat(30), language: 'zh-CN' }],
     ['opencode', '.config/opencode/opencode.json', { provider: { other: { options: { apiKey: other } } } }],
   ];
   for (const [id, rel, content] of cases) {

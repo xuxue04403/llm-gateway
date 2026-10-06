@@ -710,7 +710,7 @@ function registerIpc() {
       errors: r.errors || [],
       files: r.files || [],
       // 各目标的返回形状不完全一致：dsh/envscript 用 backups（复数），
-      // claude-code/codex/iflow/opencode 用 backup（单数）。这里归一到 backups，
+      // claude-code/codex/opencode 用 backup（单数）。这里归一到 backups，
       // 否则界面的"写入成功"弹窗里永远看不到备份路径（备份其实已经生成了）。
       backups: (r.backups && r.backups.length ? r.backups : (r.backup ? [r.backup] : [])),
       output: r.output || '',
@@ -830,9 +830,9 @@ function writeCtx(options) {
  * 预览脱敏：把**整份**预览载荷里的密钥换成打码值再送渲染层。
  *
  * 旧实现只擦"网关统一 Key"一处 —— 但预览里还带着**别的客户端配置文件的原文**：
- * iFlow 的 `apiKey`/`searchApiKey`、opencode 其它 provider 的 `apiKey`、Codex 的
- * `model_providers.*` 表（`experimental_bearer_token` 是明文）等等。那些是用户自己
- * 填在别处的真实密钥，没有任何理由为了显示一份 diff 而把它们送进渲染进程。
+ * opencode 其它 provider 的 `apiKey`、Codex 的 `model_providers.*` 表
+ * （`experimental_bearer_token` 是明文）、Claude Code 的 `env` 段等等。
+ * 那些是用户自己填在别处的真实密钥，没有任何理由为了显示一份 diff 而把它们送进渲染进程。
  * 现在走"深扫 + 全量打码"：所有登记过的密钥（启动时已把配置里全部上游 Key 登记进去）
  * 与所有已知密钥形态都会被整串抹掉。
  */

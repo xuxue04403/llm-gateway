@@ -17,11 +17,16 @@ const dsh = require('./target-dsh');
 const claudeCode = require('./target-claude-code');
 const codex = require('./target-codex');
 const opencode = require('./target-opencode');
-const iflow = require('./target-iflow');
 const envscript = require('./target-envscript');
 
 // 展示顺序 = 推荐顺序：已在本机实测/验证过的排前面，通用兜底殿后
-const TARGETS = [dsh, claudeCode, codex, iflow, opencode, envscript];
+//
+// ⚠ 这里**曾经**还有 iFlow CLI（`target-iflow.js`），已于 2026-10 移除：
+// iFlow CLI 官方公告 2026-03-20 停止维护、2026-04-17 正式关闭，
+// iFlow API 服务与模型库同步关停（建议迁往 Qoder）。给一个已停服的产品写配置没有意义。
+// 若你此前用它写入过，备份仍留在 `~/.iflow/settings.json.bak-llmgateway`，
+// 那个文件就是一份普通 JSON，手工改回 `.iflow/settings.json` 即可。
+const TARGETS = [dsh, claudeCode, codex, opencode, envscript];
 
 const BY_ID = new Map(TARGETS.map((t) => [t.id, t]));
 

@@ -3,11 +3,13 @@
 
 LG.clientOptions = LG.clientOptions || {};
 
+// iFlow CLI 已于 2026-04 停止服务（官方 2026-03-20 停止维护、04-17 关闭），
+// 故不再作为写入目标。这里不保留它的样式与说明 —— 目标清单由主进程的
+// writers.list() 提供，渲染层只按 id 查样式，多的键是无害的，但留着会误导。
 const CLIENT_STYLE = {
   dsh: { color: '#2f5bd7', short: 'D' },
   'claude-code': { color: '#d97757', short: 'C' },
   codex: { color: '#10a37f', short: 'X' },
-  iflow: { color: '#0ea5e9', short: 'i' },
   opencode: { color: '#a855f7', short: 'O' },
   envscript: { color: '#64748b', short: '⌘' },
 };
@@ -16,9 +18,8 @@ const CLIENT_DESC = {
   dsh: '把网关注册为 dsh 的 gateway 提供商（写 <code>~/.dsh/settings.yaml</code> 与凭据）。协议跟随「设置 → 客户端仿真」。',
   'claude-code': '写 <code>~/.claude/settings.json</code> 的 env 段。baseURL <b>不带 /v1</b>。',
   codex: '写 <code>~/.codex/config.toml</code>。baseURL <b>要带 /v1</b>；只用 Responses 协议。',
-  iflow: '写 <code>~/.iflow/settings.json</code>。baseURL <b>要带 /v1</b>；会把 OAuth 登录切成 API Key 模式。',
   opencode: '写 <code>~/.config/opencode/opencode.json</code>，新增一个 openai-compatible provider。',
-  envscript: '生成环境变量脚本与端点速查，覆盖 Aider / Continue / Cline / Roo / Chatbox / Gemini CLI 等一切客户端。',
+  envscript: '生成环境变量脚本与端点速查，覆盖 Aider / Continue / Cline / Roo / Chatbox / Qoder CLI 等一切客户端。',
 };
 
 function clientOptions(id) {
@@ -99,7 +100,7 @@ LG.renders.clients = function renderClients() {
           </select>
         </div>
       </div>`;
-    } else if (t.id === 'opencode' || t.id === 'iflow') {
+    } else if (t.id === 'opencode') {
       opts = `<div class="c-opts">
         <div class="line"><span style="width:74px">模型</span>${modelSelectHtml('model', o.model)}</div>
       </div>`;

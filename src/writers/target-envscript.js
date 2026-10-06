@@ -192,7 +192,7 @@ function buildFiles(ctx) {
     '  Cline / Roo    : 设置 → API Provider 选 "OpenAI Compatible"，填上面的 Base URL 与 Key',
     '                   （它们的 Key 存在 VS Code 凭据库里，本程序不代为写入）',
     '  Chatbox/Cherry : 设置里选 OpenAI 兼容，填 Base URL 与 Key',
-    '  iFlow CLI      : 建议用「客户端接入」里的 iFlow 一键写入，比手改稳',
+    '  Qoder CLI      : 设置里选 OpenAI 兼容，填上面的 Base URL 与 Key',
     '  Gemini CLI     : 走 Gemini 原生 API（/v1beta），本网关不提供该协议 —— 接不进来',
     '',
     '⚠ 本文件含本机网关 Key，请勿分享。',

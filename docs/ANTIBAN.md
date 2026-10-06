@@ -300,7 +300,7 @@ dsh（Anthropic/JS） ──▶ 网关（claude 仿真）──▶ agentrouter  
 
 1. **身份取决于"谁在调"**：dsh 调会带 `Anthropic/JS`（被拒），Claude Code 调会带
    `claude-cli`（通过）—— 同一个网关时好时坏，极难排查。
-2. **非白名单客户端会被连累**：iFlow / opencode 等客户端经过网关时，
+2. **非白名单客户端会被连累**：opencode 等客户端经过网关时，
    它们的身份同样会被送上去。
 
 **当前配置（`clientProfile: "claude"` 全局仿真）对这个组合是对的**：它把**所有**入口

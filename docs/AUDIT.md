@@ -429,7 +429,7 @@ promise 就 reject，渲染层那句 `await` 直接抛 —— 表现同样是"�
 - **`applyModelPicker` 的正常矩阵**：replace 两种 × 原表空/非空/占位 —— 全对
 - **`modelRow` 的转义与往返**：含 `"` `<` `&` 的名字逐字往返，无元素注入
 - **引擎 `modelTimeoutMs`**：`null`/畸形条目不崩；字符串条目**不**命中逐模型超时（设计使然）
-- **写回**：6 个目标 `preview→apply→restore`，用户原有键零丢失、restore 逐字节还原
+- **写回**：6 个目标（当时；iFlow 已于 2026-10 移除，见 J 节）`preview→apply→restore`，用户原有键零丢失、restore 逐字节还原
 - **`writeAtomic` 闸门**：目录 / 只读 / ACL 拒绝读 / 硬链接 / 陈旧 tmp —— 原文件均未损坏、无 tmp 残留
 - **`killProcessesByCommandlines`**：5 个真实诱饵进程选择正确；截断的 PID 行不产生假 PID
 
@@ -439,3 +439,46 @@ promise 就 reject，渲染层那句 `await` 直接抛 —— 表现同样是"�
 - **CSP 是否真的生效**：只读了 `index.html` 的 meta，未在 Electron 里实测；关于"inline handler 被挡"的判断基于规范
 - **拖拽**用的是合成 `dataTransfer`，真实可用性未验证
 - **所有上游交互都用本机假上游**，未打真实供应商
+
+---
+
+## J. 移除 iFlow CLI（2026-10）
+
+**这不是审计发现，是按上游产品状态做的功能下线。**
+
+### 依据
+
+iFlow CLI 官方公告：
+
+- **2026-03-20 起停止维护**
+- **2026-04-17 正式关闭**
+- **iFlow API 服务与模型库同步关停**
+- 官方建议迁移至 Qoder
+
+来源：[iFlow 官方告别帖](https://vibex.iflow.cn/t/topic/4819)、[iFlow CLI 站点公告](https://cli.iflow.cn)。
+
+给一个**已经停服两个月**的产品继续写配置没有意义 —— 用户点了「写入」也连不上。
+
+### 改了什么
+
+| 项目 | 变更 |
+|---|---|
+| `src/writers/target-iflow.js` | **删除** |
+| `src/writers/index.js` | 从 `TARGETS` 移除；留注释说明原因与手工回退办法 |
+| `renderer/js/clients.js` | 移除样式表与说明文案里的条目 |
+| `src/writers/target-envscript.js` | 端点速查里的 iFlow 一行换成 Qoder CLI |
+| `tests/writers.test.js` | 移除 iFlow 用例；**新增**一条回归钉：`list()` 不含 `iflow`、`get('iflow')` 返回 `null`、`preview('iflow')` 给"未知目标" |
+| `README.md` / `docs/ANTIBAN.md` | 更新目标清单，并说明备份怎么手工回退 |
+
+**刻意保留**的两处：
+
+- `tests/security.test.js` 里那条"测试没碰真实用户文件"的检查仍包含 `.iflow/settings.json` ——
+  用户机器上可能还有这个文件，检查它是**防御性**的，与功能存废无关。
+- `docs/AUDIT.md` 前四轮里的 iFlow 记述**一字未改**。那是历史审计记录，
+  当时的结论在当时的代码上是对的。为了"看起来一致"去改写历史记录，比留下不一致更糟。
+
+### 对已有用户的影响
+
+此前用它写入过的人，备份仍在 `~/.iflow/settings.json.bak-llmgateway`。
+那是一份普通 JSON，手工改回 `.iflow/settings.json` 即可 —— 但 iFlow 服务已经关了，
+所以真正要做的是**迁移到别的客户端**（Qoder 或其他），用「客户端接入」页的「通用脚本」即可接上。

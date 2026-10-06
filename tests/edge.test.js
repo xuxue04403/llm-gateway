@@ -128,8 +128,8 @@ t('pickDefaultModel：候选不存在时回落第一个；名单为空时返回�
 
 t('全部目标：没有任何模型时，preview 不得抛，且给出可读的提示或拦截理由', () => {
   const ctx = ctxFor(newHome('empty-all'), { port: 3091, apiKey: KEY, providers: [{ id: 'a', baseURL: 'https://a.com/v1', apiKey: 'k', models: [] }] });
-  // 五个"要把模型清单写进目标配置"的目标必须拦下；通用脚本不需要模型，但必须有提示
-  const mustGuard = ['dsh', 'claude-code', 'codex', 'iflow', 'opencode'];
+  // 四个"要把模型清单写进目标配置"的目标必须拦下；通用脚本不需要模型，但必须有提示
+  const mustGuard = ['dsh', 'claude-code', 'codex', 'opencode'];
   for (const tgt of writers.TARGETS) {
     const p = writers.preview(tgt.id, ctx);
     assert.strictEqual(p.ok, true, tgt.id + ' preview 不该失败：' + JSON.stringify(p.errors));
@@ -165,7 +165,6 @@ t('全部目标：统一 Key 过短时都必须拦下（引擎鉴权门槛是 �
 t('文件类目标：目标文件是坏 JSON 时必须拒绝写入且不覆盖', async () => {
   const cases = [
     ['claude-code', (h) => [path.join(h, '.claude', 'settings.json')]],
-    ['iflow', (h) => [path.join(h, '.iflow', 'settings.json')]],
     ['opencode', (h) => [path.join(h, '.config', 'opencode', 'opencode.json')]],
   ];
   for (const [id, pathsOf] of cases) {
@@ -186,7 +185,7 @@ t('文件类目标：目标文件是坏 JSON 时必须拒绝写入且不覆盖',
 
 t('文件类目标：目标文件为空（0 字节）时应当能正常写入', async () => {
   const cfg = { port: 3091, apiKey: KEY, providers: [{ id: 'a', baseURL: 'https://a.com/v1', apiKey: 'k', models: ['m1'] }] };
-  for (const [id, rel] of [['claude-code', '.claude/settings.json'], ['iflow', '.iflow/settings.json'], ['opencode', '.config/opencode/opencode.json']]) {
+  for (const [id, rel] of [['claude-code', '.claude/settings.json'], ['opencode', '.config/opencode/opencode.json']]) {
     const home = newHome('emptyfile-' + id);
     const ctx = ctxFor(home, cfg);
     const f = path.join(home, ...rel.split('/'));
@@ -227,7 +226,7 @@ t('dsh：引擎缺失时 apply 必须失败并给出原因（不得假装成功�
 
 t('restore：没有任何备份时返回明确错误，不抛', async () => {
   const cfg = { port: 3091, apiKey: KEY, providers: [{ id: 'a', baseURL: 'https://a.com/v1', apiKey: 'k', models: ['m1'] }] };
-  for (const id of ['claude-code', 'codex', 'iflow', 'opencode', 'envscript']) {
+  for (const id of ['claude-code', 'codex', 'opencode', 'envscript']) {
     const ctx = ctxFor(newHome('nobak-' + id), cfg);
     const r = await writers.restore(id, ctx);
     assert.ok(r && Array.isArray(r.errors), id + ' restore 必须返回结构化结果');

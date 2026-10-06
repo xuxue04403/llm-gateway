@@ -21,7 +21,6 @@ const writers = require('../src/writers');
 const util = require('../src/writers/util');
 const claude = require('../src/writers/target-claude-code');
 const codex = require('../src/writers/target-codex');
-const iflow = require('../src/writers/target-iflow');
 const opencode = require('../src/writers/target-opencode');
 const envscript = require('../src/writers/target-envscript');
 const dshTarget = require('../src/writers/target-dsh');
@@ -301,17 +300,12 @@ t('Codex：config.toml 不存在时能新建（新机器/未初始化）', () =>
 });
 
 /* ================================================================
- * iFlow CLI
+ * iFlow CLI —— 已于 2026-10 移除
+ *
+ * iFlow CLI 官方公告：2026-03-20 停止维护、2026-04-17 正式关闭，
+ * iFlow API 服务与模型库同步关停（建议迁往 Qoder）。
+ * 给一个已停服的产品写配置没有意义，相关目标与用例一并移除。
  * ================================================================ */
-
-const REAL_IFLOW = {
-  selectedAuthType: 'oauth-iflow',
-  searchApiKey: 'as_' + 's'.repeat(30),
-  baseUrl: 'https://apis.iflow.cn/v1',
-  apiKey: 'sk-' + 'i'.repeat(30),
-  modelName: 'glm-4.6',
-  language: 'zh-CN',
-};
 
 t('Codex：等价表头写法不能被追加成重复表（会把整份 config.toml 写成非法）', () => {
   // TOML 里下面几种是**同一张表**：`[a.b]`、`[a . b]`、`["a"."b"]`。
@@ -373,31 +367,16 @@ t('Codex：写回只动自己那一块 —— 多行字符串里的连续空行�
   assert.ok(!/\n\n\n+\[other\]/.test(after), '代码区的多余空行仍应被折叠（这是原本的意图）');
 });
 
-t('iFlow：写 baseUrl/apiKey/modelName 并把 OAuth 切成 api-key，其它键保留', () => {
-  const home = newHome('if-apply');
-  const dir = path.join(home, '.iflow');
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, 'settings.json');
-  const original = JSON.stringify(REAL_IFLOW, null, 2) + '\n';
-  fs.writeFileSync(file, original, 'utf8');
-
-  const p = iflow.preview(ctxFor(home, { model: 'glm-5.2' }));
-  assert.strictEqual(p.baseUrl, `http://127.0.0.1:${PORT}/v1`, 'iFlow 的 baseUrl 要带 /v1');
-  assert.ok(p.warnings.some((w) => w.includes('OAuth')), '应提示会切换鉴权方式');
-
-  const r = iflow.apply(ctxFor(home, { model: 'glm-5.2' }));
-  assert.strictEqual(r.ok, true, JSON.stringify(r.errors));
-  const after = JSON.parse(fs.readFileSync(file, 'utf8'));
-  assert.strictEqual(after.baseUrl, `http://127.0.0.1:${PORT}/v1`);
-  assert.strictEqual(after.apiKey, KEY);
-  assert.strictEqual(after.modelName, 'glm-5.2');
-  assert.strictEqual(after.selectedAuthType, 'api-key');
-  assert.strictEqual(after.language, 'zh-CN', '无关键必须保留');
-  assert.strictEqual(after.searchApiKey, REAL_IFLOW.searchApiKey, '无关键必须保留');
-
-  const rest = iflow.restore(ctxFor(home));
-  assert.strictEqual(rest.ok, true);
-  assert.strictEqual(fs.readFileSync(file, 'utf8'), original);
+t('注册表：目标清单里**不含**已停服的 iFlow CLI', () => {
+  // iFlow CLI 官方公告 2026-03-20 停止维护、2026-04-17 正式关闭，API 与模型库同步关停。
+  // 这条测试是"回归钉"：防止以后有人从旧文档里把它加回来。
+  const ids = writers.list().map((t) => t.id);
+  assert.ok(!ids.includes('iflow'), 'iFlow CLI 已停服，不该再作为写入目标。当前清单：' + ids.join(', '));
+  assert.strictEqual(writers.get('iflow'), null, 'writers.get("iflow") 应返回 null');
+  // 且未知目标要给出明确错误而不是抛（界面按这个分支提示）
+  const p = writers.preview('iflow', {});
+  assert.strictEqual(p.ok, false);
+  assert.ok(/未知目标/.test(p.errors.join('')), '应提示未知目标');
 });
 
 /* ================================================================
@@ -618,7 +597,9 @@ t('通用脚本：Key 含双引号时 .cmd 必须降级为注释并给出警告�
 
 t('注册表：list() 的返回值可被结构化克隆（不得含函数——那会让整个 IPC 挂掉）', () => {
   const list = writers.list();
-  assert.ok(list.length >= 6);
+  // 5 个目标：dsh / claude-code / codex / opencode / envscript
+  //（原为 6 个，iFlow CLI 停服后于 2026-10 移除）
+  assert.ok(list.length >= 5, '目标数应 ≥ 5，实际 ' + list.length);
   for (const tgt of list) {
     for (const [k, v] of Object.entries(tgt)) {
       assert.notStrictEqual(typeof v, 'function', `${tgt.id}.${k} 不能是函数`);
