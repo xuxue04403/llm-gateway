@@ -1,7 +1,7 @@
 // make-icon.mjs — 用应用自己的图标生成器产出 .ico / .png（零外部素材）
 //
-// 图标是**程序化绘制**的（src/icon.js：品牌蓝圆底 + 白色原子轨道），不依赖任何图片文件，
-// 因此换配色/换尺寸只要改一行。electron-builder 打 exe 图标需要 ≥256×256 的 .ico。
+// 图标是**程序化绘制**的（src/icon.js：圆角方块 + 竖向渐变 + 白色「汇流箭头」），
+// 不依赖任何图片文件，因此换配色/换尺寸只要改一行。electron-builder 打 exe 图标需要 ≥256×256 的 .ico。
 //
 // 用法：node scripts/make-icon.mjs
 'use strict';

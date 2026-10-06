@@ -716,4 +716,98 @@ t('日志着色：中文关键词必须能命中（`\\b` 对 CJK 不成立，旧
   assert.strictEqual(sb.logLineClass('数据目录：D:\\x'), '', '普通行不上色');
 });
 
+/* ==================== 应用图标 ==================== */
+
+t('图标：所有尺寸与状态色都能渲染，且形状正确（圆角方块）', () => {
+  const icon = require('../src/icon');
+  for (const s of [16, 24, 32, 48, 64, 128, 256]) {
+    const { buffer, width, height } = icon.renderIcon(s, icon.COLORS.brand);
+    assert.strictEqual(width, s);
+    assert.strictEqual(height, s);
+    assert.strictEqual(buffer.length, s * s * 4, s + 'px 的 RGBA 长度应为 ' + s * s * 4);
+    // 四角必须透明（圆角）—— 若哪天误改成实心方块，这条会立刻失败
+    assert.strictEqual(buffer[3], 0, s + 'px 左上角应透明（圆角方块）');
+    // 中心必须完全不透明
+    const c = (((s >> 1) * s) + (s >> 1)) * 4;
+    assert.strictEqual(buffer[c + 3], 255, s + 'px 中心应完全不透明');
+  }
+});
+
+t('图标：边缘必须有半透明像素（超采样抗锯齿），不是硬阈值', () => {
+  const icon = require('../src/icon');
+  const s = 64;
+  const { buffer } = icon.renderIcon(s, icon.COLORS.brand);
+  let partial = 0;
+  for (let i = 3; i < buffer.length; i += 4) {
+    const a = buffer[i];
+    if (a > 0 && a < 255) partial++;
+  }
+  // 旧实现是逐像素硬阈值 → 这里恒为 0，于是 16/24px 下圆角与字形边缘全是锯齿。
+  assert.ok(partial > s, '应有数百个半透明边缘像素（抗锯齿），实际 ' + partial);
+});
+
+t('图标：各状态色互不相同，且 brand 与界面 --accent 严格一致', () => {
+  const icon = require('../src/icon');
+  const seen = new Map();
+  for (const [name, rgb] of Object.entries(icon.COLORS)) {
+    // ⚠ 不能取 buffer 开头 —— 那是透明角，RGB 恒为 (0,0,0)，会让所有颜色"撞车"；
+    // 也不能手算坐标 —— 容易落进白色的字形里。
+    // 稳妥做法：扫一遍，取第一个"不透明且不是字形白"的像素，那就是底色。
+    const s = 32;
+    const buf = icon.renderIcon(s, rgb).buffer;
+    let key = null;
+    for (let i = 0; i < buf.length; i += 4) {
+      if (buf[i + 3] !== 255) continue;                                  // 抗锯齿边缘
+      if (buf[i] === 255 && buf[i + 1] === 255 && buf[i + 2] === 255) continue;  // 字形
+      key = buf[i] + ',' + buf[i + 1] + ',' + buf[i + 2];
+      break;
+    }
+    assert.ok(key, name + ' 应能找到一个底色像素');
+    assert.ok(!seen.has(key), name + ' 与 ' + seen.get(key) + ' 的配色撞了（都是 ' + key + '）');
+    seen.set(key, name);
+  }
+  // 图标主色必须等于 renderer/styles.css 的 --accent，否则会出现"图标深蓝、按钮亮蓝"
+  const css = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'styles.css'), 'utf8');
+  const m = /--accent:\s*#([0-9a-f]{6})/i.exec(css);
+  assert.ok(m, 'styles.css 里应能找到 --accent');
+  const hex = m[1];
+  const rgb = [parseInt(hex.slice(0, 2), 16), parseInt(hex.slice(2, 4), 16), parseInt(hex.slice(4, 6), 16)];
+  assert.deepStrictEqual(icon.COLORS.brand, rgb,
+    '图标品牌色应与界面 --accent 一致：图标 ' + JSON.stringify(icon.COLORS.brand) + ' vs CSS ' + JSON.stringify(rgb));
+});
+
+t('图标：ICO 容器结构正确（PNG-in-ICO，多尺寸条目）', () => {
+  const icon = require('../src/icon');
+  const sizes = [16, 24, 32, 48, 64, 128, 256];
+  const ico = icon.iconIcoBuffer(icon.COLORS.brand, sizes);
+  assert.strictEqual(ico.readUInt16LE(0), 0, 'reserved 应为 0');
+  assert.strictEqual(ico.readUInt16LE(2), 1, 'type 应为 1（icon）');
+  assert.strictEqual(ico.readUInt16LE(4), sizes.length, '条目数应与请求的尺寸数一致');
+  const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+  for (let i = 0; i < sizes.length; i++) {
+    const e = 6 + i * 16;
+    const s = sizes[i];
+    assert.strictEqual(ico[e], s >= 256 ? 0 : s, '第 ' + i + ' 条的宽度字节');
+    assert.strictEqual(ico[e + 1], s >= 256 ? 0 : s, '第 ' + i + ' 条的高度字节');
+    assert.strictEqual(ico.readUInt16LE(e + 6), 32, '第 ' + i + ' 条应为 32bpp');
+    const len = ico.readUInt32LE(e + 8);
+    const off = ico.readUInt32LE(e + 12);
+    assert.ok(off + len <= ico.length, '第 ' + i + ' 条的偏移+长度不能越界');
+    assert.ok(ico.subarray(off, off + 4).equals(PNG_SIG), '第 ' + i + ' 条的数据应以 PNG 签名开头');
+  }
+});
+
+t('图标：PNG 编码合法（签名 + IHDR 尺寸 + IEND 结尾）', () => {
+  const icon = require('../src/icon');
+  const png = icon.iconPngBuffer(48, icon.COLORS.ready);
+  assert.ok(png.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])), 'PNG 签名');
+  assert.strictEqual(png.readUInt32BE(16), 48, 'IHDR 宽度');
+  assert.strictEqual(png.readUInt32BE(20), 48, 'IHDR 高度');
+  assert.strictEqual(png[24], 8, '位深 8');
+  assert.strictEqual(png[25], 6, '颜色类型 6（RGBA）');
+  assert.ok(png.subarray(-8).includes(Buffer.from('IEND')), '应以 IEND 结尾');
+  const url = icon.iconDataURL(16, icon.COLORS.stopped);
+  assert.ok(url.startsWith('data:image/png;base64,'), 'dataURL 前缀');
+});
+
 run();

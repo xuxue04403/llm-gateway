@@ -1,7 +1,17 @@
 // icon.js — 程序化生成应用/托盘 PNG 图标（零外部资源，纯 Node 实现）
 //
-// 图形：品牌蓝圆角方块 + 白色圆点。支持任意尺寸与主色（托盘图标随服务状态变色）。
-// 实现：手绘 RGBA 像素 → PNG 编码（zlib deflate + 表驱动 CRC32），与 Electron nativeImage 直接兼容。
+// 图形：**圆角方块 + 竖向渐变 + 白色「汇流箭头」**
+//   两条上游支流 45° 汇入，出口是一支实心箭头。语义就是本产品在做的事：
+//   「多个上游 → 一个本地端点」。只用一个**连通**字形，缩到 16px 仍有清晰轮廓。
+//
+// 与旧版的区别（2026-10 重做，旧版是"圆形底 + 三条椭圆轨道 + 6 个环点 + 中心点"）：
+//   ① 元素从 10 个减到 1 个 —— 旧版在 16px 下必然糊成一团，且"原子轨道"是 AI 产品最烂大街的套路
+//   ② 加入 **4×4 超采样抗锯齿** —— 旧版是逐像素硬阈值，边缘锯齿在 16/24px 下非常明显
+//   ③ 底色改为圆角方块 + 渐变，贴合 Windows 11 的图标语言；渐变由传入的状态色推导，
+//      因此托盘图标的五种状态色自动获得同样的明暗层次
+//
+// 实现：SDF（有符号距离场）组合图形 → 手绘 RGBA 像素 → PNG 编码
+//（zlib deflate + 表驱动 CRC32），与 Electron nativeImage 直接兼容。
 'use strict';
 
 const zlib = require('zlib');
@@ -54,74 +64,106 @@ function pngFromPixels(w, h, rgba) {
   return Buffer.concat([PNG_SIG, chunk('IHDR', ihdr), chunk('IDAT', idat), chunk('IEND', Buffer.alloc(0))]);
 }
 
-// 渲染图标：深色圆底 + 白色原子轨道（与 Electron 官方 exe 图标同一风格）。
-// 底色 = rgb（服务状态色：运行时托盘随状态变色；白色轨道/中心点不变）。
+/* ------------------------------------------------------------------ *
+ * 几何：全部用归一化坐标（0..1），与输出尺寸无关
+ * ------------------------------------------------------------------ */
+
+// 圆角方块
+const PAD = 0.035;          // 方块四周留白（相对边长）
+const TILE_R = 0.225;       // 圆角半径
+
+// 字形：三条胶囊 + 一个三角。坐标经两轮视觉迭代定稿。
+const STEM_R = 0.052;       // 笔画半径
+const CAPS = [
+  [0.215, 0.272, 0.478, 0.500, STEM_R],   // 上支流（45° 汇入）
+  [0.215, 0.728, 0.478, 0.500, STEM_R],   // 下支流
+  [0.460, 0.500, 0.645, 0.500, STEM_R],   // 主干（接箭头）
+];
+const ARROW = { tipX: 0.815, tipY: 0.500, w: 0.175, h: 0.168 };
+
+/** 点到线段的距离（胶囊体的基础） */
+function distSeg(px, py, ax, ay, bx, by) {
+  const vx = bx - ax; const vy = by - ay;
+  const wx = px - ax; const wy = py - ay;
+  const L2 = vx * vx + vy * vy;
+  let t = L2 > 0 ? (wx * vx + wy * vy) / L2 : 0;
+  t = t < 0 ? 0 : (t > 1 ? 1 : t);
+  return Math.hypot(px - (ax + t * vx), py - (ay + t * vy));
+}
+
+/** 圆角方块的 SDF（<0 在内部） */
+function sdRoundRect(px, py, cx, cy, hw, hh, r) {
+  const qx = Math.abs(px - cx) - (hw - r);
+  const qy = Math.abs(py - cy) - (hh - r);
+  const ox = qx > 0 ? qx : 0;
+  const oy = qy > 0 ? qy : 0;
+  return Math.hypot(ox, oy) + Math.min(Math.max(qx, qy), 0) - r;
+}
+
+/** 字形命中判定：在任一胶囊内，或在箭头三角内 */
+function insideGlyph(px, py) {
+  for (let i = 0; i < CAPS.length; i++) {
+    const c = CAPS[i];
+    if (distSeg(px, py, c[0], c[1], c[2], c[3]) <= c[4]) return true;
+  }
+  // 箭头：顶点朝右的等腰三角（按到顶点的横向比例判定半高）
+  const { tipX, tipY, w, h } = ARROW;
+  if (px <= tipX && px >= tipX - w) {
+    const t = (tipX - px) / w;
+    if (Math.abs(py - tipY) <= h * t) return true;
+  }
+  return false;
+}
+
+/** 由状态色推导渐变的暗端（压暗但不脏：同时压一点饱和感） */
+function darken(rgb, f) {
+  return [
+    Math.round(rgb[0] * (1 - f)),
+    Math.round(rgb[1] * (1 - f)),
+    Math.round(rgb[2] * (1 - f)),
+  ];
+}
+
+const SS = 4;   // 每轴超采样倍数（4×4=16 个样本/像素）
+
+/**
+ * 渲染图标：圆角方块（竖向渐变）+ 白色汇流箭头。
+ * @param size 输出边长（像素）
+ * @param rgb  底色（托盘状态色；渐变的亮端即此色，暗端自动压暗）
+ */
 function renderIcon(size, rgb) {
-  const w = size, h = size;
+  const w = size; const h = size;
   const rgba = new Uint8Array(w * h * 4);
-  const r = rgb[0], g = rgb[1], b = rgb[2];
-  const cx = (w - 1) / 2, cy = (h - 1) / 2;
-  const RR = w / 2 - Math.max(1, size * 0.02);       // 圆底半径（留 1px 抗锯齿余量）
-
-  // 三条椭圆轨道（±35° / 水平）
-  const a = w * 0.40, bb = w * 0.17;
-  const tracks = [];
-  for (const th of [-0.6, 0, 0.6]) {
-    const cos = Math.cos(th), sin = Math.sin(th);
-    const pts = [];
-    for (let k = 0; k <= 180; k++) {
-      const t = (Math.PI * 2 * k) / 180;
-      const x0 = a * Math.cos(t), y0 = bb * Math.sin(t);
-      pts.push([cx + x0 * cos - y0 * sin, cy + x0 * sin + y0 * cos]);
-    }
-    tracks.push(pts);
-  }
-  // 轨道长轴两端的空心环点
-  const dots = [];
-  for (const th of [-0.6, 0, 0.6]) {
-    const cos = Math.cos(th), sin = Math.sin(th);
-    dots.push([cx + a * 0.86 * cos, cy + a * 0.86 * sin]);
-    dots.push([cx - a * 0.86 * cos, cy - a * 0.86 * sin]);
-  }
-
-  const lineW2 = Math.max(1, size * 0.052) / 2;       // 轨道线宽/2
-  const ringIn2 = Math.pow(size * 0.03, 2);           // 环点内径²
-  const ringOut2 = Math.pow(size * 0.105, 2);         // 环点外径²
-  const centerR2 = Math.pow(Math.max(1, size * 0.075), 2);
+  const top = rgb || COLORS.brand;
+  const bot = darken(top, 0.38);
+  const half = 0.5 - PAD;
+  const samples = SS * SS;
 
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
+      let rS = 0; let gS = 0; let bS = 0; let hit = 0;
+      for (let sy = 0; sy < SS; sy++) {
+        for (let sx = 0; sx < SS; sx++) {
+          const px = (x + (sx + 0.5) / SS) / size;
+          const py = (y + (sy + 0.5) / SS) / size;
+          if (sdRoundRect(px, py, 0.5, 0.5, half, half, TILE_R) > 0) continue;
+          hit++;
+          if (insideGlyph(px, py)) { rS += 255; gS += 255; bS += 255; continue; }
+          // 竖向渐变：从方块顶部到底部
+          const t = (py - PAD) / (1 - 2 * PAD);
+          const k = t < 0 ? 0 : (t > 1 ? 1 : t);
+          rS += top[0] + (bot[0] - top[0]) * k;
+          gS += top[1] + (bot[1] - top[1]) * k;
+          bS += top[2] + (bot[2] - top[2]) * k;
+        }
+      }
       const i = (y * w + x) * 4;
-      const dx = x - cx, dy = y - cy;
-      const d2 = dx * dx + dy * dy;
-      if (d2 > RR * RR) { rgba[i + 3] = 0; continue; }   // 圆外透明
-      rgba[i] = r; rgba[i + 1] = g; rgba[i + 2] = b; rgba[i + 3] = 255;
-
-      let white = d2 <= centerR2;
-      // 轨道（采样点最近距离判定，先粗筛再精算）
-      if (!white) {
-        for (const pts of tracks) {
-          if (Math.abs(x - cx) > a + Math.max(1, size * 0.06) && Math.abs(y - cy) > a + Math.max(1, size * 0.06)) continue;
-          let best = Infinity;
-          for (const p of pts) {
-            const ddx = x - p[0], ddy = y - p[1];
-            const dd = ddx * ddx + ddy * ddy;
-            if (dd < best) best = dd;
-            if (best <= lineW2 * lineW2) break;
-          }
-          if (best <= lineW2 * lineW2) { white = true; break; }
-        }
-      }
-      // 空心环点（轨道端点）
-      if (!white) {
-        for (const dot of dots) {
-          const ddx = x - dot[0], ddy = y - dot[1];
-          const dd = ddx * ddx + ddy * ddy;
-          if (dd >= ringIn2 && dd <= ringOut2) { white = true; break; }
-        }
-      }
-
-      if (white) { rgba[i] = 255; rgba[i + 1] = 255; rgba[i + 2] = 255; }
+      if (!hit) { rgba[i + 3] = 0; continue; }
+      // 按键：命中样本数 / 总样本数 → 边缘半透明，天然抗锯齿
+      rgba[i] = Math.round(rS / hit);
+      rgba[i + 1] = Math.round(gS / hit);
+      rgba[i + 2] = Math.round(bS / hit);
+      rgba[i + 3] = Math.round(255 * hit / samples);
     }
   }
   return { buffer: Buffer.from(rgba.buffer), width: w, height: h };
@@ -138,8 +180,8 @@ function iconPngBuffer(size, rgb) {
   return pngFromPixels(size, size, renderIcon(size, rgb).buffer);
 }
 
-// 生成 ICO（PNG-in-ICO，Vista+ 标准）：多尺寸条目（16/32/256）+ 品牌蓝。
-// 供 rcedit / electron-builder 设置 exe 图标，保证托盘/窗口/exe 图案一致。
+// 生成 ICO（PNG-in-ICO，Vista+ 标准）：多尺寸条目 + 品牌色。
+// 供 electron-builder 设置 exe 图标，保证托盘/窗口/exe 图案一致。
 function iconIcoBuffer(rgb, sizes) {
   const list = sizes || [16, 32, 256];
   const pngs = list.map((s) => iconPngBuffer(s, rgb));
@@ -170,14 +212,16 @@ function iconIcoBuffer(rgb, sizes) {
   return buf;
 }
 
-// 品牌蓝与其他状态色（与界面状态色一致）
+// 品牌蓝与其他状态色。
+// brand 与界面 CSS 的 `--accent: #3b82f6` 完全一致 —— 图标与 UI 用同一个主色，
+// 改配色时两边一起改，不会出现"图标是深蓝、按钮是亮蓝"这种不统一。
 const COLORS = {
-  brand: [47, 91, 215],
-  stopped: [138, 147, 163],
-  starting: [245, 185, 60],
-  ready: [62, 207, 142],
-  failed: [232, 84, 77],
-  safe: [240, 155, 60],
+  brand: [59, 130, 246],      // = renderer/styles.css 的 --accent
+  stopped: [138, 147, 163],   // 网关未运行
+  starting: [245, 185, 60],   // 启动中
+  ready: [62, 207, 142],      // 运行中
+  failed: [232, 84, 77],      // 启动失败
+  safe: [240, 155, 60],       // 需要留意
 };
 
 module.exports = { pngFromPixels, renderIcon, iconDataURL, iconPngBuffer, iconIcoBuffer, COLORS };
