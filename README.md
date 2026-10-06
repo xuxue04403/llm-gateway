@@ -320,6 +320,7 @@ scripts/               引擎一致性校验 / 绿色目录打包
 
 | 现象 | 先看什么 |
 |---|---|
+| **双击 exe 没反应、无窗口、无报错** | 环境变量 `ELECTRON_RUN_AS_NODE` 被设成了 `1`。它会让 Electron 程序**当成纯 Node 运行、不创建窗口**，然后立刻退出（退出码 0）—— 界面上看就是"什么都没发生"。见下方专节 |
 | 客户端报 401 | 「概览」里的统一 Key 是否与客户端里填的一致；改过 Key 就要重跑一次「客户端接入」 |
 | 请求 404 / 模型不存在 | 「模型」页里有没有这个逻辑名——网关**只认**配置里声明过的名字 |
 | 某家一直不被使用 | 「供应商」页点「测试」，看连通性；再看「日志」页的 `[route]` 行（每次请求都会记选路判定） |
@@ -327,3 +328,39 @@ scripts/               引擎一致性校验 / 绿色目录打包
 | Claude Code 报模型不存在 | 它默认要 `opus`/`sonnet`/`haiku` 这些别名；勾选「同时改写模型别名」重写一次 |
 | Codex 连不上 | 网关支持 `/v1/responses`，但**上游**也要支持；至少保留一家支持的供应商 |
 | 界面白屏 | 看 `<数据目录>\logs\app.log`——渲染层的报错会写进去 |
+
+### 「双击没反应」到底怎么回事
+
+这是 Electron 程序的一个通用陷阱，**不是本程序的 bug**，但几乎无法从现象猜到原因。
+
+`ELECTRON_RUN_AS_NODE=1` 会让 Electron 的 exe 退化成一个纯 Node 解释器：不加载界面、不创建窗口、
+没有脚本参数时直接退出（退出码 0）。于是双击之后**什么都不发生**——没有窗口、没有报错，
+任务管理器里也看不到残留进程。
+
+先确认（注意也要看**当前会话**的值，因为程序会继承）：
+
+```powershell
+[Environment]::GetEnvironmentVariable('ELECTRON_RUN_AS_NODE', 'User')
+[Environment]::GetEnvironmentVariable('ELECTRON_RUN_AS_NODE', 'Machine')
+$env:ELECTRON_RUN_AS_NODE
+```
+
+任一输出 `1` 就清掉：
+
+```powershell
+[Environment]::SetEnvironmentVariable('ELECTRON_RUN_AS_NODE', $null, 'User')
+Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+```
+
+**改完必须重启资源管理器**（运行中的 explorer 还揣着旧环境，不重启不生效）：
+
+```powershell
+taskkill /f /im explorer.exe
+Start-Process explorer.exe
+```
+
+> ⚠ **一个很容易自己踩到的坑**：如果你在**带着该变量的终端里**执行 `Start-Process explorer.exe`
+> 手动重启资源管理器，**新 explorer 会继承这个变量**，之后从资源管理器启动的一切程序都带着它。
+> 本项目的开发过程中就真实发生过一次——清 Windows 图标缓存时重启 explorer 导致的，
+> 表现是"刚构建好、刚才还能跑的 exe 突然双击不动了"。
+> **所以重启 explorer 之前，先确认当前会话里它是空的。**
