@@ -18,6 +18,12 @@ const models = require('./models');
 
 const TARGET_ID = 'dsh';
 
+// 显示名**只此一处**。卡片标题读的是 module.exports.name，预览弹窗标题读的是
+// preview() 返回的 name —— 两处各写一份字面量的话迟早会走散（审计实测：
+// 注册表写 'dsh' 而 preview 写 'dsh（DSH harness / DSH 桌面版）'，
+// 同一张卡片点进去标题就变了）。这里用一个常量喂两边。
+const DISPLAY_NAME = 'dsh（DSH harness / DSH 桌面版）';
+
 function dshHome(ctx) {
   if (ctx && ctx.home) return path.join(ctx.home, '.dsh');       // 测试用：指向临时 home
   return process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
@@ -211,7 +217,7 @@ function preview(ctx) {
 
   return {
     id: TARGET_ID,
-    name: 'dsh（DSH harness / DSH 桌面版）',
+    name: DISPLAY_NAME,
     method: 'engine',
     summary: `注册 gateway 提供商（${names.length} 个模型，协议 ${wire.api}）`,
     guard,
@@ -354,4 +360,4 @@ function restore(ctx) {
   };
 }
 
-module.exports = { id: TARGET_ID, name: 'dsh', detect, preview, apply, restore, paths, wireOf, findGatewayBlock, baseUrlHint: '由客户端仿真决定' };
+module.exports = { id: TARGET_ID, name: DISPLAY_NAME, detect, preview, apply, restore, paths, wireOf, findGatewayBlock, baseUrlHint: '由客户端仿真决定' };

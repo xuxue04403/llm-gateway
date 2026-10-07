@@ -83,11 +83,20 @@ function detectAll(baseCtx) {
     try {
       out.push(t.detect(baseCtx));
     } catch (e) {
-      out.push({
+      // ⚠ 兜底对象必须带上 wire。dsh 是唯一"线协议由全局 clientProfile 决定"的目标，
+      // 界面专门为它显示"将写入 <协议> / <baseURL>"。旧实现这个分支没有 wire，
+      // 于是 detect 一失败（例如 ~/.dsh/settings.yaml 是目录、ACL 拒绝时 statSync 抛），
+      // 那行就显示成"（未知）"—— 恰恰是用户最没把握、最需要提示的时候。
+      // 其它 4 个目标不读 wire，所以只有 dsh 受影响。
+      const one = {
         id: t.id, name: t.name, installed: false,
         evidence: ['检测失败：' + (e && e.message ? e.message : e)],
         configPaths: [], current: {},
-      });
+      };
+      if (typeof t.wireOf === 'function') {
+        try { one.wire = t.wireOf((baseCtx && baseCtx.config) || {}, baseCtx && baseCtx.port); } catch (_) { /* 猜不出来就算了 */ }
+      }
+      out.push(one);
     }
   }
   return out;

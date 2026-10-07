@@ -135,19 +135,30 @@ async function boot() {
   // 一键写入的目标检测（子进程 + 读磁盘，异步做，不挡首屏）
   // ⚠ 必须包 try/catch：这是**可选**功能，它失败不该把已经渲染好的整个界面干掉
   //（旧实现没有保护，检测一挂就走到最外层 catch → 整页变红字）。
-  // 同时保留"没检测过"与"检测到 0 个"的区别：null = 还没检测，[] = 检测了但没有目标。
+  //
+  // ⚠ 三种状态必须能区分开（旧实现把它们混成了同一种）：
+  //     clientDetect === null       → 还没检测 / 正在检测
+  //     clientDetect === [] 且无 err → 检测成功，但一个目标都没有
+  //     clientDetect === [] 且有 err → **检测失败**
+  //   旧实现在失败时也置 []，而渲染层把 [] 一律显示成"正在检测…" ——
+  //   于是检测一失败，界面就永久停在"正在检测…"，用户永远等不到结果，
+  //   也没有任何提示告诉他要点「重新检测」。审计实测命中。
   LG.clientDetect = null;
+  LG.clientDetectError = '';
   try {
     const det = await window.lgw.writeDetect();
     if (det && det.ok === false && !(det.targets || []).length) {
       LG.clientDetect = [];
-      toast('客户端检测失败：' + (det.error || '未知原因'), 'warn', 8000);
+      LG.clientDetectError = det.error || '未知原因';
+      toast('客户端检测失败：' + LG.clientDetectError, 'warn', 8000);
     } else {
       LG.clientDetect = (det && Array.isArray(det.targets)) ? det.targets : [];
+      if (!Array.isArray(det && det.targets)) LG.clientDetectError = '主进程返回的检测结果形状不对';
     }
   } catch (e) {
     LG.clientDetect = [];
-    toast('客户端检测失败：' + ((e && e.message) || e), 'warn', 8000);
+    LG.clientDetectError = (e && e.message) || String(e);
+    toast('客户端检测失败：' + LG.clientDetectError, 'warn', 8000);
   }
   LG.initClients();
 

@@ -631,4 +631,164 @@ t('注册表：未知目标返回错误而不是抛', () => {
   assert.strictEqual(r.ok, false);
 });
 
+/* ================================================================
+ * 第五轮审计修复的回归钉子
+ * ================================================================ */
+
+// —— F2：写入失败时也必须把"已经生成的备份"报出来 ——
+// 失败通常发生在最后的 rename，而备份在那之前就生成了。界面拿不到这个路径的话，
+// 用户会在"写入失败"的困惑里把旁边那份唯一的原始备份当垃圾删掉。
+t('F2：写入失败时仍返回 backup（备份已生成，不能被丢弃）', () => {
+  const home = newHome('f2');
+  const p = path.join(home, '.claude', 'settings.json');
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const original = JSON.stringify({ env: { OLD: '1' }, keep: 1 }, null, 2);
+  fs.writeFileSync(p, original, 'utf8');
+  const bak = p + util.BACKUP_SUFFIX;
+
+  // 让 rename 必然失败：把目标文件设为只读
+  fs.chmodSync(p, 0o444);
+  const r = util.writeAtomic(p, '{"new":true}');
+
+  assert.strictEqual(r.ok, false, '只读目标上的写入应当失败');
+  assert.ok(fs.existsSync(bak), '备份应当已经生成');
+  assert.strictEqual(r.backup, bak, '失败返回里必须带回 backup 路径');
+  assert.strictEqual(fs.readFileSync(bak, 'utf8'), original, '备份内容必须是原始文件');
+  assert.strictEqual(fs.readFileSync(p, 'utf8'), original, '失败时原文件不得被改动');
+  fs.chmodSync(p, 0o644);
+});
+
+t('F2：各目标在写入失败时都把 backups 带出来', async () => {
+  const cases = [
+    ['claude-code', '.claude/settings.json', '{"env":{"OLD":"1"}}'],
+    ['codex', '.codex/config.toml', 'model = "old"\n'],
+    ['opencode', '.config/opencode/opencode.json', '{"keep":1}'],
+    // envscript 写的是 <home>/clients/ 下的四个文件，名字由它自己决定 ——
+    // 这里用 buildFiles 拿真实名字，别写死（写死过一次，测试因此假通过）
+    ['envscript', null, '# old\n'],
+  ];
+  for (const [id, rel, body] of cases) {
+    const home = newHome('f2-' + id);
+    const ctx = ctxFor(home);
+    const mod = writers.get(id);
+    const realRel = rel || path.relative(home, path.join(mod.dirOf(ctx), mod.buildFiles(ctx).files[0].name));
+    const p = path.join(home, realRel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, body, 'utf8');
+    fs.chmodSync(p, 0o444);
+    const r = await writers.apply(id, ctx);
+    assert.strictEqual(r.ok, false, id + ' 在只读目标上应当失败（检查路径：' + realRel + '）');
+    const baks = (r.backups && r.backups.length ? r.backups : (r.backup ? [r.backup] : []));
+    assert.ok(baks.length > 0, id + ' 失败返回必须带出备份路径（界面要靠它提示用户别删）');
+    assert.ok(baks.some((b) => b.startsWith(p)), id + ' 备份路径应当指向目标文件');
+    fs.chmodSync(p, 0o644);
+  }
+});
+
+// —— F1：目标 config.toml 本身不合法时必须拦下 ——
+// 旧实现只校验"改完的"文本，从不看原文件；于是用户手工编辑漏个等号，
+// 我们照样写进去并弹"写入成功"，而 Codex 自己的解析器读不了这份文件。
+t('F1：codex 目标在现有 config.toml 不合法时拦下，且不写入', async () => {
+  const BAD = [
+    'this line has no equals sign\n',
+    '[unclosed table\n',
+    '{ this is not json \n',
+    '[t]\nk = 1\nnot_a_kv\n',
+    'model = "unterminated\n',
+    'model = "a"\nmodel = "b"\n',
+  ];
+  for (const bad of BAD) {
+    const home = newHome('f1');
+    const p = path.join(home, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, bad, 'utf8');
+
+    const pv = await writers.preview('codex', ctxFor(home));
+    assert.ok((pv.guard || []).length > 0, 'preview 必须给出 guard：' + JSON.stringify(bad));
+
+    const ap = await writers.apply('codex', ctxFor(home));
+    assert.strictEqual(ap.ok, false, 'apply 必须失败：' + JSON.stringify(bad));
+    assert.strictEqual(fs.readFileSync(p, 'utf8'), bad, '原文件必须一字未动');
+  }
+});
+
+t('F1 反向：合法的 config.toml 不能被误伤（含跨行数组、多行字符串、注释）', async () => {
+  const GOOD = [
+    'model = "gpt-5"\n',
+    'args = [\n  "-y",\n  "pkg",\n]\n',
+    'txt = """\n[brackets]\nno equals\n"""\nk = 1\n',
+    '[a.b] # comment\nk = 1\n',
+    '# only a comment\n',
+    '',
+    '[[srv]]\nname = "a"\n',
+    'x = "]" \ny = "["\n',
+  ];
+  for (const good of GOOD) {
+    assert.strictEqual(util.tomlValidate(good), '', '不该被误判：' + JSON.stringify(good));
+    const home = newHome('f1ok');
+    const p = path.join(home, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, good, 'utf8');
+    const ap = await writers.apply('codex', ctxFor(home));
+    assert.strictEqual(ap.ok, true, '合法文件应当写成功：' + JSON.stringify(good) + ' → ' + JSON.stringify(ap.errors));
+    const after = fs.readFileSync(p, 'utf8');
+    assert.ok(after.includes('model_providers.llmgateway'), '应写入 gateway 表');
+    assert.strictEqual(util.tomlValidate(after), '', '写完后仍须合法');
+  }
+});
+
+// —— F8：envscript.restore 部分失败时 errors 不能是空的 ——
+t('F8：envscript 恢复部分失败时 errors 带出真实原因', async () => {
+  const home = newHome('f8');
+  const ctx = ctxFor(home);
+  const first = await writers.apply('envscript', ctx);
+  assert.strictEqual(first.ok, true, '首次写入应成功');
+  const second = await writers.apply('envscript', ctx);
+  assert.strictEqual(second.ok, true, '二次写入应成功（生成 before-restore 备份）');
+
+  // 让其中一个目标文件无法写回 → 恢复时该条必失败
+  const one = first.files[0];
+  fs.chmodSync(one, 0o444);
+  const r = await writers.restore('envscript', ctx);
+  fs.chmodSync(one, 0o644);
+
+  assert.strictEqual(r.ok, false, '应当报告失败');
+  assert.ok((r.errors || []).length > 0, 'errors 不能为空 —— 否则界面只能显示"未知错误"');
+  assert.ok(r.errors.some((e) => e.includes(one) || /EPERM|denied|permitted/i.test(e)),
+    'errors 里应当能看到是哪个文件、什么原因：' + JSON.stringify(r.errors));
+});
+
+// —— F5：detectAll 的兜底分支必须带 wire（dsh 的线协议提示靠它）——
+t('F5：detect 抛异常时，dsh 的兜底结果仍带 wire', () => {
+  const dsh = writers.get('dsh');
+  const orig = dsh.detect;
+  const base = { config: { clientProfile: 'claude' }, port: PORT, home: process.env.USERPROFILE };
+  dsh.detect = () => { throw new Error('注入故障：模拟 settings.yaml 不可读'); };
+  try {
+    const d = writers.detectAll(base).find((x) => x.id === 'dsh');
+    assert.ok(d, '兜底分支仍应产出一条 dsh 记录');
+    assert.strictEqual(d.installed, false);
+    assert.ok(d.wire, '兜底分支必须带 wire —— 否则界面显示"（未知）"，用户无法预判线协议');
+    assert.strictEqual(d.wire.api, 'anthropic-messages', 'clientProfile=claude 应为 anthropic');
+    assert.ok(!/\/v1$/.test(d.wire.baseURL), 'claude 形态的 baseURL 不带 /v1');
+  } finally {
+    dsh.detect = orig;
+  }
+  // 正常运行路径不受影响
+  const normal = writers.detectAll({ config: { clientProfile: '' }, port: PORT, home: process.env.USERPROFILE })
+    .find((x) => x.id === 'dsh');
+  assert.ok(normal.wire, '正常路径本来就有 wire');
+});
+
+// —— 目标显示名必须一致（卡片标题与预览弹窗标题是同一个）——
+t('显示名一致：注册表的 name 与 preview.name 必须相同', () => {
+  for (const item of writers.list()) {
+    const mod = writers.get(item.id);
+    const pv = mod.preview(ctxFor(newHome('nm-' + item.id)));
+    if (pv && pv.name) {
+      assert.strictEqual(item.name, pv.name, item.id + ' 的卡片名与预览名不一致');
+    }
+  }
+});
+
 run();

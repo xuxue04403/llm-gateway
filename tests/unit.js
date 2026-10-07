@@ -716,6 +716,129 @@ t('日志着色：中文关键词必须能命中（`\\b` 对 CJK 不成立，旧
   assert.strictEqual(sb.logLineClass('数据目录：D:\\x'), '', '普通行不上色');
 });
 
+/* ---- 第五轮审计：日志着色的两类误判 ---- */
+
+function loadLogClass() {
+  const vm = require('vm');
+  const logsSrc = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'js', 'logs.js'), 'utf8');
+  const sb = {
+    console, JSON, String, Number, Math, RegExp, Array, Object, Date,
+    document: { querySelector: () => null, querySelectorAll: () => [], createElement: () => ({ style: {}, classList: { add() {}, remove() {} }, addEventListener() {}, appendChild() {} }) },
+    LG: { renders: {}, state: null, activeView: 'logs' }, $: () => null, $$: () => [], esc: (s) => String(s), toast: () => {},
+  };
+  sb.globalThis = sb;
+  vm.createContext(sb);
+  vm.runInContext(logsSrc, sb, { filename: 'logs.js' });
+  return sb.logLineClass;
+}
+
+t('日志着色 F3：路由失败行不得被标成绿色（"无候选"曾与"路由成功"同色）', () => {
+  const cls = loadLogClass();
+  // "无候选 provider"是用户最需要立刻看见的路由失败（模型名拼错 / 供应商被停用），
+  // 旧实现按 `[route]` 前缀一律标绿 —— 恰好把最该看见的失败显示成"成功"。
+  assert.strictEqual(cls('[route] model-x: 无候选 provider（没有一家声明该模型）'), 'warn');
+  assert.strictEqual(cls('[route] model-x: 全部候选熔断，归属无法判定（p1）'), 'err');
+  assert.strictEqual(cls('[route] model-x: 候选全部熔断（p1 breaker open）'), 'err');
+  // 正常路由仍然标绿（别把这条规则误扩成"所有 [route] 都警告"）
+  assert.strictEqual(cls('[route] model-x: 2 个候选（p1 priority=1, p2 priority=2）'), 'ok');
+  // failover 决策行不能无色（用户扫日志时全靠它们判断"为什么走了那家"）
+  assert.strictEqual(cls('failover stopped (model-x via p1 HTTP 400 → 502, anthropic)'), 'warn');
+  assert.strictEqual(cls('upstream p1 HTTP 404（未见"模型不存在"特征，按路由不存在处理）→ 继续 failover'), 'warn');
+});
+
+t('日志着色 F4：正常自愈行不得被标红（"网络错误→原地重试一次"曾整片飘红）', () => {
+  const cls = loadLogClass();
+  assert.strictEqual(cls('upstream p1 网络错误（ECONNRESET，1200ms）→ 原地重试一次'), 'warn', '抖动后自动恢复是正常行为');
+  assert.strictEqual(cls('upstream p1 重试成功（网络抖动已恢复）'), 'warn');
+  assert.strictEqual(cls('upstream p1 内容拦截，已降敏重试一次…'), 'warn');
+  // 真失败仍然是 err（不能因为上面这条规则把真错误也降级）
+  assert.strictEqual(cls('upstream p1 重试失败: ECONNRESET'), 'err');
+});
+
+t('日志着色：客户端最终状态码必须决定颜色（status=502 曾被标绿）', () => {
+  const cls = loadLogClass();
+  // `[call]` 收尾行没有任何中文错误词，旧实现按 `[call]` 前缀一律标绿 ——
+  // 一次彻底失败的请求被显示成绿色"成功"，是最坏的一种误判。
+  assert.strictEqual(cls('[call] responses POST /v1/responses status=502 dur=120ms from=p1 proto=responses'), 'err');
+  assert.strictEqual(cls('[call] chat POST /v1/chat/completions status=401 stream=false dur=30ms from=p1'), 'err');
+  assert.strictEqual(cls('[call] responses POST /v1/responses status=200 dur=120ms from=p1 proto=responses'), 'ok');
+  assert.strictEqual(cls('[call] m all-providers status=ok dur=1330ms'), 'ok', '非数字状态不受影响');
+  // 上游 4xx/5xx（请求本身可能已经 failover 成功）至少算警告
+  assert.strictEqual(cls('upstream p1 HTTP 401: invalid api key'), 'warn');
+  assert.strictEqual(cls('catalog p1 HTTP 403: forbidden'), 'warn');
+});
+
+/* ==================== TOML 自检（第五轮强化）==================== */
+
+t('tomlValidate：行形状错误必须抓到（旧实现 8 种真实坏写法全放行）', () => {
+  const util = require('../src/writers/util');
+  const BAD = [
+    ['this line has no equals sign\n', '没有等号'],
+    ['[unclosed table\n', '表头少右括号'],
+    ['{ this is not json \n', 'JSON 混入'],
+    ['[t]\nk = 1\nnot_a_kv\n', '表内非键值对'],
+    ['[a.b # comment\n', '带注释的未闭合表头'],
+    ['model = "unterminated\n', '字符串没闭合'],
+    ['model = "a"\nmodel = "b"\n', '顶层键重复'],
+  ];
+  for (const [text, why] of BAD) {
+    assert.ok(util.tomlValidate(text) !== '', '应当抓到（' + why + '）：' + JSON.stringify(text));
+  }
+});
+
+t('tomlValidate：合法 TOML 一个都不能误伤（跨行数组的续行没有 =，最容易误判）', () => {
+  const util = require('../src/writers/util');
+  const GOOD = [
+    'a = 1\nb = "x"\nc = true\n',
+    'args = [\n  "-y",\n  "pkg",\n  "@scope/name",\n]\nnext = 1\n',   // 续行没有 =
+    'point = { x = 1, y = 2 }\n',
+    'm = [[1, 2], [3, 4]]\n',
+    'cmd = ["a#b", "c"]  # 尾注释\n',
+    'txt = """\nline1\n[brackets]\nno equals here\n"""\nk = 1\n',        // 多行串里有"像表头/像正文"的行
+    "txt = '''\nraw \\n not escape\n'''\n",
+    '[a.b] # 行尾注释\nk = 1\n',
+    '[[srv]]\nname = "a"\n[[srv]]\nname = "b"\n',
+    'a.b.c = 1\n',
+    '"quoted key" = 1\n\'literal key\' = 2\n',
+    '["a.b"]\nk = 1\n',
+    '# 只有注释\n\n# 又一行注释\n',
+    'a=1\nb=[1,2]\n',                                                    // 无空格
+    'x = [\n  1, # one\n  2, # two\n]\n',
+    'x = "]" \ny = "["\n',                                               // 值里的方括号
+    'x = { a = "b=c" }\n',
+    '["a\\"b"]\nk = 1\n',                                                // 键里的转义引号
+    '',
+    'a = 1\r\n[t]\r\nk = 2\r\n',                                         // CRLF
+  ];
+  for (const text of GOOD) {
+    assert.strictEqual(util.tomlValidate(text), '', '不该误判：' + JSON.stringify(text));
+  }
+});
+
+t('tomlHeaderKey：等价写法必须归一化成同一个键（含引号内的反斜杠转义）', () => {
+  const util = require('../src/writers/util');
+  const strip = (h) => String(h).replace(/^\[+|\]+$/g, '').trim();
+  const PAIRS = [
+    ['[a.b]', '["a"."b"]'],
+    ['[a . b]', '[a.b]'],
+    ["['model_providers'.'llmgateway']", '["model_providers"."llmgateway"]'],
+    // 关键：TOML 基本字符串里 `\"` 是"一个引号字符"，与字面量写法是**同一张表**。
+    // 旧实现不处理转义，两者归一化结果不同 → 同一张表被认成两张 → upsert 追加重复表。
+    ['["a"."llm\\"gateway"]', "['a'.'llm\"gateway']"],
+    ['["a"."l\\\\m"]', "['a'.'l\\m']"],
+  ];
+  for (const [x, y] of PAIRS) {
+    assert.strictEqual(util.tomlHeaderKey(strip(x)), util.tomlHeaderKey(strip(y)),
+      '应当等价：' + x + '  vs  ' + y);
+  }
+  // 反向：一层 vs 两层**不**等价（别把归一化做过头）
+  assert.notStrictEqual(util.tomlHeaderKey(strip('[a.b]')), util.tomlHeaderKey(strip('["a.b"]')));
+  // 畸形输入不抛
+  for (const h of ['', '   ', '"', "'", '...', 'a..b', '模型.名称']) {
+    assert.doesNotThrow(() => util.tomlHeaderKey(strip(h)), '不该抛：' + JSON.stringify(h));
+  }
+});
+
 /* ==================== 应用图标 ==================== */
 
 t('图标：所有尺寸与状态色都能渲染，且形状正确（圆角方块）', () => {

@@ -718,11 +718,15 @@ function registerIpc() {
     };
   });
 
-  handle('write:restore', (_e, id) => {
+  handle('write:restore', async (_e, id) => {
     const target = String(id || '');
     const ctx = writeCtx({});
-    const r = writers.restore(target, ctx);
-    logger.info(`一键写入[${target}]：恢复${r.ok ? '成功' : '失败'}`);
+    // ⚠ 必须 await：writers.restore 是 async，返回 Promise。
+    // 漏了 await 时 `r.ok` 恒为 undefined → 日志**永远**记「恢复失败」，
+    // 哪怕恢复实际成功了（审计实测：await 后 r.ok=true，不 await 时是 undefined）。
+    // 排错时这条日志会把方向带反。apply 那边一直是 await 的，这里当初漏了。
+    const r = await writers.restore(target, ctx);
+    logger.info(`一键写入[${target}]：恢复${r && r.ok ? '成功' : '失败'}`);
     return r;
   });
 

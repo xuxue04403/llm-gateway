@@ -19,6 +19,7 @@ const LG = {
   health: null,
   testResults: {},      // providerId -> 探测结果
   clientDetect: [],     // 一键写入目标的检测结果
+  clientDetectError: '', // 检测失败的原因（非空即"失败"，与"检测到 0 个"区分开）
   renders: {},          // view -> render 函数
   activeView: 'dashboard',
 };

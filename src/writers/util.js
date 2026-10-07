@@ -57,9 +57,12 @@ function ensureDir(file) {
  * @returns {{ok:boolean, backup?:string, error?:string, skipped?:boolean}}
  */
 function writeAtomic(file, text) {
+  // ⚠ backup 必须在 try 之外声明：写入失败（rename 被独占锁定等）时备份**已经生成**了，
+  // 若把它丢在 try 里，throw 之后 catch 只能回 {ok:false,error} —— 界面就拿不到备份路径。
+  // 而"写入失败"恰恰是用户最需要知道备份在哪的时候（否则他可能把那份唯一备份当垃圾删掉）。
+  let backup = '';
   try {
     ensureDir(file);
-    let backup = '';
     if (exists(file)) {
       try {
         fs.readFileSync(file);           // 只验证可读性，内容用不到
@@ -93,7 +96,8 @@ function writeAtomic(file, text) {
     }
     return { ok: true, backup };
   } catch (e) {
-    return { ok: false, error: e && e.message ? e.message : String(e) };
+    // 带上 backup：失败路径上它通常非空（备份先于写入生成），必须让调用方/界面看到
+    return { ok: false, backup, error: e && e.message ? e.message : String(e) };
   }
 }
 
@@ -391,6 +395,20 @@ function tomlHeaderKey(raw) {
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (quote) {
+      // TOML **基本字符串**里的 `\` 是转义符：`\"` 表示一个引号字符，不是"段结束"。
+      // 不处理的话 `["a"."llm\"gateway"]` 会被切成错误的分段（`llm\` + 后面被当成新段），
+      // 于是它与**字面量**写法 `'llm"gateway'`（同一张表）归一化结果不同 ——
+      // 同一张表被认成两张，upsert 会追加一张重复表。
+      // （审计实测：`"llm\"gateway"` 旧实现得到 `"llm\\gateway"`。）
+      if (c === '\\' && quote === '"') {
+        const n = s[i + 1];
+        if (n == null) { cur += '\\'; continue; }
+        i++;
+        const ESC = { n: '\n', t: '\t', r: '\r', b: '\b', f: '\f', '"': '"', '\\': '\\' };
+        // 未知转义（TOML 里本就不合法）原样保留，别把内容吃掉
+        cur += Object.prototype.hasOwnProperty.call(ESC, n) ? ESC[n] : ('\\' + n);
+        continue;
+      }
       if (c === quote) { quote = null; if (c === '"' && s[i + 1] === '"') i++; continue; }
       cur += c;
       continue;
@@ -554,6 +572,53 @@ function tomlUnquote(raw) {
 }
 
 /**
+ * 统计一行带来的"括号净深度"增量（引号内与注释里的括号不算）。
+ *
+ * 只服务于下面 tomlValidate 的第 0 步：判断当前是否处在**跨行的数组/内联表**里。
+ * 那些续行（`  "-y",`）本来就没有 `=`，不能按"键值对"去要求它们。
+ * 刻意保守：认不出来时宁可少算，也不误伤合法文件。
+ */
+function bracketDelta(code) {
+  let d = 0;
+  let q = null;
+  for (let i = 0; i < code.length; i++) {
+    const c = code[i];
+    if (q) {
+      if (c === '\\' && q === '"') { i++; continue; }
+      if (c === q) q = null;
+      continue;
+    }
+    if (c === '"' || c === "'") { q = c; continue; }
+    if (c === '#') break;
+    if (c === '[' || c === '{') d++;
+    else if (c === ']' || c === '}') d--;
+  }
+  return d;
+}
+
+/**
+ * 这一行是否**结束在引号内部**（即字符串没闭合）。
+ *
+ * 先剥掉多行字符串的定界符 `"""` / `'''` —— 它们是"合法的未闭合"，不算错。
+ * 剩下的按单引号扫描，末尾仍停在引号里就是漏了右引号。
+ */
+function endsInsideQuote(code) {
+  const s = String(code == null ? '' : code).replace(/"""|'''/g, '');
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) {
+      if (c === '\\' && q === '"') { i++; continue; }
+      if (c === q) q = null;
+      continue;
+    }
+    if (c === '#') return false;
+    if (c === '"' || c === "'") q = c;
+  }
+  return q !== null;
+}
+
+/**
  * 轻量 TOML 自检：只查"会让解析器**整体**失败"的结构性问题。
  *
  * 为什么需要它（三条都是实测出来的高危）：我们改的是用户**已有的** config.toml，
@@ -570,6 +635,43 @@ function tomlValidate(text) {
   const src = String(text == null ? '' : text);
   const lines = src.split(/\r?\n/);
   const lex = tomlLex(lines);
+
+  // 0) 行形状：代码行必须是"键 = 值"、表头或注释之一。
+  //
+  //    为什么必须有这一步（审计实测）：下面 1)~4) 全是对**结构**的检查，对
+  //    `this line has no equals sign`、`[unclosed table`、`{ this is not json`
+  //    这类**手工编辑失误**一律放行 —— 8 种真实坏写法 8 种全过。
+  //    于是 codex 会带着"写入成功"把它们原样留着，而 Codex 自己的解析器读不了，
+  //    用户拿不到任何提示（claude-code / opencode 在同类输入下都会拦）。
+  //
+  //    只判"确定不合法"的形态：没有 `=`、表头没有右括号。
+  //    不做值层面的校验（`n = 12abc` 这种留给真正的解析器），避免误伤。
+  {
+    let depth = 0;
+    let bad = '';
+    // ⚠ 第二个参数是**循环上界**（`for (i = 0; i < limit; i++)`），不是起始行。
+    // 传 0 的话一次都不跑 —— 这里必须传 lines.length。
+    forEachCodeLine(lines, lines.length, (raw, i) => {
+      const t = String(raw == null ? '' : raw).trim();
+      if (depth === 0 && t && !t.startsWith('#')) {
+        if (t.startsWith('[')) {
+          if (!/\][ \t]*(#.*)?$/.test(t)) { bad = '第 ' + (i + 1) + ' 行的表头没有右括号'; return true; }
+        } else if (!/^[^=]+=/.test(t)) {
+          bad = '第 ' + (i + 1) + ' 行既不是「键 = 值」、也不是表头或注释';
+          return true;
+        } else if (endsInsideQuote(t)) {
+          // 值里的引号没闭合（`model = "未闭合`）。TOML 会把它连到下一行甚至文件尾，
+          // 是手工编辑最常见的事故之一，且会让整份文件不可读。
+          bad = '第 ' + (i + 1) + ' 行的字符串没有闭合';
+          return true;
+        }
+      }
+      depth += bracketDelta(t);
+      if (depth < 0) depth = 0;      // 多余的右括号不改变后续判定，别把后面全带偏
+      return false;
+    });
+    if (bad) return 'TOML 语法有问题：' + bad;
+  }
 
   // 1) 未闭合的多行字符串（用词法扫描的结果，而不是"数引号奇偶"——后者会把
   //    `a = """x'''y"""` 这种**合法**写法误判为未闭合）
@@ -609,10 +711,14 @@ function tomlValidate(text) {
     }
   }
 
-  // 4) 同一张表内键重复
+  // 4) 同一张表内键重复（含**第一个表头之前的顶层区**）
+  //
+  //    ⚠ 顶层区原来被漏掉了：循环只从 heads[0] 开始，于是 `model = "a"` 紧跟
+  //    `model = "b"` 这种顶层重复键一路放行 —— 而 TOML 对它是硬错误
+  //    （Cannot overwrite a value），整份文件读不了。审计实测命中。
   {
-    for (let hi = 0; hi < heads.length; hi++) {
-      const h = heads[hi];
+    for (let hi = -1; hi < heads.length; hi++) {
+      const h = hi < 0 ? { line: -1, name: '（顶层）' } : heads[hi];
       const end = hi + 1 < heads.length ? heads[hi + 1].line : lines.length;
       const seen = new Set();
       let dup = '';
@@ -625,7 +731,7 @@ function tomlValidate(text) {
         }
         return false;
       });
-      if (dup) return '表 [' + h.name + '] 里键 ' + dup + ' 重复了';
+      if (dup) return (hi < 0 ? '顶层的键 ' : '表 [' + h.name + '] 里的键 ') + dup + ' 重复了';
     }
   }
 
@@ -672,5 +778,6 @@ module.exports = {
   writeAtomic, restore, backupInfo, ensureDir,
   redact, maskValue, simpleDiff,
   tomlScanHeaders, tomlSectionRange, tomlTopKeyLine, tomlString, tomlUpsertTopKey, tomlUpsertTable, tomlReadTable, tomlUnquote,
+  tomlHeaderKey,
   tomlValidate,
 };

@@ -165,4 +165,6 @@ if (problems.length) {
 
 console.log(`[OK] 差异与声明一致：共 ${DECLARED.length} 处已声明改动，无未声明变化。`);
 console.log('     每一处的理由见 scripts/check-engine-parity.mjs 的 DECLARED（用 --verbose 打印）。');
-console.log('     ⇒ "除声明项外，网关功能一字未减"这句话仍然可机器复核。');
+console.log('     ⇒ 「除这些块之外，引擎没有别的块被改动」这句话可机器复核。');
+console.log('     ⚠ 粒度是**块**不是行：一旦某个块进了 DECLARED，之后对它内部的修改');
+console.log('       （包括整段删功能）就不会再被发现 —— 那由 tests/gateway.test.js 等测试守。');

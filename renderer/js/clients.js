@@ -3,6 +3,23 @@
 
 LG.clientOptions = LG.clientOptions || {};
 
+/**
+ * 从主进程返回里提取"能给人看的原因"。
+ *
+ * 为什么需要它：主进程的 IPC 兜底包装 handle() 在 handler 抛异常时回的是
+ * `{ok:false, error:'内部错误（write:xxx）：<真实异常>'}` —— **没有 errors 数组**。
+ * 而各目标的正常失败路径回的是 `{ok:false, errors:[...]}`。
+ * 旧实现在预览/写入/恢复三处只读 errors，于是主进程兜底的失败一律显示成"未知错误"，
+ * 恰好把唯一有价值的线索（真实异常）丢掉。同文件其它 20+ 处都是正确读 r.error 的。
+ */
+function errTextOf(r) {
+  if (!r) return '主进程没有返回结果';
+  const arr = Array.isArray(r.errors) ? r.errors.filter(Boolean) : [];
+  if (arr.length) return arr.join('；');
+  if (r.error) return String(r.error);
+  return '未知错误';
+}
+
 // iFlow CLI 已于 2026-04 停止服务（官方 2026-03-20 停止维护、04-17 关闭），
 // 故不再作为写入目标。这里不保留它的样式与说明 —— 目标清单由主进程的
 // writers.list() 提供，渲染层只按 id 查样式，多的键是无害的，但留着会误导。
@@ -36,8 +53,20 @@ function modelSelectHtml(id, current) {
 
 LG.renders.clients = function renderClients() {
   const grid = $('#clientGrid');
-  if (!LG.clientDetect.length) {
+  // 三种状态必须分开显示（见 app.js 里那段注释）：把"检测失败"显示成"正在检测…"
+  // 会让用户永远等下去，也不知道该点「重新检测」。
+  if (LG.clientDetect === null || LG.clientDetect === undefined) {
     grid.innerHTML = '<div class="empty">正在检测…</div>';
+    return;
+  }
+  if (!LG.clientDetect.length) {
+    grid.innerHTML = LG.clientDetectError
+      ? '<div class="empty">客户端检测失败：' + esc(LG.clientDetectError)
+        + '<br><span class="hint">这是可选功能，不影响网关本身。点右上角「重新检测」重试；'
+        + '若一直失败，看「日志」页里的 [界面] 报错。</span></div>'
+      : '<div class="empty">没有检测到可实现一键写入的客户端。'
+        + '<br><span class="hint">本程序支持 dsh / Claude Code / Codex / OpenCode / 通用环境变量脚本；'
+        + '对应的配置目录不存在时就不会出现在这里。</span></div>';
     return;
   }
   const names = modelNames();
@@ -188,7 +217,10 @@ function dirtyWarningHtml() {
 async function doPreview(id) {
   const r = await window.lgw.writePreview(id, clientOptions(id));
   if (!r || !r.ok) {
-    toast('预览失败：' + ((r && r.errors || []).join('；') || '未知错误'), 'err', 8000);
+    // ⚠ 必须读 r.error：主进程的 handle() 包装在 handler 抛异常时回的是
+    // `{ok:false, error:'内部错误（write:preview）：…'}`，**没有 errors 数组**。
+    // 只读 errors 的话，用户看到的永远是一句"未知错误"，唯一有价值的线索被丢掉。
+    toast('预览失败：' + errTextOf(r), 'err', 8000);
     return;
   }
   const guards = (r.guard || []).length
@@ -263,9 +295,16 @@ async function doApply(id, skipConfirm) {
   toast('正在写入 ' + (t.name || id) + ' …', '', 2500);
   const r = await window.lgw.writeApply(id, clientOptions(id));
   if (!r || !r.ok) {
+    // 失败时**必须**把已经生成的备份摆出来。写入失败通常发生在最后的 rename 阶段，
+    // 而备份在那之前就生成了 —— 用户按这个弹窗去手工修的时候，若不知道旁边躺着一份
+    // 原始备份，很可能把它当垃圾删掉，那唯一的一份就没了。
+    const baks = (r && (r.backups || (r.backup ? [r.backup] : []))) || [];
     Modal.open({
       title: '写入失败 · ' + (t.name || id),
-      body: `<div class="guard"><ul>${(r && r.errors || ['未知错误']).map((e) => `<li>${esc(e)}</li>`).join('')}</ul></div>
+      body: `<div class="guard"><ul>${esc(errTextOf(r)).split('；').map((e) => `<li>${esc(e)}</li>`).join('')}</ul></div>
+        ${baks.length ? `<div class="warnbox"><b>原文件已被备份（先别删）：</b><br />`
+          + baks.map((b) => '<code>' + esc(b) + '</code>').join('<br />')
+          + '<br /><span class="hint">这份备份是你写入前的原始内容。要还原就点卡片上的「恢复」。</span></div>' : ''}
         ${r && r.output ? `<pre class="log" style="max-height:220px;">${esc(r.output)}</pre>` : ''}`,
       buttons: [{ label: '知道了', cls: 'btn-primary' }],
     });
@@ -303,7 +342,11 @@ async function doRestore(id) {
   if (r && r.ok) {
     toast('已恢复：' + ((r.results || []).map((x) => x.file).join('、') || '无变化'), 'ok', 5000);
   } else {
-    toast('恢复失败：' + ((r && r.errors || []).join('；') || '未知错误'), 'err', 8000);
+    // 部分失败时，真正的原因在 results[i].error 里（例如 envscript 的某个文件被占用）。
+    // 只看 errors 会在"errors 为空但有失败结果"的目标上退化成"未知错误"。
+    const fromResults = ((r && r.results) || []).filter((x) => x && x.ok === false && x.error)
+      .map((x) => (x.file ? x.file + '：' : '') + x.error);
+    toast('恢复失败：' + (fromResults.join('；') || errTextOf(r)), 'err', 10000);
   }
   redetectClients();
 }
@@ -311,8 +354,25 @@ async function doRestore(id) {
 /* ---------------- 检测 ---------------- */
 
 async function redetectClients() {
-  const r = await window.lgw.writeDetect();
-  LG.clientDetect = (r && r.targets) || [];
+  // 与 boot 时同款：把"正在检测 / 检测失败 / 检测到 0 个"三种状态区分开
+  LG.clientDetect = null;
+  LG.clientDetectError = '';
+  LG.renders.clients();
+  try {
+    const r = await window.lgw.writeDetect();
+    if (r && r.ok === false && !(r.targets || []).length) {
+      LG.clientDetect = [];
+      LG.clientDetectError = r.error || '未知原因';
+      toast('客户端检测失败：' + LG.clientDetectError, 'warn', 8000);
+    } else {
+      LG.clientDetect = (r && Array.isArray(r.targets)) ? r.targets : [];
+      if (!Array.isArray(r && r.targets)) LG.clientDetectError = '主进程返回的检测结果形状不对';
+    }
+  } catch (e) {
+    LG.clientDetect = [];
+    LG.clientDetectError = (e && e.message) || String(e);
+    toast('客户端检测失败：' + LG.clientDetectError, 'warn', 8000);
+  }
   LG.renders.clients();
 }
 

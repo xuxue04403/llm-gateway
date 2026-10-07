@@ -155,6 +155,21 @@ function preview(ctx) {
   const guard = [];
   const keyProblem = util.apiKeyProblem(ctx.apiKey);
   if (keyProblem) guard.push(keyProblem);
+  // 原文件**本身**是不是合法 TOML。
+  //
+  // 审计实测（8/8 命中）：旧实现只对"改完的"文本跑 tomlValidate，从不看原文件。
+  // 于是用户手工编辑时漏个等号、`[table` 少个右括号、字符串没闭合 —— 我们照样写进去、
+  // 界面弹绿色"写入成功"，而 Codex 自己的解析器读不了这份文件，他的 mcp_servers /
+  // projects / 其它 provider 全部失效。对照：claude-code 与 opencode 在同类输入下都会拦。
+  // 用户不会想到"是原来就坏的"，只会认为是我们写坏的。
+  if (String(before || '').trim()) {
+    const beforeError = util.tomlValidate(before);
+    if (beforeError) {
+      guard.push('现有 config.toml 本身就不是合法 TOML（' + beforeError + '）—— 请先修好它。'
+        + 'Codex 现在读不了这份文件，写入也救不回来；先修好再写，否则你会以为是本程序写坏的。'
+        + '（本程序只做结构性校验，抓不出所有语法错误；如需彻底确认可先用 Codex 自己启动一次。）');
+    }
+  }
   if (!model) guard.push('网关没有任何启用供应商声明模型 —— Codex 会去请求一个网关不认识的名字');
   if (names.length === 0) guard.push('网关没有任何可用模型');
   const chosenProblem = models.chosenModelProblem(ctx.config || {}, model);
@@ -243,6 +258,20 @@ function apply(ctx) {
 
   const text = buildConfig(ctx, cur.text);
 
+  // 原文件本身不合法 → 中止（与 preview 的 guard 同源，纵深防御）。
+  // 不拦的话我们会往一份 Codex 读不了的文件里继续写，还报"成功"。
+  if (String(cur.text || '').trim()) {
+    const beforeError = util.tomlValidate(cur.text);
+    if (beforeError) {
+      return {
+        ok: false,
+        errors: ['现有 config.toml 本身就不是合法 TOML（' + beforeError + '），已中止写入。'
+          + '原文件未改动 —— 请先修好它（Codex 现在也读不了这份文件）。'],
+        files: [],
+      };
+    }
+  }
+
   // 写前自检：不合法就不写（宁可不写，也不写坏）。
   const preError = util.tomlValidate(text);
   if (preError) {
@@ -250,7 +279,8 @@ function apply(ctx) {
   }
 
   const w = util.writeAtomic(file, text);
-  if (!w.ok) return { ok: false, errors: [w.error], files: [] };
+  // 失败时也带回 backups（本目标一律用复数，与成功路径一致，便于 main.js 归一化）
+  if (!w.ok) return { ok: false, errors: [w.error], files: [], backups: w.backup ? [w.backup] : [] };
 
   // 写后复核：落盘的内容必须仍是合法 TOML。不合法就用备份回滚 ——
   // 这是最后一道闸门，用户自己的 provider / mcp_servers 不该被我们写坏。

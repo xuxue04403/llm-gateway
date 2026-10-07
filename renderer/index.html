@@ -12,10 +12,14 @@
       base-uri 'none'           防注入 <base href> 把相对脚本路径指到外部
       form-action 'none'        防注入表单把数据 POST 出去
       object-src / frame-src / worker-src / media-src / manifest-src 'none'  一律不用
-    （frame-ancestors 在 meta 里无效，只作占位说明；本程序不加载任何外部页面。）
+    ⚠ **不要**在这里写 frame-ancestors：该指令在 <meta> 投递时会被浏览器忽略，
+      并在每次启动时往 app.log 写一条 `[ERROR] The Content Security Policy directive
+      'frame-ancestors' is ignored when delivered via a <meta> element` ——
+      一条永远存在的假 ERROR，会把真正的错误淹掉。本程序不加载任何外部页面，
+      也没有被 iframe 嵌套的场景，这条指令本来就不需要。
   -->
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'; worker-src 'none'; media-src 'none'; manifest-src 'none';" />
+        content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; media-src 'none'; manifest-src 'none';" />
   <title>LLM Gateway</title>
   <link rel="stylesheet" href="styles.css" />
 </head>

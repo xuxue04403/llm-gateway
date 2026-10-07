@@ -135,7 +135,8 @@ function apply(ctx) {
   const { list, model } = plan(ctx);
   const after = buildConfig(cfg, ctx, model, list);
   const w = util.writeAtomic(file, JSON.stringify(after, null, 2) + '\n');
-  if (!w.ok) return { ok: false, errors: [w.error], files: [] };
+  // 失败时也带上 backup，理由同 claude-code（备份先于 rename 生成）
+  if (!w.ok) return { ok: false, errors: [w.error], files: [], backup: w.backup || null };
   return {
     ok: true,
     errors: [],

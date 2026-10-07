@@ -259,7 +259,10 @@ function apply(ctx) {
   for (const f of buildFiles(ctx).files) {
     const p = path.join(dir, f.name);
     const w = util.writeAtomic(p, f.text);
-    if (!w.ok) return { ok: false, errors: [p + '：' + w.error], files, backups };
+    // 失败时把**当前这个文件**的备份也带上（w.backup 在这一刻已经生成，push 还没执行到）
+    if (!w.ok) {
+      return { ok: false, errors: [p + '：' + w.error], files, backups: w.backup ? backups.concat([w.backup]) : backups };
+    }
     files.push(p);
     if (w.backup) backups.push(w.backup);
   }
@@ -287,8 +290,17 @@ function restore(ctx) {
   return {
     ok: results.length > 0 && results.every((r) => r.ok),
     results,
-    errors: results.length === 0 ? ['这些文件由本程序生成，没有需要恢复的备份'] : [],
+    // ⚠ 原来只在"一条结果都没有"时给 errors，**有失败结果时反而给空数组** ——
+    // 于是界面拿到 ok:false + errors:[] 只能显示"恢复失败：未知错误"，
+    // 那条含真实原因（EPERM/路径）的 results[i].error 被整个丢掉。
+    // 与 codex / dsh 的写法对齐。
+    errors: results.length === 0
+      ? ['这些文件由本程序生成，没有需要恢复的备份']
+      : results.filter((r) => !r.ok).map((r) => r.file + '：' + r.error),
   };
 }
 
-module.exports = { id: TARGET_ID, name: '通用（环境变量脚本）', detect, preview, apply, restore, dirOf, buildFiles, endpoints, baseUrlHint: '两种都给' };
+// 名字必须与 target-envscript.js:239 的 preview.name 完全一致 —— 否则卡片上叫一个名字、
+// 点进预览弹窗又变成另一个（审计实测：注册表写「通用（环境变量脚本）」而 preview 写
+// 「通用（环境变量脚本 + 端点速查）」）。
+module.exports = { id: TARGET_ID, name: '通用（环境变量脚本 + 端点速查）', detect, preview, apply, restore, dirOf, buildFiles, endpoints, baseUrlHint: '两种都给' };

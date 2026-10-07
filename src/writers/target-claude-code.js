@@ -191,7 +191,9 @@ function apply(ctx) {
   const { patch, main, setDefaultModel } = envPatch(ctx);
   const after = buildSettings(cfg, patch, setDefaultModel ? main : '');
   const w = util.writeAtomic(file, after);
-  if (!w.ok) return { ok: false, errors: [w.error], files: [] };
+  // 失败时也要带上 backup：写入失败通常发生在 rename 阶段，而备份**那时已经生成**了。
+  // 界面若拿不到这个路径，用户会在"写入失败"的困惑里把旁边那份唯一的原始备份当垃圾删掉。
+  if (!w.ok) return { ok: false, errors: [w.error], files: [], backup: w.backup || null };
   return {
     ok: true,
     errors: [],
