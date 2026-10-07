@@ -378,4 +378,35 @@ t('测试自身：所有写入都落在临时目录里（绝不碰真实用户�
   }
 });
 
+t('测试自身：绝不写进真实的 dsh profile（DSH_PROFILE_DIR 陷阱）', () => {
+  // 实测事故（2026-10-07）：一次单元测试把 home 指向临时目录，但开发机的 shell 里带着
+  // `DSH_PROFILE_DIR=C:\Users\<user>\.dsh\profiles\desktop`。旧实现的 resolveProfile()
+  // 让环境变量优先，于是测试**写进了用户的真实 DSH 配置** —— 往 desktop profile 的
+  // cordis.patch.yml 里塞了 alpha/beta/zeta 三个夹具模型。
+  //
+  // 这条守卫直接检查真实 profile：要么不存在，要么不得含测试夹具的痕迹。
+  // （只做"是否被测试污染"的判定，不改动任何真实文件。）
+  const profilesRoot = path.join(os.homedir(), '.dsh', 'profiles');
+  if (!fs.existsSync(profilesRoot)) return;
+  const marks = ['alpha-model', 'beta-model', 'zeta-model', 'sk-user-OTHER-CLIENT-SECRET'];
+  const walk = (dir, depth) => {
+    if (depth > 2) return;
+    let entries = [];
+    try { entries = fs.readdirSync(dir); } catch (_) { return; }
+    for (const n of entries) {
+      const p = path.join(dir, n);
+      let st;
+      try { st = fs.statSync(p); } catch (_) { continue; }
+      if (st.isDirectory()) { walk(p, depth + 1); continue; }
+      if (!/\.(yml|yaml|json)$/.test(n)) continue;
+      const text = fs.readFileSync(p, 'utf8');
+      for (const m of marks) {
+        assert.ok(!text.includes(m), '真实 dsh profile 被测试污染了（含 ' + m + '）：' + p);
+      }
+      assert.ok(!text.includes(KEY), '真实 dsh profile 里出现了测试统一 Key：' + p);
+    }
+  };
+  walk(profilesRoot, 0);
+});
+
 run();

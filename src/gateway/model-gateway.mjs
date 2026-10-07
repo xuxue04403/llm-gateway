@@ -4907,6 +4907,144 @@ function writeFileAtomicDsh(file, text, backupSuffix) {
   fs.renameSync(tmp, file);
 }
 
+/**
+ * 把一段 YAML 块整体缩进 `n` 个空格（每行都加，空行不加）。
+ * settings.yaml 里 `gateway:` 在 4 空格，profile patch 里在 6 空格（多一层 `- id:` 数组项）。
+ */
+function reindentBlock(block, n) {
+  const pad = ' '.repeat(n);
+  return String(block).split('\n').map((l) => (l.trim() === '' ? l : pad + l)).join('\n');
+}
+
+/**
+ * 在 dsh **profile patch**（`<profiles>/<name>/cordis.patch.yml`）里 upsert
+ * `- id: llm-pi-ai` 这一项的 `config.providers.gateway`。
+ *
+ * 为什么需要它（2026-10-07 实测）：官方 dsh 已经把 `settings.yaml` 标记为 **removed** ——
+ * 启动时只把它**导入一次**然后改名成 `settings.yaml.imported`，而且必须重启才生效。
+ * 当前真正生效的载体是 profile 的 patch 文件（`cordis.patch.yml`），文件头自己写着
+ * "Your patch layer for this dsh profile, applied after every bundle layer"，
+ * Web 界面的 Models 页也是写这里。只写 settings.yaml 的话，用户会遇到
+ * "命令报成功、dsh 里却看不到网关"，而且**过一段时间还会凭空消失**（导入失败只在改名后的文件里留痕）。
+ *
+ * 定位方式与 upsertGatewayInSettings 同款：**逐行、按缩进层级**，不用全局正则 ——
+ * 数组里可能有别的项也叫 gateway，全局正则会把它们一起改掉。
+ *
+ * @param {string} text  patch 文件原文（可为空 = 文件不存在）
+ * @param {string} block 要写入的 `gateway:` 块（缩进按 patch 层级，6 空格起）
+ * @returns {string} 改写后的文本
+ */
+function upsertGatewayInPatch(text, block) {
+  const src = String(text == null ? '' : text);
+  const lines = src.split(/\r?\n/);
+  const indentOf = (l) => (/^(\s*)/.exec(l) || ['', ''])[1].length;
+  const isBlank = (l) => String(l).trim() === '';
+
+  // 找顶层数组项 `- id: llm-pi-ai`（引号可选，id 后可跟注释）
+  const idRe = /^(\s*)-\s*id:\s*['"]?llm-pi-ai['"]?\s*(?:#.*)?$/;
+  let start = -1;
+  let itemIndent = '';
+  for (let i = 0; i < lines.length; i++) {
+    const m = idRe.exec(lines[i]);
+    if (m) { start = i; itemIndent = m[1]; break; }
+  }
+
+  // 找"属于某个块"的结束位置：从 from 行往下，第一行**非空且缩进 <= indent** 的就结束
+  const blockEnd = (from, indent) => {
+    let end = lines.length;
+    for (let i = from; i < lines.length; i++) {
+      if (!isBlank(lines[i]) && indentOf(lines[i]) <= indent) { end = i; break; }
+    }
+    // 不要吞掉块尾的空行（那是与下一项之间的分隔）
+    while (end > from && isBlank(lines[end - 1])) end--;
+    return end;
+  };
+
+  if (start < 0) {
+    // 文件里没有这一项（或文件根本不存在）→ 追加一个**完整的数组项**。
+    // ⚠ 不能只追加 `gateway:` 那个块：patch 的顶层是 YAML **数组**，
+    // 光有 providers 块的话整份文件会变成一个 mapping，dsh 直接加载不了
+    //（实测：只写块时 js-yaml 解析出来的不是数组，`- id:` 项全丢）。
+    const entry = [
+      '- id: llm-pi-ai',
+      '  name: "@deepseek-ai/dsh-llm-pi-ai"',
+      '  config:',
+      '    providers:',
+      block,
+    ].join('\n');
+    const body = src.trim() === '' ? entry : src.replace(/\s*$/, '') + '\n' + entry;
+    return body.replace(/\s*$/, '') + '\n';
+  }
+
+  const pad = ' '.repeat(indentOf(lines[start]));
+  // 本项的结束：下一个同缩进的 `- ` 项
+  let itemEnd = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^\s*-\s/.test(lines[i]) && indentOf(lines[i]) === pad.length) { itemEnd = i; break; }
+  }
+
+  // 在本项内找 `config:`（缩进 = pad + 2）
+  const cfgIndent = pad.length + 2;
+  let cfgLine = -1;
+  for (let i = start + 1; i < itemEnd; i++) {
+    if (/^\s*config:\s*(?:#.*)?$/.test(lines[i]) && indentOf(lines[i]) === cfgIndent) { cfgLine = i; break; }
+  }
+
+  // 在 config 内找 `providers:`（缩进 = pad + 4）
+  const provIndent = pad.length + 4;
+  const gwIndent = provIndent + 2;
+
+  // 把 gateway 块并进 providers —— **只动 gateway 这一个键**。
+  // ⚠ 绝不能整段替换 providers：用户可能在里面配了别的供应商（实测踩到：
+  // 整段替换会把它们全部抹掉，那是不可逆的数据丢失）。
+  const mergeIntoProviders = (provLine, provEnd) => {
+    // providers 带内联值（`providers: {}`）时先展开成块形式，否则后面插缩进行会写出非法 YAML。
+    const inline = lines[provLine].replace(/^\s*providers:\s*/, '').replace(/#.*$/, '').trim();
+    if (inline) {
+      if (inline !== '{}') {
+        // 有内容的内联表无法在文本层面安全合并 → 拒绝改写，交给上层如实报告
+        throw new Error('patch 里 llm-pi-ai.config.providers 是带内容的内联映射（' + inline
+          + '），无法安全合并。请手工把 gateway 加进去，或把它改写成块形式后重试。');
+      }
+      lines[provLine] = ' '.repeat(provIndent) + 'providers:';
+      provEnd = provLine + 1;
+    }
+    // providers 里已经有 gateway 吗
+    let gwLine = -1;
+    for (let i = provLine + 1; i < provEnd; i++) {
+      if (/^\s*gateway:\s*(?:#.*)?$/.test(lines[i]) && indentOf(lines[i]) === gwIndent) { gwLine = i; break; }
+    }
+    if (gwLine >= 0) {
+      const gwEnd = Math.min(blockEnd(gwLine + 1, gwIndent), provEnd);
+      lines.splice(gwLine, gwEnd - gwLine, ...block.split('\n'));
+    } else {
+      // 插到 providers 段末尾（跳过尾部的空行，别把分隔空行顶开）
+      const ins = (provEnd > provLine + 1 && isBlank(lines[provEnd - 1])) ? provEnd - 1 : provEnd;
+      lines.splice(ins, 0, ...block.split('\n'));
+    }
+    return lines.join('\n');
+  };
+
+  if (cfgLine >= 0) {
+    const cfgEnd = Math.min(blockEnd(cfgLine + 1, cfgIndent), itemEnd);
+    let provLine = -1;
+    for (let i = cfgLine + 1; i < cfgEnd; i++) {
+      if (/^\s*providers:/.test(lines[i]) && indentOf(lines[i]) === provIndent) { provLine = i; break; }
+    }
+    if (provLine < 0) {
+      // 有 config 但没有 providers → 在 config 下建一个
+      lines.splice(cfgLine + 1, 0, ' '.repeat(provIndent) + 'providers:', ...block.split('\n'));
+      return lines.join('\n');
+    }
+    return mergeIntoProviders(provLine, Math.min(blockEnd(provLine + 1, provIndent), itemEnd));
+  }
+
+  // 连 config 都没有 → 在本项末尾补一个
+  const ins = (isBlank(lines[itemEnd - 1]) ? itemEnd - 1 : itemEnd);
+  lines.splice(ins, 0, ' '.repeat(cfgIndent) + 'config:', ' '.repeat(provIndent) + 'providers:', ...block.split('\n'));
+  return lines.join('\n');
+}
+
 function writeDshConfig(args) {
   const get = (flag) => {
     const i = args.indexOf(flag);
@@ -5045,6 +5183,52 @@ ${modelLines}`;
     // 第四轮审计修复：原子写 + 建目录（见 writeFileAtomicDsh 注释）
     writeFileAtomicDsh(settingsPath, settings, '.bak-gateway');
     console.log('[write-dsh] settings.yaml: llm-pi-ai.providers.gateway upserted');
+  }
+
+  // profile patch：**当前官方版本真正生效的载体**。settings.yaml 已被官方标记为 removed
+  // （启动时导入一次就改名），只写它的话用户会遇到"报成功但 dsh 里看不到"。
+  // 两个都写：老版本认 settings.yaml，新版本认 patch，互相兜底。
+  // ⚠ 只在 profile 目录**真实存在**时才写 —— 否则会凭空造出一个 dsh 根本不加载的 profile 目录。
+  //
+  // ⚠⚠ `--settings` 一旦显式给出，**它所在目录就是本次操作的 dsh home**，profile 必须从这里派生，
+  // 不能再回退去读 `DSH_PROFILES_DIR` / `DSH_PROFILE` / `DSH_PROFILE_DIR` 环境变量。
+  // 实测事故（2026-10-07）：单元测试把 `--settings` 指向临时目录，但开发机 shell 里带着
+  // `DSH_PROFILE_DIR=C:\Users\<user>\.dsh\profiles\desktop` —— 于是测试**往用户的真实 DSH
+  // profile 里写了夹具模型**。调用方既然指明了 home，环境变量就必须让位。
+  const explicitSettings = get('--settings') || process.env.DSH_SETTINGS || '';
+  const homeDir = explicitSettings ? path.dirname(explicitSettings) : dshHome;
+  const envProfilesRoot = explicitSettings ? '' : (process.env.DSH_PROFILES_DIR || '');
+  const envProfileName = explicitSettings ? '' : (process.env.DSH_PROFILE || '');
+  // DSH_PROFILE_DIR 给的是绝对目录，只在"没显式指定 home"时才认（同上）
+  const envProfileDir = explicitSettings ? '' : String(process.env.DSH_PROFILE_DIR || '').trim();
+  const profilesRoot = get('--profiles-dir') || envProfilesRoot || path.join(homeDir, 'profiles');
+  const profileName = get('--profile') || envProfileName || 'desktop';
+  const patchPath = get('--patch') || (envProfileDir
+    ? path.join(envProfileDir, 'cordis.patch.yml')
+    : path.join(profilesRoot, profileName, 'cordis.patch.yml'));
+  const profileDir = path.dirname(patchPath);
+  if (fs.existsSync(profileDir)) {
+    let patch = fs.existsSync(patchPath) ? fs.readFileSync(patchPath, 'utf8') : '';
+    const patchBefore = patch;
+    try {
+      // patch 比 settings.yaml 多一层（`- id:` 数组项 → config → providers），整体 +2 缩进
+      patch = upsertGatewayInPatch(patch, reindentBlock(block, 2));
+    } catch (e) {
+      // 改不了就**如实说**，绝不静默跳过 —— 否则用户以为网关已经注册好了。
+      // settings.yaml 那边已经写成功（老版本仍可用），所以这里不整体失败。
+      console.error(`[write-dsh] ⚠ profile patch 未写入：${e && e.message ? e.message : e}`);
+      console.error(`[write-dsh]   文件：${patchPath}`);
+      console.error('[write-dsh]   settings.yaml 已写入；新版 dsh 还需你手工把 gateway 加进 profile patch。');
+      patch = patchBefore;
+    }
+    if (patch !== patchBefore) {
+      writeFileAtomicDsh(patchPath, patch, '.bak-gateway');
+      console.log(`[write-dsh] profile patch (${profileName}): llm-pi-ai.config.providers.gateway upserted → ${patchPath}`);
+    } else {
+      console.log(`[write-dsh] profile patch (${profileName}): no change needed`);
+    }
+  } else {
+    console.log(`[write-dsh] profile patch skipped: ${profileDir} 不存在（只写了 settings.yaml）`);
   }
 
   // credentials.yaml: upsert DSH_GATEWAY_API_KEY under refs（key 使用 YAML 转义）

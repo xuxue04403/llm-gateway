@@ -791,4 +791,80 @@ t('显示名一致：注册表的 name 与 preview.name 必须相同', () => {
   }
 });
 
+// —— dsh：写入目标要跟进官方新格式（profile patch）——
+// 实测背景：官方 dsh 已把 settings.yaml 标记为 removed —— 启动时只导入一次就改名成 .imported，
+// 而且必须重启才生效。真正生效的载体是 profiles/<name>/cordis.patch.yml 里 `- id: llm-pi-ai` 项。
+t('dsh：写入同时覆盖 profile patch（新版 dsh 真正加载的位置）', async () => {
+  const home = newHome('dsh-patch');
+  const prof = path.join(home, '.dsh', 'profiles', 'desktop');
+  fs.mkdirSync(prof, { recursive: true });
+  // 仿真真实文件：desktop 已有别的项，且 providers 是空的
+  const ORIG = [
+    '# patch layer',
+    '- id: ui-chat',
+    '  name: "@deepseek-ai/dsh-client-ui-chat"',
+    '  config:',
+    '    transcriptView: standard',
+    '- id: llm-pi-ai',
+    '  name: "@deepseek-ai/dsh-llm-pi-ai"',
+    '  config:',
+    '    providers: {}',
+    '- id: agent-default-model',
+    '  name: "@deepseek-ai/dsh-agent-default-model"',
+    '  config:',
+    '    provider: deepseek-account',
+    '',
+  ].join('\n');
+  fs.writeFileSync(path.join(prof, 'cordis.patch.yml'), ORIG, 'utf8');
+  // 另一个 profile（web）绝不能被碰
+  const web = path.join(home, '.dsh', 'profiles', 'web');
+  fs.mkdirSync(web, { recursive: true });
+  const WEB = '- id: llm-pi-ai\n  name: x\n  config:\n    providers: {}\n';
+  fs.writeFileSync(path.join(web, 'cordis.patch.yml'), WEB, 'utf8');
+
+  const r = await writers.apply('dsh', ctxFor(home));
+  assert.strictEqual(r.ok, true, 'dsh 写入应成功：' + JSON.stringify(r.errors || r.output));
+
+  const patch = fs.readFileSync(path.join(prof, 'cordis.patch.yml'), 'utf8');
+  assert.ok(/^\s{6}gateway:\s*$/m.test(patch), 'patch 里应出现 6 空格缩进的 gateway:');
+  assert.ok(patch.includes('apiKeyEnv: DSH_GATEWAY_API_KEY'), 'patch 里应有 apiKeyEnv');
+  assert.ok(patch.includes('ui-chat') && patch.includes('agent-default-model'),
+    '原有的其它项必须原样保留');
+  assert.strictEqual(fs.readFileSync(path.join(web, 'cordis.patch.yml'), 'utf8'), WEB,
+    '只应写当前 profile（desktop），web profile 一个字节都不能动');
+  // settings.yaml 也要写（老版本兼容路径）
+  assert.ok(fs.existsSync(path.join(home, '.dsh', 'settings.yaml')), 'settings.yaml 也应当写');
+  assert.ok(fs.existsSync(path.join(home, '.dsh', '.credentials.yaml')), 'credentials 应当写');
+  // 幂等：再写一次不应产生重复的 gateway:
+  const before = patch;
+  await writers.apply('dsh', ctxFor(home));
+  const after = fs.readFileSync(path.join(prof, 'cordis.patch.yml'), 'utf8');
+  assert.strictEqual((after.match(/^\s+gateway:\s*$/gm) || []).length, 1, 'gateway: 只能有一个');
+  assert.strictEqual(after, before, '重复写入应当是幂等的');
+});
+
+t('dsh：patch 里已有别的供应商时不得被抹掉（合并而不是整段替换）', async () => {
+  const home = newHome('dsh-merge');
+  const prof = path.join(home, '.dsh', 'profiles', 'desktop');
+  fs.mkdirSync(prof, { recursive: true });
+  fs.writeFileSync(path.join(prof, 'cordis.patch.yml'), [
+    '- id: llm-pi-ai',
+    '  name: "@deepseek-ai/dsh-llm-pi-ai"',
+    '  config:',
+    '    providers:',
+    '      other:',
+    '        displayName: 别家的',
+    '        api: openai-completions',
+    '        baseURL: https://other.example/v1',
+    '',
+  ].join('\n'), 'utf8');
+
+  const r = await writers.apply('dsh', ctxFor(home));
+  assert.strictEqual(r.ok, true, '应成功：' + JSON.stringify(r.errors || r.output));
+  const patch = fs.readFileSync(path.join(prof, 'cordis.patch.yml'), 'utf8');
+  assert.ok(patch.includes('other:'), '用户原有的 other 供应商必须保留');
+  assert.ok(patch.includes('https://other.example/v1'), 'other 的 baseURL 必须保留');
+  assert.ok(/^\s{6}gateway:\s*$/m.test(patch), 'gateway 应当被加进去');
+});
+
 run();

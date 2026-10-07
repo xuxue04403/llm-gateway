@@ -588,3 +588,72 @@ F1 的修法不是"加一句 `tomlValidate(before)`"就完事 —— 旧实现**
 引擎差异校验：38 处声明改动，0 处未声明
 ```
 
+---
+
+## L. 「一键写入 dsh」的写入目标跟进官方新格式（2026-10-07）
+
+### L.1 起因
+
+用户提出："一键写入 dsh 应该写入当前运行的官方 dsh desktop 中"。查下去发现**目标路径对、但载体已经过时**。
+
+### L.2 现场证据
+
+| 事实 | 证据 |
+|---|---|
+| 官方程序确实读 `~/.dsh` | 官方自己设的环境变量：`DSH_HOME=C:\Users\xuexu\.dsh`、`DSH_PROFILE=desktop`、`DSH_PROFILE_DIR=...\.dsh\profiles\desktop` |
+| **`settings.yaml` 已不存在** | 只剩 `settings.yaml.imported`（11 KB，含 gateway + 31 个模型） |
+| **官方把它标记为 removed** | 源码 `importLegacyDocument()` 注释：*"Move the sections of **the removed `settings.yaml`** into the active profile"* |
+| 它是**一次性导入** | `const path = join(profile.home, "settings.yaml"); if (!existsSync(path)) return; await rename(path, \`${path}.imported\`);` |
+| 导入后写进**同名 entry** | `for (const [section, values] of …) { const ns = LEGACY_SECTION_ENTRIES[section] ?? section; await this.update(ns, values); }`；`update(ns, patch)` 的文档写明 `@param ns Profile entry id` |
+| **当前 profile 里 gateway 是空的** | `~/.dsh/profiles/desktop/cordis.patch.yml`：`- id: llm-pi-ai` → `config: providers: {}` |
+
+**结论**：旧实现只写 `settings.yaml` —— 能到达，但需要**重启 dsh**，而且导入完文件就被改名；用户遇到的现象是"命令报成功、dsh 里看不到网关"，过一阵还会凭空消失。
+
+### L.3 修法
+
+除 `settings.yaml` 之外，**同时**写 profile patch（`<profiles>/<name>/cordis.patch.yml` 里 `- id: llm-pi-ai` 项的 `config.providers.gateway`）—— 那才是官方当前真正加载的载体，文件头自己写着 *"Your patch layer for this dsh profile, applied after every bundle layer"*。两个都写，新老版本互相兜底。
+
+引擎新增 `reindentBlock`（settings 里 4 空格 → patch 里 6 空格）与 `upsertGatewayInPatch`（按缩进层级定位的数组项编辑器）。
+
+### L.4 实现过程中撞到的三个坑
+
+**① 整段替换 `providers:` 会抹掉用户已有的供应商。**
+第一版实现找到 `providers:` 就把整段换掉。实测：patch 里已有 `other:` 时**它被整个删除** —— 不可逆的数据丢失。改成"只合并 `gateway` 这一个键"，并加了一条专门的回归测试。
+
+**② 文件不存在时只写 providers 块 → 整份 patch 变成 mapping。**
+patch 的顶层是 YAML **数组**。空文件时只追加 providers 块，js-yaml 解析出来不是数组，`- id:` 项全丢。改成追加**完整的数组项**。
+
+**③ 带内容的内联映射无法安全合并 → 拒绝改写并如实报错。**
+`providers: {a: 1}` 这种形态无法在文本层面安全合并。选择抛出明确错误、由上层打印警告（`settings.yaml` 仍已写入），而不是静默跳过或猜着改。
+
+### L.5 我自己造成的事故（必须记录）
+
+**测试往用户的真实 dsh profile 里写了夹具数据。**
+
+- **现象**：跑完测试后，`~/.dsh/profiles/desktop/cordis.patch.yml` 从 907 B 变成 2075 B，多出 `alpha-model`/`beta-model`/`zeta-model` 与 `baseURL http://127.0.0.1:3099`，并产生了 `.bak-gateway`。
+- **原因（两层）**：
+  1. `target-dsh.js` 的 `resolveProfile()` 让 `DSH_PROFILE_DIR` 环境变量**优先于**调用方传入的 `ctx.home` —— 测试明明把 home 指向临时目录，却被环境变量带回了真实 profile。
+  2. 引擎侧同理：`gateway.test.js` / `unit.js` 直接 spawn `--write-dsh` 时只传 `--settings`（指向临时目录）**没传 profile 参数**，引擎于是回退读 `DSH_PROFILE_DIR`。
+- **第一次修得不彻底**：只修了 `target-dsh.js`，重跑测试后**真实 profile 又被写了一次**。直到把引擎侧也修了才真正封死。
+- **最终修法**：
+  - `resolveProfile(ctx)`：`ctx.home` 一旦给出，就是唯一真相，环境变量一律让位。
+  - 引擎：`--settings` **一旦显式给出，它所在目录就是本次操作的 dsh home**，profile 从那里派生，不再回退到环境变量。
+  - `target-dsh.js` 的 spawn 始终显式传 `--profiles-dir` + `--profile`，与 detect/preview 同源。
+- **新增守卫**：`tests/security.test.js` 增加一条 —— 扫描真实的 `~/.dsh/profiles/**`，一旦出现测试夹具的痕迹（`alpha-model` 等）就失败。与已有的 `.iflow/settings.json` 守卫同类。
+- **恢复**：用写入前自动生成的 `.bak-gateway`（907 B）逐字节还原，备份文件已清理。定点验证（环境里带着真实 `DSH_PROFILE_DIR`、`--settings` 指向临时目录）确认：写入落在临时 profile，真实 profile 哈希前后一致。
+
+**教训**：让"环境变量"与"调用方显式参数"争夺同一个路径的所有权，是这个项目里第二次栽在同一类问题上（第一次是 `ELECTRON_RUN_AS_NODE` 污染资源管理器）。**显式参数一旦给出，就必须完全覆盖环境变量。**
+
+### L.6 验收
+
+```
+275 项测试全绿（272 → +3：profile patch 写入、合并不抹除、真实 profile 守卫）
+  unit 66 / writers 35 / edge 29 / security 19 / renderer 12 / gateway 114
+引擎差异校验：42 处声明改动，0 处未声明
+端到端（临时 DSH home + 真实引擎）：desktop patch 写入正确、原有项保留、
+  web profile 未被误改、settings.yaml 与 credentials 同时就位、
+  产物经 PyYAML 独立校验 ALL OK
+真实 profile：测试全程哈希不变（32B8AF25…，907 B）
+```
+
+

@@ -79,6 +79,16 @@ const DECLARED = [
   // —— 与上游无差异但块边界受上面注释影响的（脚本按"块"比对，注释归属会让相邻块显示为变化）——
   { name: 'accountUsable', why: '仅前导注释块位置变化（函数体一字未改）' },
   { name: 'readTextWithTimeout', why: '仅前导注释块位置变化（函数体一字未改）' },
+
+  // —— 2026-10-07：dsh 写入目标跟进官方新格式（profile patch）——
+  // 实测背景：官方 dsh 已把 settings.yaml 标记为 **removed** —— 启动时 importLegacyDocument()
+  // 只把它导入一次然后改名成 .imported，而且必须重启才生效。当前真正生效的载体是
+  // `<dshHome>/profiles/<profile>/cordis.patch.yml` 里 `- id: llm-pi-ai` 项的 config。
+  // 只写 settings.yaml 的话，用户会遇到"命令报成功、dsh 里看不到网关"，而且过一阵还会消失。
+  { name: 'reindentBlock', why: '新增：把 gateway 块整体缩进（settings.yaml 里是 4 空格，profile patch 里多一层 `- id:` 数组项、要 6 空格）' },
+  { name: 'upsertGatewayInPatch', why: '新增：在 profile patch 里按缩进层级 upsert `- id: llm-pi-ai → config.providers.gateway`。只合并 gateway 一个键（实测踩到：整段替换会把用户已配的其它供应商全部抹掉）' },
+  { name: 'writeDshConfig', why: '除 settings.yaml 外**同时**写 profile patch（新老版本互相兜底）；profile 目录不存在时跳过，patch 无法安全合并时如实报错而不是静默跳过' },
+  { name: 'writeFileAtomicDsh', why: '仅前导注释块位置变化（函数体一字未改）—— 新增的两个函数插在它前面，脚本按"块"比对会把注释归属算进来' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

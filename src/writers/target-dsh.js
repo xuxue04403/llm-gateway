@@ -74,23 +74,84 @@ function paths(ctx) {
  *   · 但合并结果落在 profile 补丁里，用户想核对"到底进没进去"要看那个文件。
  * 这两个事实都必须告诉用户，否则界面说的和磁盘上的现象对不上。
  */
-function findProfilePatch(ctx) {
+/**
+ * 解析**当前生效的** profile 目录与它的 patch 文件。
+ *
+ * ⚠ 旧实现是"在 profiles/ 下找到第一个 cordis.patch.yml 就返回" —— 那是错的：
+ * 实测这台机器上有 `desktop`（官方桌面版，DSH_PROFILE=desktop）和 `web` 两个 profile，
+ * 而 readdirSync 的返回顺序不保证，于是它可能报的是 web 的那个，用户按提示去核对
+ * 会看到另一个文件。dsh 自己用 `DSH_PROFILE` 决定加载哪个（`DSH_PROFILE_DIR` 是它导出的绝对路径）。
+ *
+ * 优先级：DSH_PROFILE_DIR 直接给目录 > DSH_PROFILE 指定名字 > desktop（官方桌面版的默认名）> 唯一的一个。
+ * 目录不存在就返回空 —— 绝不凭空创建 dsh 不会加载的 profile。
+ */
+function resolveProfile(ctx) {
   const p = paths(ctx);
+  // ⚠ 只有"目标就是真实 dsh"（调用方**没有**指定 home）时才看环境变量。
+  //
+  // 实测事故（2026-10-07）：单元测试把 home 指向临时目录，但开发机的 shell 里带着
+  // `DSH_PROFILE_DIR=C:\Users\<user>\.dsh\profiles\desktop` —— 环境变量优先级更高，
+  // 于是测试**写进了用户的真实 DSH 配置**（往 desktop profile 里塞了 alpha/beta/zeta
+  // 三个测试模型）。ctx.home 一旦给出，它就是唯一真相，环境变量必须让位。
+  const useEnv = !(ctx && ctx.home);
+  const fromDir = useEnv ? String(process.env.DSH_PROFILE_DIR || '').trim() : '';
+  if (fromDir && fs.existsSync(fromDir)) {
+    return { name: path.basename(fromDir), dir: fromDir, patch: path.join(fromDir, 'cordis.patch.yml') };
+  }
+  const names = [];
   try {
-    if (!fs.existsSync(p.profilesDir)) return '';
-    for (const name of fs.readdirSync(p.profilesDir)) {
-      const f = path.join(p.profilesDir, name, 'cordis.patch.yml');
-      if (fs.existsSync(f)) return f;
+    if (fs.existsSync(p.profilesDir)) {
+      for (const n of fs.readdirSync(p.profilesDir)) {
+        try { if (fs.statSync(path.join(p.profilesDir, n)).isDirectory()) names.push(n); } catch (_) { /* 忽略 */ }
+      }
     }
   } catch (_) { /* 忽略 */ }
-  return '';
+  const want = useEnv ? String(process.env.DSH_PROFILE || '').trim() : '';
+  const name = (want && names.includes(want)) ? want
+    : (names.includes('desktop') ? 'desktop'
+      : (names.length === 1 ? names[0] : ''));
+  if (!name) return { name: '', dir: '', patch: '' };
+  const dir = path.join(p.profilesDir, name);
+  return { name, dir, patch: path.join(dir, 'cordis.patch.yml') };
 }
 
-/** profile 补丁里是否已有 `gateway:` 供应商条目（缩进 8）。 */
+function findProfilePatch(ctx) {
+  return resolveProfile(ctx).patch;
+}
+
+/**
+ * profile 补丁里是否已有 `gateway:` 供应商条目。
+ *
+ * ⚠ 旧实现写死"缩进 8 空格"，而真实层级是 **6**：
+ *     - id: llm-pi-ai            (0)
+ *       config:                  (2)
+ *         providers:             (4)
+ *           gateway:             (6)
+ * 于是 `inProfile` 恒为 false —— 界面上永远显示"尚未注册"，用户核对时对不上。
+ * 现在按"层级"判：先定位 `- id: llm-pi-ai` 项，再在它内部找 `providers:` 下的 `gateway:`。
+ */
 function profileHasGateway(patchPath) {
   if (!patchPath) return false;
   const text = util.readText(patchPath);
-  return /^\s{8}gateway:\s*$/m.test(text);
+  if (!text) return false;
+  const lines = String(text).split(/\r?\n/);
+  const indentOf = (l) => (/^(\s*)/.exec(l) || ['', ''])[1].length;
+  let i = lines.findIndex((l) => /^\s*-\s*id:\s*['"]?llm-pi-ai['"]?\s*(?:#.*)?$/.test(l));
+  if (i < 0) return false;
+  const itemIndent = indentOf(lines[i]);
+  let providersIndent = -1;
+  for (i++; i < lines.length; i++) {
+    if (/^\s*-\s/.test(lines[i]) && indentOf(lines[i]) === itemIndent) break;   // 下一项
+    if (providersIndent < 0) {
+      if (/^\s*providers:\s*(?:#.*)?$/.test(lines[i])) providersIndent = indentOf(lines[i]);
+      continue;
+    }
+    if (lines[i].trim() === '') continue;
+    const ind = indentOf(lines[i]);
+    if (ind <= providersIndent) break;                                          // providers 段结束
+    if (ind === providersIndent + 2 && /^gateway:\s*(?:#.*)?$/.test(lines[i].trim())) return true;
+  }
+  return false;
 }
 
 /**
@@ -279,6 +340,16 @@ function apply(ctx) {
 
   const p = paths(ctx);
   const mjs = ctx.enginePath;
+  // 当前生效的 profile（官方新版真正加载的载体）。
+  // ⚠ 必须显式把 `--profiles-dir` 与 `--profile` 都传过去：引擎自己会退回读
+  // `DSH_PROFILE_DIR` / `DSH_PROFILE` 环境变量，那在测试或"临时 home"场景下会把写入
+  // **引到用户的真实 profile**（实测事故，见 resolveProfile 的注释）。
+  // 两个参数一给，引擎的路径来源就与这边的 detect/preview 完全同源。
+  const prof = resolveProfile(ctx);
+  const profArgs = [
+    '--profiles-dir', p.profilesDir,
+    '--profile', prof.name || 'desktop',
+  ];
   return new Promise((resolve) => {
     if (!mjs || !util.exists(mjs)) {
       return resolve({ ok: false, output: '', errors: ['找不到网关引擎：' + mjs], files: [] });
@@ -290,6 +361,7 @@ function apply(ctx) {
         '--config', ctx.configPath,
         '--settings', p.settings,
         '--credentials', p.credentials,
+        ...profArgs,
         '--port', String(ctx.port),
       ], {
         windowsHide: true,
