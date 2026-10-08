@@ -68,11 +68,10 @@ if (existsSync(dataDir)) {
 }
 rmSync(OUT_DIR, { recursive: true, force: true });
 mkdirSync(OUT_DIR, { recursive: true });
-if (stashed) {
-  cpSync(stashDir, dataDir, { recursive: true });
-  rmSync(stashDir, { recursive: true, force: true });
-  console.log('  data\\ 已放回');
-}
+// ⚠ `data\` 刻意**不在这里**放回。
+// 它必须在"闸门校验 + 打 zip"**之后**才回来 —— 见文件末尾的说明。
+// 早期版本在这里就放回，结果是：闸门看到 data\ 存在 → 中止打包 → **zip 永远生不出来**。
+// （而这个闸门本身是对的：分发的压缩包里绝不能有用户的密钥。）
 
 // 1) Electron 运行时（排除它自带的 default_app.asar —— 那是"没有 app 时"的占位页面）
 let copied = 0;
@@ -226,4 +225,20 @@ if (!process.argv.includes('--no-zip')) {
   } else {
     console.log('     zip 打包失败：' + ((r.stderr || r.stdout || '').trim() || '未知错误'));
   }
+}
+
+// 8) **把用户的 data\ 放回**。
+//
+// 为什么必须放在最后（这是两个需求的交点，摆错过一次）：
+//   · 用户需求：`out\LLM-Gateway\data\` 是他的**运行状态**（供应商/密钥/日志），
+//     构建不能删它 —— 早期版本 `rmSync(OUT_DIR)` 把它一起删了，
+//     而下次启动又从"既有安装"导入旧配置，用户新加的家**静默消失**。
+//   · 分发需求：打进 zip 的那个目录里**绝不能**有 data\（上面第 6 步的闸门）。
+//
+// 两者不矛盾，只要顺序对：**暂存 → 构建 → 闸门 → 打 zip → 放回**。
+// 摆成"构建后立刻放回"会让闸门挡住 zip；摆成"根本不暂存"会删掉用户配置。
+if (stashed) {
+  cpSync(stashDir, dataDir, { recursive: true });
+  rmSync(stashDir, { recursive: true, force: true });
+  console.log('  data\\ 已放回（用户的供应商配置完好；它**没有**进 zip）');
 }
