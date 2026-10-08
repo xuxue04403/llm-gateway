@@ -656,4 +656,110 @@ patch 的顶层是 YAML **数组**。空文件时只追加 providers 块，js-ya
 真实 profile：测试全程哈希不变（32B8AF25…，907 B）
 ```
 
+---
+
+## M. 向两个 DSH 插件借来的四项网关能力（2026-10-08）
+
+用户要求评估 `dsh-our-free-model` 与 `dsh-factory-provider`，并把其中**强烈建议**的四条做进 llm-gateway。
+
+**选型原则**：这两个插件是 DSH 进程内的客户端（能任意改写请求体），llm-gateway 是纯转发网关。
+所以只搬**网关本来就该有、而且不依赖"我是客户端"这个身份**的能力 —— 免费通道那类需要伪装客户端指纹的东西
+（`Bearer public` + `x-opencode-*` 头 + 工具四元组注入）**没有搬**。
+
+### M.1 工具调用配对修复（三种协议共用一处）
+
+插件原文：*"缺少对应结果的工具调用在重放时，上游返回 400 invalid_request_error，
+此后该会话中的每一次请求都会失败。"*
+
+根源：用户在工具执行到一半点「停止」、客户端崩溃、网络断开 —— assistant 轮已记下调用，
+结果从没写回历史。这条残缺记录**永久留在会话里**，之后每一轮重放都带着它。
+
+这是网关的天然职责（客户端各修各的，不如转发前统一修一次）。实现三个 shape adapter：
+
+| 协议 | 配对关系 |
+|---|---|
+| chat | `assistant.tool_calls[].id` ↔ 紧邻的 `role:'tool'.tool_call_id` |
+| messages | `assistant.content[type=tool_use].id` ↔ 下一条的 `tool_result.tool_use_id` |
+| responses | `input[type=function_call].call_id` ↔ `function_call_output.call_id` |
+
+两个方向都修：**缺结果补占位**（文案明确写"结果不可得"，不伪造内容）、**孤儿结果剔除**（同样会让上游 400）。
+
+**真实上游验证**（sensenova，源码版引擎）：
+
+```
+工具调用配对修复（chat）：补 1 处缺结果、剔除 0 处孤儿（残缺记录会让上游 400 并永久污染该会话）
+[call] deepseek-v4-flash via=sensenova#key1 status=ok stream=0 dur=1692ms
+```
+
+HTTP 200 —— 旧实现这条请求会被上游 400 拒掉。
+
+### M.2 Anthropic 缓存断点自动放置
+
+`dsh-factory-provider` 实测：同一段长前缀，不打 0% 命中，打好 **99.79%**（首轮写 8919，
+后两轮读 8919/8934，新增各 15 token）。计费权重上缓存读 ×0.1、未缓存输入 ×1 —— 十倍量级。
+
+实现：工具表末尾 → system 末尾 → 倒数第二条消息末尾 → 最后一条消息末尾（最多 4 个，Anthropic 上限）。
+
+**三条"不动手"的规矩**：
+1. 客户端自己带了 `cache_control` → 一个字节都不动（尊重客户端策略）
+2. body 太短（< 1024 token）→ 不打断点（打了也是白花一次缓存写入 ×1.25）
+3. 全局 `cacheBreakpoints: 'off'` 或该家 `cacheBreakpoints: 'off'` → 完全跳过
+
+### M.3 按响应体形状判定流式（而不是只信 Content-Type）
+
+插件原文：*"该车道会在高负载下以 200 + application/json 返回完整的 SSE 帧序列。"*
+旧实现依赖 header → 把整条流当 JSON 读、parse 失败、整轮报废；更糟的是那个错误对象还带 `status:200`，
+会让可用性探测把**完全可用的模型**判成不可路由。
+
+实现：客户端要流式、header 却说 JSON 时，先嗅探首块（≤4KB）按形状分流，已读字节原样补发。
+只在"可能说谎"的组合下才偷看，正常路径零开销。
+
+### M.4 解码速度计量（剔除未流出的 reasoning token）
+
+插件记的事故：一条实际 **~40 tok/s** 的车道被报成 **2941 tok/s**。原因不在网关，而在分子分母量的不是同一段时间
+—— 一次调用计费 422 个输出 token，其中 291 个是**未流出任何帧**的 reasoning token
+（它们在第一个可见 token 之前就已生成完毕），而窗口起点正是那个首 token。
+
+实现三条纪律：① 首字取**正文**帧（reasoning 帧不算"字"）；② 分子剔除 reasoning token；
+③ 窗口短于 500ms 或分子为 0 时**不打印**（宁可留空，也不给假数字）。
+
+**真实上游验证**（这条恰好撞上了事故场景）：
+
+```
+[decode] deepseek-v4-flash via=sensenova ttfb=2835ms decode=65tok/s(60 tok/923ms, 已剔除未流出 reasoning 64)
+```
+
+上游报 `completion_tokens: 124`、`reasoning_tokens: 64`。
+**天真算法 124/923ms = 134 tok/s —— 比真实速度快一倍多**；剔除后 60/923ms = 65 tok/s 才是对的。
+
+### M.5 实现过程中撞到的三个坑（都是测试抓到的）
+
+**① `forward()` 拿不到 cfg。** 把 `cfg` 当第三个参数传给 `placeAnthropicCacheBreakpoints`，
+抛 ReferenceError 被外层 catch 吞掉，表现成"这家供应商失败" —— **一次本来正常的请求变成 503**。
+这正是网关最容易骗过人的地方：任何在 try 块里的拼写/作用域错误都会被当成上游故障。
+改成模块级 `CACHE_BREAKPOINT_MODE`（在 `loadConfig` 里赋值）。
+
+**② 阈值单位写错。** `roughTokens()` 返回的是 **token** 估算值（字符数/4），
+却拿去和 `CACHE_MIN_CHARS = 4096`（字符数）比 —— 6000 字符的 system 只有 1500 token，
+被误判成"太短"而**静默跳过断点**（功能看着在、其实从不生效）。改成 `CACHE_MIN_TOKENS = 1024`。
+
+**③ 偷看过的首事件绕过了计量器。** `pendingHead` 是直接写给客户端的，不经过读循环 ——
+少喂这一口，"首字"被算到第二个 chunk 上，窗口变成 ~0ms，**速度永远测不出来**。
+把计量器建在 `pendingHead` 补发之前。
+
+三个坑都是"功能看起来在了、实际不生效"或"错误被伪装成上游故障"，靠测试才发现。
+
+### M.6 验收
+
+```
+283 项测试全绿（275 → +8，全部针对本轮四项能力）
+  unit 66 / writers 35 / edge 29 / security 19 / renderer 12 / gateway 122
+引擎差异校验：63 处声明改动，0 处未声明
+真实上游端到端（sensenova）：配对修复生效→200；解码速度
+  ttfb=2835ms decode=65tok/s(60 tok/923ms, 已剔除未流出 reasoning 64)
+  引擎内部错误 0 条
+真实 dsh profile：全程哈希不变
+```
+
+
 

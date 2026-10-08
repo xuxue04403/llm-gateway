@@ -89,6 +89,30 @@ const DECLARED = [
   { name: 'upsertGatewayInPatch', why: '新增：在 profile patch 里按缩进层级 upsert `- id: llm-pi-ai → config.providers.gateway`。只合并 gateway 一个键（实测踩到：整段替换会把用户已配的其它供应商全部抹掉）' },
   { name: 'writeDshConfig', why: '除 settings.yaml 外**同时**写 profile patch（新老版本互相兜底）；profile 目录不存在时跳过，patch 无法安全合并时如实报错而不是静默跳过' },
   { name: 'writeFileAtomicDsh', why: '仅前导注释块位置变化（函数体一字未改）—— 新增的两个函数插在它前面，脚本按"块"比对会把注释归属算进来' },
+
+  // —— 2026-10-08：从 dsh-our-free-model / dsh-factory-provider 借来的四项能力 ——
+  // 两个插件各自踩过的坑，这里做成网关级能力（详见 docs/AUDIT.md 的 M 节）。
+  { name: 'TOOL_PAIR_PLACEHOLDER', why: '新增：工具配对修复用的占位应答文案（明确写"结果不可得"，不伪造内容）' },
+  { name: 'repairToolPairingChat', why: '新增：chat 协议配对修复 —— assistant.tool_calls[] ↔ role:tool.tool_call_id' },
+  { name: 'repairToolPairingAnthropic', why: '新增：messages 协议配对修复 —— content[type=tool_use].id ↔ 下一条的 tool_result.tool_use_id' },
+  { name: 'repairToolPairingResponses', why: '新增：responses 协议配对修复 —— input[type=function_call] ↔ function_call_output' },
+  { name: 'repairToolPairing', why: '新增：三协议统一入口（残缺的调用记录会让上游 400 并**永久污染该会话**，这是网关的天然职责）' },
+  { name: 'CACHE_BP_MAX', why: '新增：Anthropic 单请求最多 4 个缓存断点' },
+  { name: 'CACHE_MIN_TOKENS', why: '新增：低于 1024 token 不值得打断点（打了也是白花一次缓存写入 ×1.25）' },
+  { name: 'CACHE_BREAKPOINT_MODE', why: '新增：缓存断点全局开关（模块级 —— forward() 的签名里没有 cfg，当参数传会抛 ReferenceError，见该常量注释）' },
+  { name: 'cacheBpBlocked', why: '新增：被打断点后仍报错的供应商（学习结果，下次直接跳过）' },
+  { name: 'roughTokens', why: '新增：粗略 token 估算（只用于"值不值得打断点"的门槛判断，不参与计费）' },
+  { name: 'hasClientCacheControl', why: '新增：检测客户端是否自带 cache_control —— 带了就一个字节都不动（尊重客户端自己的缓存策略）' },
+  { name: 'placeAnthropicCacheBreakpoints', why: '新增：缓存断点自动放置。实测同一段前缀不打 0% 命中、打好 99.79%（缓存读 ×0.1 vs 未缓存 ×1，十倍量级）' },
+  { name: 'shapeOfHead', why: '新增：只看首个非空 token 判定响应体形状（SSE / JSON）' },
+  { name: 'MIN_DECODE_WINDOW_MS', why: '新增：解码窗口下限 —— 短于此不报速度（宁可留空，也不给一个假数字）' },
+  { name: 'makeDecodeMeter', why: '新增：解码速度计量器工厂' },
+  { name: 'DECODE_TAIL_CHARS', why: '新增：尾部保留窗口（usage 帧可能跨 chunk，保留尾部即可拼出完整 JSON；内存上界不随流长度增长）' },
+  { name: 'feedDecodeMeter', why: '新增：增量喂入上游 chunk，识别首字与 usage（只做字符串扫描，转发热路径上不加 JSON.parse）' },
+  { name: 'readDecodeMeter', why: '新增：取读数 —— 分子剔除未流出的 reasoning token（实测事故：实际 ~40 tok/s 被报成 2941 tok/s）' },
+  { name: 'decodeMeterText', why: '新增：速度读数的日志片段（无可测窗口时如实说"—"）' },
+  { name: 'loadConfig', why: '新增一行：把 cfg.cacheBreakpoints 存进模块级 CACHE_BREAKPOINT_MODE（在 port 兜底之后，不影响原有解析）' },
+  { name: 'THINKING_UNSUPPORTED_RE', why: '仅前导注释块位置变化（正则一字未改）—— 新增的函数插在它前面，脚本按"块"比对会把注释归属算进来' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

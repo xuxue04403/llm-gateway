@@ -345,6 +345,10 @@ let upstreamPort = 0;
       catalog: opts.catalog === undefined ? [{ id: 'test-model' }] : opts.catalog,
       status: opts.status === undefined ? 200 : opts.status,
       sseErrorFirst: !!opts.sseErrorFirst,   // 200 + SSE 首事件即 error（api.chiyi.cc 实测形态）
+      sseAsJson: !!opts.sseAsJson,           // 200 + application/json 头，但 body 是 SSE 帧（header 说谎）
+      sseBody: opts.sseBody || null,         // 自定义 SSE 响应体（测解码速度计量用）
+      sseGapMs: opts.sseGapMs || 0,          // >0：分两段发（制造解码时间窗）
+      sseSplitAt: opts.sseSplitAt || 0,
       thinkingPassback: !!opts.thinkingPassback,   // 400/500 要求 thinking 回传（air-outer/agentrouter 实测形态）
       thinkingPassbackStatus: opts.thinkingPassbackStatus || 400,
       rejectThinking: opts.rejectThinking || null, // 'sse' | '400'：带顶层 thinking 就拒收（amd 实测形态）
@@ -502,8 +506,22 @@ let upstreamPort = 0;
               + 'event: error\ndata: {"error":{"message":"Service temporarily unavailable","type":"api_error"},"type":"error"}\n\n');
             return;
           }
-          res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
-          res.end('data: {"choices":[{"delta":{"content":"upstream-ok"}}]}\n\ndata: [DONE]\n\n');
+          // 实测形态（dsh-our-free-model 记录）：上游在高负载下用 **200 + application/json**
+          // 回完整的 SSE 帧序列 —— header 说谎，只能按响应体形状判定。
+          res.writeHead(200, {
+            'content-type': st.sseAsJson ? 'application/json' : 'text/event-stream',
+            'cache-control': 'no-cache',
+          });
+          const sseOut = st.sseBody || 'data: {"choices":[{"delta":{"content":"upstream-ok"}}]}\n\ndata: [DONE]\n\n';
+          // sseGapMs > 0：先发前半段，隔一段时间再发后半段 —— 制造一个真实的解码时间窗
+          //（解码速度计量需要"首字 → 末字"之间的窗口，一次性 flush 的窗口约等于 0ms，
+          // 按设计就该留空不报速度，那样测不出东西）。
+          if (st.sseGapMs > 0 && st.sseSplitAt > 0 && st.sseSplitAt < sseOut.length) {
+            res.write(sseOut.slice(0, st.sseSplitAt));
+            setTimeout(() => { try { res.end(sseOut.slice(st.sseSplitAt)); } catch { /* 忽略 */ } }, st.sseGapMs);
+          } else {
+            res.end(sseOut);
+          }
         };
         if (st.delayMs) setTimeout(send, st.delayMs); else send();
       });
@@ -3534,6 +3552,177 @@ let upstreamPort = 0;
         assert.ok(up2.st.calls >= 1, '措辞「' + msg + '」应换到下一家');
       } finally { killGw(gw); closeUp(up1); closeUp(up2); }
     }
+  });
+
+  /* ==================================================================================
+   * 本轮四项能力（来源：dsh-our-free-model / dsh-factory-provider 的实战教训）
+   * ① 工具调用配对修复  ② Anthropic 缓存断点  ③ 按响应体形状判定流式  ④ 解码速度计量
+   * ================================================================================== */
+
+  t('① 工具配对：assistant 声明了 tool_calls 却没有结果 → 补一条占位应答（chat 协议）', async () => {
+    const up = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([providerOf('pc1', up, { priority: 1 })], 'pair-chat');
+    try {
+      assert.ok(gw.ready, '应就绪');
+      // 残缺记录：assistant 已记下调用，但用户中途点了停止 / 客户端崩了，结果从没写回
+      const r = await call({
+        port: gw.port,
+        body: {
+          model: 'test-model',
+          messages: [
+            { role: 'user', content: 'hi' },
+            { role: 'assistant', content: null, tool_calls: [{ id: 'call_a', type: 'function', function: { name: 'f', arguments: '{}' } }] },
+          ],
+        },
+      });
+      assert.strictEqual(r.status, 200, '转发应成功，实际 ' + r.status + ' ' + r.text.slice(0, 160));
+      const sent = up.st.bodies[up.st.bodies.length - 1];
+      const answered = (sent.messages || []).filter((m) => m && m.role === 'tool' && m.tool_call_id === 'call_a');
+      assert.strictEqual(answered.length, 1,
+        '上游必须收到一条 tool_call_id=call_a 的应答（否则它会 400 并永久污染该会话）；实际消息数 ' + (sent.messages || []).length);
+      assert.ok(typeof answered[0].content === 'string' && answered[0].content.length > 0, '占位应答不能是空串');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('① 工具配对：Anthropic 协议下 tool_use 缺 tool_result → 补一条（/v1/messages）', async () => {
+    const up = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([providerOf('pa1', up, { priority: 1 })], 'pair-anth');
+    try {
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: {
+          model: 'test-model', max_tokens: 16,
+          messages: [
+            { role: 'user', content: 'hi' },
+            { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_a', name: 'f', input: {} }] },
+          ],
+        },
+      });
+      assert.strictEqual(r.status, 200, '转发应成功，实际 ' + r.status + ' ' + r.text.slice(0, 160));
+      const sent = up.st.bodies[up.st.bodies.length - 1];
+      const blocks = (sent.messages || []).flatMap((m) => (Array.isArray(m.content) ? m.content : []));
+      const results = blocks.filter((b) => b && b.type === 'tool_result' && b.tool_use_id === 'toolu_a');
+      assert.strictEqual(results.length, 1, '必须补出 tool_use_id=toolu_a 的 tool_result');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('① 工具配对：孤儿 tool 消息（没有对应调用）→ 剔除，不发给上游', async () => {
+    const up = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([providerOf('po1', up, { priority: 1 })], 'pair-orphan');
+    try {
+      const r = await call({
+        port: gw.port,
+        body: {
+          model: 'test-model',
+          messages: [
+            { role: 'user', content: 'hi' },
+            { role: 'tool', tool_call_id: 'call_ghost', content: 'orphan-result' },
+          ],
+        },
+      });
+      assert.strictEqual(r.status, 200, '转发应成功，实际 ' + r.status);
+      const sent = up.st.bodies[up.st.bodies.length - 1];
+      const ghosts = (sent.messages || []).filter((m) => m && m.tool_call_id === 'call_ghost');
+      assert.strictEqual(ghosts.length, 0, '孤儿 tool 消息必须被剔除（上游会 400）');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('② 缓存断点：长 Anthropic 请求自动打断点（缓存读 ×0.1 vs 未缓存 ×1）', async () => {
+    const up = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([providerOf('cb1', up, { priority: 1 })], 'cachebp');
+    try {
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: {
+          model: 'test-model', max_tokens: 16,
+          system: 'S'.repeat(6000),   // 6000 字符 ≈ 1500 token，超过 CACHE_MIN_TOKENS(1024)，值得缓存
+          messages: [{ role: 'user', content: 'hi' }],
+        },
+      });
+      assert.strictEqual(r.status, 200, '转发应成功，实际 ' + r.status + ' ' + r.text.slice(0, 160));
+      const sent = up.st.bodies[up.st.bodies.length - 1];
+      const text = JSON.stringify(sent);
+      assert.ok(text.includes('cache_control'), '长请求应被放置缓存断点');
+      assert.ok(/ephemeral/.test(text), '断点类型应为 ephemeral');
+      // 字符串 system 会被升级成块数组（只有块形态才能挂 cache_control）
+      assert.ok(Array.isArray(sent.system), 'system 应被规范化为块数组');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('② 缓存断点：客户端自己带了 cache_control → 一个字节都不动（尊重客户端策略）', async () => {
+    const up = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([providerOf('cb2', up, { priority: 1 })], 'cachebp-cli');
+    try {
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: {
+          model: 'test-model', max_tokens: 16,
+          system: [{ type: 'text', text: 'S'.repeat(6000), cache_control: { type: 'ephemeral' } }],
+          messages: [{ role: 'user', content: 'hi' }],
+        },
+      });
+      assert.strictEqual(r.status, 200, '转发应成功，实际 ' + r.status);
+      const sent = up.st.bodies[up.st.bodies.length - 1];
+      const n = (JSON.stringify(sent).match(/cache_control/g) || []).length;
+      assert.strictEqual(n, 1, '客户端已自带一个断点时不得再追加，实际 ' + n + ' 个');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('② 缓存断点：太短的请求不打断点（低于最小可缓存长度，打了是白花写入费）', async () => {
+    const up = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([providerOf('cb3', up, { priority: 1 })], 'cachebp-small');
+    try {
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '转发应成功，实际 ' + r.status);
+      const sent = up.st.bodies[up.st.bodies.length - 1];
+      assert.ok(!JSON.stringify(sent).includes('cache_control'), '短请求不应被打断点');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('③ 形状判定：Content-Type 谎称 application/json 但 body 是 SSE → 仍按流式转发', async () => {
+    // 实测形态（dsh-our-free-model 记录）：上游高负载时用 200 + application/json 回完整 SSE 帧。
+    // 旧实现只信 header → 把整条流当 JSON 读、解析失败、整轮报废。
+    const up = await startFakeUpstream({ status: 200, sseAsJson: true });
+    const gw = await startGatewayWith([providerOf('sn1', up, { priority: 1 })], 'sniff');
+    try {
+      assert.ok(gw.ready, '应就绪');
+      const r = await call({
+        port: gw.port,
+        body: { model: 'test-model', stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 160));
+      assert.ok(/upstream-ok/.test(r.text), 'SSE 帧内容应原样到达客户端，实际 ' + r.text.slice(0, 200));
+      assert.ok(/data:\s*\[DONE\]/.test(r.text), '结束帧也应到达，实际 ' + r.text.slice(0, 200));
+      const log = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/但响应体形状是 SSE/.test(log), '日志应如实记下"header 与形状不一致"这一次判定');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('④ 解码速度：日志给出首字延迟与解码速度，并剔除未流出的 reasoning token', async () => {
+    // 分两段发，制造一个真实的解码时间窗（一次性 flush 的窗口≈0ms，按设计就该留空）
+    const part1 = 'data: {"choices":[{"delta":{"content":"a"}}]}\n\n';
+    const part2 = 'data: {"choices":[{"delta":{"content":"b"}}],'
+      + '"usage":{"completion_tokens":60,"completion_tokens_details":{"reasoning_tokens":10}}}\n\n'
+      + 'data: [DONE]\n\n';
+    const up = await startFakeUpstream({ status: 200, sseBody: part1 + part2, sseSplitAt: part1.length, sseGapMs: 800 });
+    const gw = await startGatewayWith([providerOf('dm1', up, { priority: 1 })], 'decodemeter');
+    try {
+      const r = await call({
+        port: gw.port,
+        body: { model: 'test-model', stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 160));
+      await new Promise((res) => setTimeout(res, 300));   // 等日志落盘
+      const log = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/\[decode\]/.test(log), '应记下解码速度读数，日志尾部：' + log.slice(-300));
+      assert.ok(/ttfb=\d+ms/.test(log), '应记下首字延迟');
+      // 分子必须是 60-10=50（reasoning token 在首字之前就已生成完毕，不属于解码窗口）
+      assert.ok(/50 tok\//.test(log), '应剔除 10 个未流出的 reasoning token（分子 60→50），日志尾部：' + log.slice(-300));
+      assert.ok(/已剔除未流出 reasoning 10/.test(log), '应如实标注剔除了多少');
+    } finally { killGw(gw); closeUp(up); }
   });
 
   // 执行

@@ -293,6 +293,9 @@ function loadConfig() {
       log(`config port invalid (${cfg.port}), falling back to 3091`);
       cfg.port = 3091;
     }
+    // Anthropic 缓存断点的全局开关（'auto' 默认开；'off' 完全不动请求体）。
+    // 放在这里而不是当参数传：forward() 的签名里没有 cfg（见 CACHE_BREAKPOINT_MODE 注释）。
+    if (cfg.cacheBreakpoints !== undefined) CACHE_BREAKPOINT_MODE = cfg.cacheBreakpoints;
     return cfg;
   } catch (e) {
     log(`config parse error: ${e.message}`);
@@ -2682,6 +2685,426 @@ const THINKING_REJECTED_GENERIC_RE = /rejected the request as invalid/i;
  */
 const THINKING_UNSUPPORTED_RE = /"thinking"\s+is not supported|thinking\b[^.\n]{0,30}\bnot supported|does not support[^.\n]{0,24}thinking|不支持[^。\n]{0,10}(?:思考|thinking)/i;
 
+/* ==================================================================================
+ * 工具调用配对修复（三种协议共用一处）
+ *
+ * 来源：dsh-our-free-model / dsh-factory-provider 的实战教训（两个项目独立记了同一个坑）：
+ *   「缺少对应结果的工具调用在重放时，上游返回 400 invalid_request_error，
+ *     此后该会话中的每一次请求都会失败。」
+ *
+ * 为什么会发生：用户在工具执行到一半时点了「停止」、客户端崩了、或网络断了 ——
+ * assistant 轮里已经记下 tool_calls，但对应的 tool_result 从来没写回历史。
+ * 这条残缺记录**永久留在会话里**，之后每一轮重放都带着它，于是整条会话报废。
+ *
+ * 这是网关的天然职责：客户端各修各的，不如在转发前统一修一次；
+ * 三种协议（chat / messages / responses）形态不同，但配对语义完全一致。
+ * ================================================================================== */
+
+/** 补位用的占位结果：明确说明"结果不可得"，不伪造任何内容。 */
+const TOOL_PAIR_PLACEHOLDER = '[tool result unavailable: the call was interrupted before a result was recorded]';
+
+/** 只做配对的**结构性**修复：不编造结果、不改动已有的工具输出。 */
+
+/**
+ * chat 协议：`assistant.tool_calls[].id` ↔ 紧邻的 `role:'tool'.tool_call_id`。
+ * @returns {{messages:Array, added:number, dropped:number}|null} 无需修复时返回 null。
+ */
+function repairToolPairingChat(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+  const out = [];
+  let added = 0;
+  let dropped = 0;
+  for (let i = 0; i < messages.length; i += 1) {
+    const m = messages[i];
+    if (!m || typeof m !== 'object' || Array.isArray(m)) { out.push(m); continue; }
+    const calls = Array.isArray(m.tool_calls) ? m.tool_calls.filter((c) => c && typeof c === 'object' && c.id) : [];
+    if (m.role !== 'assistant' || calls.length === 0) {
+      // 孤儿 tool 消息：没有任何 assistant 轮声明过它 → 上游会 400，丢弃
+      if (m.role === 'tool') { dropped += 1; continue; }
+      out.push(m);
+      continue;
+    }
+    out.push(m);
+    // 收集紧跟其后的连续 tool 消息
+    const answered = new Set();
+    let j = i + 1;
+    while (j < messages.length && messages[j] && typeof messages[j] === 'object' && messages[j].role === 'tool') {
+      const tid = String(messages[j].tool_call_id ?? '');
+      if (tid && !answered.has(tid)) { answered.add(tid); out.push(messages[j]); }
+      else dropped += 1;   // 重复应答 / 无 id
+      j += 1;
+    }
+    // 缺结果的补一条占位，保持"每个 tool_call 必有 tool 应答"
+    for (const c of calls) {
+      const id = String(c.id);
+      if (answered.has(id)) continue;
+      out.push({ role: 'tool', tool_call_id: id, content: TOOL_PAIR_PLACEHOLDER });
+      added += 1;
+    }
+    i = j - 1;
+  }
+  if (added === 0 && dropped === 0) return null;
+  return { messages: out, added, dropped };
+}
+
+/**
+ * Anthropic messages 协议：`assistant.content[type=tool_use].id` ↔ 下一条
+ * `user.content[type=tool_result].tool_use_id`。
+ * content 既可能是字符串也可能是块数组，两种都要处理。
+ * @returns {{messages:Array, added:number, dropped:number}|null}
+ */
+function repairToolPairingAnthropic(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+  const out = [];
+  let added = 0;
+  let dropped = 0;
+  const declared = new Set();   // 全局已声明的 tool_use id（用于识别孤儿 tool_result）
+  for (let i = 0; i < messages.length; i += 1) {
+    const m = messages[i];
+    if (!m || typeof m !== 'object' || Array.isArray(m)) { out.push(m); continue; }
+    const blocks = Array.isArray(m.content) ? m.content : null;
+
+    // ① 孤儿 tool_result：tool_use_id 不在任何已声明的集合里 → 剔除该块
+    if (blocks && m.role === 'user') {
+      const kept = [];
+      let removedHere = 0;
+      for (const b of blocks) {
+        if (b && typeof b === 'object' && b.type === 'tool_result') {
+          const tid = String(b.tool_use_id ?? '');
+          if (!tid || !declared.has(tid)) { removedHere += 1; continue; }
+        }
+        kept.push(b);
+      }
+      if (removedHere > 0) {
+        dropped += removedHere;
+        if (kept.length === 0) continue;   // 整条消息只剩被剔的块 → 丢弃整条
+        out.push({ ...m, content: kept });
+        continue;
+      }
+    }
+
+    out.push(m);
+
+    // ② assistant 轮：记下声明的 tool_use，并检查紧随的 user 轮是否都给回了结果
+    if (!blocks || m.role !== 'assistant') continue;
+    const uses = blocks.filter((b) => b && typeof b === 'object' && b.type === 'tool_use' && b.id);
+    if (uses.length === 0) continue;
+    for (const u of uses) declared.add(String(u.id));
+
+    const next = messages[i + 1];
+    const nextBlocks = next && next.role === 'user' && Array.isArray(next.content) ? next.content : null;
+    const answered = new Set();
+    if (nextBlocks) {
+      for (const b of nextBlocks) {
+        if (b && typeof b === 'object' && b.type === 'tool_result' && b.tool_use_id) answered.add(String(b.tool_use_id));
+      }
+    }
+    const missing = uses.filter((u) => !answered.has(String(u.id)));
+    if (missing.length === 0) continue;
+    const filler = missing.map((u) => ({ type: 'tool_result', tool_use_id: String(u.id), content: TOOL_PAIR_PLACEHOLDER }));
+    added += filler.length;
+    if (nextBlocks) {
+      // 已有 user 轮：把占位块并进去（放在最前，保持"结果紧跟调用"的顺序）
+      out[out.length - 1] = next;
+      messages[i + 1] = { ...next, content: [...filler, ...nextBlocks] };
+      out.push(messages[i + 1]);
+      i += 1;
+    } else {
+      // 没有紧随的 user 轮（会话末尾就是一次未完成的调用）→ 补一条
+      out.push({ role: 'user', content: filler });
+    }
+  }
+  if (added === 0 && dropped === 0) return null;
+  return { messages: out, added, dropped };
+}
+
+/**
+ * Responses 协议：`input[type=function_call].call_id` ↔ `input[type=function_call_output].call_id`。
+ * @returns {{input:Array, added:number, dropped:number}|null}
+ */
+function repairToolPairingResponses(input) {
+  if (!Array.isArray(input) || input.length === 0) return null;
+  const seenCalls = new Set();
+  const seenOutputs = new Set();
+  for (const it of input) {
+    if (!it || typeof it !== 'object') continue;
+    if (it.type === 'function_call' && it.call_id) seenCalls.add(String(it.call_id));
+    if (it.type === 'function_call_output' && it.call_id) seenOutputs.add(String(it.call_id));
+  }
+  const out = [];
+  let added = 0;
+  let dropped = 0;
+  for (const it of input) {
+    if (it && typeof it === 'object' && it.type === 'function_call_output' && it.call_id
+      && !seenCalls.has(String(it.call_id))) { dropped += 1; continue; }
+    out.push(it);
+  }
+  const pending = [];
+  for (const it of out) {
+    if (it && typeof it === 'object' && it.type === 'function_call' && it.call_id) {
+      const id = String(it.call_id);
+      if (!seenOutputs.has(id)) pending.push(id);
+    }
+  }
+  for (const id of pending) {
+    out.push({ type: 'function_call_output', call_id: id, output: TOOL_PAIR_PLACEHOLDER });
+    added += 1;
+  }
+  if (added === 0 && dropped === 0) return null;
+  return { input: out, added, dropped };
+}
+
+/**
+ * 统一入口：按协议分发。返回 null 表示配对完好、无需改动（调用方据此跳过日志）。
+ * @param {object} body 请求体（**不改原对象**，返回新的 body）
+ * @param {'chat'|'messages'|'responses'} proto
+ * @returns {{body:object, added:number, dropped:number}|null}
+ */
+function repairToolPairing(body, proto) {
+  if (!body || typeof body !== 'object') return null;
+  if (proto === 'messages') {
+    const r = repairToolPairingAnthropic(body.messages);
+    if (!r) return null;
+    return { body: { ...body, messages: r.messages }, added: r.added, dropped: r.dropped };
+  }
+  if (proto === 'responses') {
+    const r = repairToolPairingResponses(body.input);
+    if (!r) return null;
+    return { body: { ...body, input: r.input }, added: r.added, dropped: r.dropped };
+  }
+  const r = repairToolPairingChat(body.messages);
+  if (!r) return null;
+  return { body: { ...body, messages: r.messages }, added: r.added, dropped: r.dropped };
+}
+
+/* ==================================================================================
+ * Anthropic 缓存断点自动放置
+ *
+ * 来源：dsh-factory-provider 的实测 —— 同一段长前缀，不打断点时缓存命中 **0%**，
+ * 打好断点后 **99.79%**（首轮写 8919，后两轮读 8919/8934，新增各 15 token）。
+ * 计费权重上缓存读 ×0.1、未缓存输入 ×1 —— 这是十倍量级的差别。
+ *
+ * 什么时候不动：
+ *   · 客户端自己带了 cache_control（它有自己的策略，别去覆盖）
+ *   · body 太小（低于最小可缓存长度，打了也是白打，还多花一次缓存写入 ×1.25）
+ *   · 供应商或全局显式关掉
+ * ================================================================================== */
+
+/** Anthropic 单请求最多 4 个断点；多数模型最小可缓存 1024 token（低于它打了也是白打）。 */
+const CACHE_BP_MAX = 4;
+// ⚠ 单位是 **token** 不是字符：roughTokens() 返回的是字符数/4 的估算值。
+// 曾经写成 4096 并直接和 roughTokens 比 —— 6000 字符的 system 只有 1500 token，
+// 被误判成"太短"而跳过断点（测试 T=cachebp 抓到的）。
+const CACHE_MIN_TOKENS = 1024;
+
+/**
+ * 全局默认（`config.cacheBreakpoints`，在 loadConfig 里赋值）。
+ * ⚠ 这里必须是**模块级**而不是函数参数：`forward()` 的签名是
+ * (provider, upstreamPath, upstreamHeaders, body, res, opts)，**拿不到 cfg** ——
+ * 曾经把 cfg 当第三个参数传进去，抛 ReferenceError 被外层 catch 吞掉，
+ * 表现成"这家供应商失败"，把一次本来正常的请求变成 503（测试 T=det422 抓到的）。
+ */
+let CACHE_BREAKPOINT_MODE = 'auto';
+
+/** 被打断点后仍报错的供应商（学习结果）：下次直接跳过，不再白失败一轮。 */
+const cacheBpBlocked = new Set();
+
+/** 粗略 token 估算（只用于"值不值得打断点"的门槛判断，不参与计费）。 */
+function roughTokens(v) {
+  if (typeof v === 'string') return Math.ceil(v.length / 4);
+  if (Array.isArray(v)) return v.reduce((n, x) => n + roughTokens(x), 0);
+  if (v && typeof v === 'object') return Object.values(v).reduce((n, x) => n + roughTokens(x), 0);
+  return 0;
+}
+
+/** 该请求里客户端是否自己用了缓存断点。 */
+function hasClientCacheControl(body) {
+  const scan = (v) => {
+    if (Array.isArray(v)) return v.some(scan);
+    if (v && typeof v === 'object') return ('cache_control' in v) || Object.values(v).some(scan);
+    return false;
+  };
+  return scan(body && body.system) || scan(body && body.messages) || scan(body && body.tools);
+}
+
+/**
+ * 在 Anthropic 请求体上放置缓存断点（**返回新对象**）。
+ * 位置策略：工具表末尾 → system 末尾 → 倒数第二条消息末尾 → 最后一条消息末尾。
+ * 前两个是"稳定前缀"（几乎每轮不变），后两个是"移动前缀"（本轮缓存、下轮命中）。
+ * @param {object} body 请求体
+ * @param {object} provider 供应商配置（读 provider.cacheBreakpoints 覆盖全局）
+ * @returns {{body:object, placed:number}|null} 未放置时返回 null。
+ */
+function placeAnthropicCacheBreakpoints(body, provider) {
+  if (!body || typeof body !== 'object') return null;
+  const perProvider = provider && provider.cacheBreakpoints;
+  const mode = perProvider !== undefined ? perProvider : CACHE_BREAKPOINT_MODE;
+  if (mode === false || mode === 'off') return null;
+  if (provider && cacheBpBlocked.has(provider.id)) return null;
+  if (hasClientCacheControl(body)) return null;
+  if (roughTokens(body) < CACHE_MIN_TOKENS) return null;
+
+  const out = { ...body };
+  let placed = 0;
+  const mark = () => ({ type: 'ephemeral' });
+
+  // ① 工具表末尾（缓存 tools + 其后的 system）
+  if (Array.isArray(out.tools) && out.tools.length > 0 && placed < CACHE_BP_MAX) {
+    const last = out.tools[out.tools.length - 1];
+    if (last && typeof last === 'object') {
+      out.tools = out.tools.slice(0, -1).concat([{ ...last, cache_control: mark() }]);
+      placed += 1;
+    }
+  }
+  // ② system 末尾
+  if (placed < CACHE_BP_MAX && out.system !== undefined && out.system !== null) {
+    if (typeof out.system === 'string') {
+      out.system = [{ type: 'text', text: out.system, cache_control: mark() }];
+      placed += 1;
+    } else if (Array.isArray(out.system) && out.system.length > 0) {
+      const last = out.system[out.system.length - 1];
+      if (last && typeof last === 'object') {
+        out.system = out.system.slice(0, -1).concat([{ ...last, cache_control: mark() }]);
+        placed += 1;
+      }
+    }
+  }
+  // ③④ 最后两条消息的末尾块（"移动断点"：本轮写、下轮读）
+  if (Array.isArray(out.messages) && out.messages.length > 0) {
+    const idxs = out.messages.length >= 2 ? [out.messages.length - 2, out.messages.length - 1] : [out.messages.length - 1];
+    const msgs = out.messages.slice();
+    for (const idx of idxs) {
+      if (placed >= CACHE_BP_MAX) break;
+      const m = msgs[idx];
+      if (!m || typeof m !== 'object') continue;
+      if (typeof m.content === 'string') {
+        msgs[idx] = { ...m, content: [{ type: 'text', text: m.content, cache_control: mark() }] };
+        placed += 1;
+      } else if (Array.isArray(m.content) && m.content.length > 0) {
+        const last = m.content[m.content.length - 1];
+        if (!last || typeof last !== 'object') continue;
+        if ('cache_control' in last) continue;   // 已有点（理论上前面已拦，双保险）
+        msgs[idx] = { ...m, content: m.content.slice(0, -1).concat([{ ...last, cache_control: mark() }]) };
+        placed += 1;
+      }
+    }
+    out.messages = msgs;
+  }
+
+  if (placed === 0) return null;
+  return { body: out, placed };
+}
+
+/* ==================================================================================
+ * 按响应体形状判定是不是 SSE（而不是只信 Content-Type）
+ *
+ * 来源：dsh-our-free-model 的实测 —— 「该车道会在高负载下以 **200 + application/json**
+ * 返回完整的 SSE 帧序列」。旧实现依赖 header，于是把整条流当 JSON 读、parse 失败、整轮报废；
+ * 更糟的是这个错误对象还带 status:200，会让可用性探测把**完全可用的模型**判成不可路由。
+ *
+ * 这里先嗅探首块（≤4KB）按形状分流，再把已读字节原样补发 —— 不缓冲、不改变实时性。
+ * ================================================================================== */
+
+/** 只看首个非空 token，判定形状。 */
+function shapeOfHead(text) {
+  const t = String(text || '').replace(/^\uFEFF/, '').replace(/^[\s\r\n]+/, '');
+  if (t === '') return 'unknown';
+  if (t.startsWith('{') || t.startsWith('[')) return 'json';
+  // SSE 的行起始：data: / event: / id: / retry: / 注释行 ":"
+  if (/^(?:data|event|id|retry)\s*:/.test(t) || t.startsWith(':')) return 'sse';
+  return 'unknown';
+}
+
+/* ==================================================================================
+ * 解码速度计量（只统计"真正流出正文"的那段时间）
+ *
+ * 来源：dsh-our-free-model 记录的一次事故 —— 一条实际 ~40 tok/s 的车道被报成 **2941 tok/s**。
+ * 原因不在网关，而在分子分母量的不是同一段时间：一次调用计费 422 个输出 token，
+ * 其中 291 个是**未流出任何帧**的 reasoning token（它们在第一个可见 token 之前就已生成完毕），
+ * 而窗口起点正是那个首 token。
+ *
+ * 因此这里只做三件事：
+ *   ① 首字时刻取**正文**帧（reasoning 帧不算"字"）；
+ *   ② 分子剔除未流出的 reasoning token；
+ *   ③ 窗口过短时不报速度 —— 宁可留空，也不给一个假数字。
+ * ================================================================================== */
+
+const MIN_DECODE_WINDOW_MS = 500;
+
+/** 建一个计量器：喂进上游字节，最后取一次读数。 */
+function makeDecodeMeter() {
+  return { tail: '', firstContentAt: 0, endAt: 0, usage: null };
+}
+
+/** 尾部保留窗口：usage 帧可能跨 chunk 到达，保留尾部即可拼出完整 JSON。 */
+const DECODE_TAIL_CHARS = 8192;
+
+/**
+ * 增量喂入一个上游 chunk。
+ * 识别两类帧：正文（content / text_delta）与 usage。
+ * 只做字符串扫描，不 JSON.parse 整帧 —— 转发热路径上不能有额外开销。
+ * 内存上界是 DECODE_TAIL_CHARS（不随流长度增长）。
+ */
+function feedDecodeMeter(meter, chunkText) {
+  if (!meter || !chunkText) return;
+  const fresh = meter.tail + chunkText;
+  // 首字：OpenAI 的 delta.content 有非空值，或 Anthropic 的 text_delta
+  if (!meter.firstContentAt) {
+    const openaiContent = /"content"\s*:\s*"(?:[^"\\]|\\.)+"/.test(fresh);
+    const anthContent = /"type"\s*:\s*"text_delta"/.test(fresh);
+    if (openaiContent || anthContent) meter.firstContentAt = Date.now();
+  }
+  // usage：从起点做括号配平取完整对象（配平失败说明还没收全，等下一块）
+  const um = /"usage"\s*:\s*\{/.exec(fresh);
+  if (um) {
+    const start = fresh.indexOf('{', um.index);
+    let depth = 0;
+    let end = -1;
+    for (let i = start; i < fresh.length; i += 1) {
+      const c = fresh[i];
+      if (c === '{') depth += 1;
+      else if (c === '}') { depth -= 1; if (depth === 0) { end = i + 1; break; } }
+    }
+    if (end > 0) {
+      try { meter.usage = JSON.parse(fresh.slice(start, end)); } catch { /* 形状异常：忽略 */ }
+    }
+  }
+  meter.tail = fresh.length > DECODE_TAIL_CHARS ? fresh.slice(-DECODE_TAIL_CHARS) : fresh;
+}
+
+/**
+ * 取读数。返回 null 表示"没有可测量的解码窗口"（调用方应留空而不是编一个数）。
+ * 关键：outputTokens 里剔除 reasoning_tokens（它们可能一个帧都没流出）。
+ */
+function readDecodeMeter(meter, startedAt) {
+  if (!meter || !meter.firstContentAt) return null;
+  const end = meter.endAt || Date.now();
+  const windowMs = end - meter.firstContentAt;
+  if (windowMs < MIN_DECODE_WINDOW_MS) return null;
+  const u = meter.usage || {};
+  const outRaw = Number(u.completion_tokens ?? u.output_tokens ?? 0) || 0;
+  const reason = Number((u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens)
+    ?? (u.output_tokens_details && u.output_tokens_details.reasoning_tokens) ?? 0) || 0;
+  const decodeTokens = Math.max(0, outRaw - reason);
+  if (decodeTokens <= 0) return null;
+  const tps = decodeTokens / (windowMs / 1000);
+  if (!Number.isFinite(tps) || tps <= 0) return null;
+  return {
+    ttfbMs: meter.firstContentAt - startedAt,
+    windowMs,
+    decodeTokens,
+    reasoningExcluded: reason,
+    tps: Math.round(tps * 10) / 10,
+  };
+}
+
+/** 速度读数的日志片段（无可测窗口时如实说"—"，不编数字）。 */
+function decodeMeterText(m) {
+  if (!m) return 'ttfb=— decode=—';
+  return `ttfb=${m.ttfbMs}ms decode=${m.tps}tok/s(${m.decodeTokens} tok/${m.windowMs}ms`
+    + (m.reasoningExcluded > 0 ? `, 已剔除未流出 reasoning ${m.reasoningExcluded}` : '') + ')';
+}
+
 /**
  * 给"带 tool_use 但缺 thinking 块"的 assistant 轮补一个空占位 thinking 块。
  * 只做**结构性补齐**：thinking 正文与签名都为空（不伪造推理内容）。
@@ -2869,6 +3292,27 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       if (stripped) {
         outBody = stripped.body;
         log(`upstream ${provider.id}（不支持 thinking）→ 去掉顶层 thinking 参数后发送`);
+      }
+    }
+    // ── 转发前的最后一道整形（两个能力，都是"网关才做得了"的事）──
+    // ① 工具调用配对修复：残缺的调用记录（用户中途点停止/客户端崩溃）留在历史里，
+    //    上游会 400 invalid_request_error 并让**该会话此后每一轮都失败**。三种协议共用一处修复。
+    // ② Anthropic 缓存断点：实测同一段前缀，不打 0% 命中、打好 99.79%（缓存读 0.1x vs 未缓存 1x）。
+    if (!rawMode && outBody) {
+      const proto = isAnthropicPath ? 'messages' : (responsesMode ? 'responses' : 'chat');
+      const fixed = repairToolPairing(outBody, proto);
+      if (fixed) {
+        outBody = fixed.body;
+        log(`工具调用配对修复（${proto}）：补 ${fixed.added} 处缺结果、剔除 ${fixed.dropped} 处孤儿`
+          + '（残缺记录会让上游 400 并永久污染该会话）');
+      }
+      if (isAnthropicPath) {
+        // ⚠ 只传 provider：forward() 拿不到 cfg（见 CACHE_BREAKPOINT_MODE 的注释）
+        const bp = placeAnthropicCacheBreakpoints(outBody, provider);
+        if (bp) {
+          outBody = bp.body;
+          log(`Anthropic 缓存断点：放置 ${bp.placed} 处（缓存读 ×0.1 vs 未缓存输入 ×1）`);
+        }
       }
     }
     // raw 模式不带 body：显式传 undefined，避免 fetch 在没有 content-length 时挂起等待请求体
@@ -3150,8 +3594,15 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
   // 现在：写响应头之前先偷看首个 SSE 事件——若它是 error，就当作该供应商失败（冷却+熔断+换下一家）。
   // 关键点：此时**还没向客户端写任何字节**，所以 failover 是安全的（客户端最终收到的是
   // 下一家的正常流，或全部失败时网关自己的 503 文案）。
+  // 形状判定（③）：Content-Type 会说谎 —— 实测有上游在高负载下用 **200 + application/json**
+  // 返回完整的 SSE 帧序列。旧实现只信 header，于是把整条流当 JSON 读、解析失败、整轮报废；
+  // 更糟的是那个错误对象还带 status:200，会让可用性探测把**完全可用的模型**判成不可路由。
+  // 现在：客户端要流式、header 却说 JSON 时，先偷看首块按**响应体形状**定夺。
+  const ctypeSaysSse = /event-stream/i.test(ctype);
+  const wantsStream = !!(body && typeof body === 'object' && body.stream === true);
+  const mayLieAboutJson = !ctypeSaysSse && /json/i.test(ctype) && wantsStream;
   let pendingHead = null;   // 偷看得到的首事件字节（未判失败时原样补发给客户端）
-  if (bodyStream && /event-stream/i.test(ctype)) {
+  if (bodyStream && (ctypeSaysSse || mayLieAboutJson)) {
     try {
       const peekReader = bodyStream.getReader();
       const chunks = [];
@@ -3168,6 +3619,13 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       }
       const head = Buffer.concat(chunks).toString('utf8');
       pendingHead = Buffer.concat(chunks);
+      // header 与响应体形状不一致时，以**形状**为准（③，见上方说明）。
+      // 已读字节原样保留在 pendingHead 里，稍后补发 —— 实时性不受影响。
+      if (!ctypeSaysSse && shapeOfHead(head) === 'sse') {
+        log(`upstream ${provider.id} 的 Content-Type 是「${ctype}」但响应体形状是 SSE`
+          + ' → 按流式处理（旧实现会把整轮当 JSON 解析而报废）');
+        ctype = 'text/event-stream';
+      }
       const hasRealEvent = /event:\s*(message_start|content_block_start|content_block_delta|response\.created|response\.in_progress|response\.output_item)/i.test(head)
         || /"type"\s*:\s*"(message_start|content_block_start|response\.created)"/.test(head);
       const looksError = !hasRealEvent && (/event:\s*error/i.test(head) || /"type"\s*:\s*"error"/.test(head.slice(0, 2048)));
@@ -3228,8 +3686,15 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     res.destroy();
     return false;
   }
+  // ④ 解码速度计量：只统计"真正流出正文"的那段时间（reasoning token 剔除，见上方说明）。
+  // 内存上界 8KB，不随流长度增长；失败绝不影响转发。
+  // ⚠ 必须建在 pendingHead 补发**之前**：偷看过的首事件是直接写给客户端的，
+  // 不经过下面的读循环 —— 少喂这一口，"首字"就会被算到第二个 chunk 上，
+  // 窗口变成 ~0ms，速度永远测不出来（测试 T=decodemeter 抓到的）。
+  const meter = makeDecodeMeter();
   if (pendingHead && pendingHead.length) {
     // 偷看过的首事件原样补发（客户端不该察觉这一步）
+    try { feedDecodeMeter(meter, pendingHead.toString('utf8')); } catch { /* 计量失败绝不影响转发 */ }
     if (opts && typeof opts.onSniff === 'function') {
       try { opts.onSniff(pendingHead.toString('utf8')); } catch { /* 忽略 */ }
     }
@@ -3275,6 +3740,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         const { done, value } = await reader.read();
         if (done) break;
         lastRead = Date.now();
+        try { feedDecodeMeter(meter, Buffer.from(value).toString('utf8')); } catch { /* 计量失败绝不影响转发 */ }
         if (sniff) {
           try {
             sniff.text += Buffer.from(value).toString('utf8');
@@ -3313,6 +3779,11 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       try { reader.releaseLock(); } catch { }
     }
     if (clientGone) return false;   // 收尾阶段才发现断开 → 同样不记成功
+    // ④ 解码速度：无可测窗口时**不打印**（宁可留空，也不给一个假数字 —— 曾有一条实际
+    // ~40 tok/s 的车道被"整段耗时 ÷ 正文落地耗时"报成 2941 tok/s）。
+    meter.endAt = Date.now();
+    const dec = readDecodeMeter(meter, startedAt);
+    if (dec) log(`[decode] ${(body && body.model) || '(no model)'} via=${provider.id} ${decodeMeterText(dec)}`);
   }
   if (res.destroyed || res.writableEnded) return false;
   try {
