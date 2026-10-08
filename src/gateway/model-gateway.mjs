@@ -4040,22 +4040,24 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     return true;
   }
   // ── 直通路径的"上游 200 但不是我们要的东西"检测 ──
-  // 真实高频形态：上游前面挂了反代/CDN，它自己出错时回 **200 + text/html 错误页**
-  //（或 200 + 纯文本）。直通路径不解析响应体，于是旧实现把这页 HTML 原样配 200 发给客户端
-  // —— 客户端拿到"成功"却解析失败，而网关日志一片干净（实测 2026-10-08 审计：四条路径里
-  // 只有这条会把 HTML 当成功透传，与矩阵路径的 502 处置不一致）。
+  // 真实高频形态：上游前面挂了反代/CDN，它自己出错时回 **200 + text/html 错误页**。
+  // 直通路径不解析响应体，于是旧实现把这页 HTML 原样配 200 发给客户端 ——
+  // 客户端拿到"成功"却解析失败，而网关日志一片干净。
   //
-  // 判据刻意只看响应头（零成本、不读 body）：客户端要 JSON 时，上游给回来的 content-type
-  // 既不是 JSON 也不是 SSE —— 那这个响应不可能是合法的模型输出。
-  // 同协议流式（客户端要 SSE）不在此列：SSE 帧的 content-type 本就多样，误判代价更大。
-  if (!wantsStream && upstream.status === 200 && !ctypeSaysSse && ctype && !/json/i.test(ctype)) {
+  // ⚠⚠ 判据**必须只认 text/html**，不能写成"content-type 不是 JSON 就算错"。
+  // 实测踩到（2026-10-08，本轮修复引入又修掉）：`agentrouter` 是**合法供应商**，
+  // 它的正常响应就是 `200 + text/plain; charset=utf-8`，body 完全合法的 JSON ——
+  // 按"不是 JSON 就拦"会把一家**本来能用**的供应商打成 502，
+  // 比原来那个"HTML 被透传"的问题严重得多（后者至少客户端能看出不对）。
+  // 反代/CDN 的错误页无一例外用 text/html，所以只认它既够用又不误伤。
+  if (!wantsStream && upstream.status === 200 && !ctypeSaysSse && /text\/html|application\/xhtml/i.test(ctype)) {
     log(`upstream ${provider.id} 返回 200 但 content-type=${ctype}（客户端要 JSON）→ 判定为上游/反代错误页，不再透传`);
     try { await upstream.body?.cancel(); } catch { /* 忽略 */ }
     return {
       stop: {
         status: 502,
         upstreamStatus: upstream.status,
-        reason: `上游返回 200 但内容不是 JSON（Content-Type: ${ctype}）—— 通常是上游前面有反代/网关插了错误页`,
+        reason: `上游返回 200 但内容是 HTML（Content-Type: ${ctype}）—— 通常是上游前面有反代/网关插了错误页`,
       },
     };
   }
