@@ -973,4 +973,57 @@ t('预览：必须对**用户自己文件里**的其它凭据也打码（界面�
   assert.ok(blob.includes('ANTHROPIC_BASE_URL'), '非密钥字段不能被误伤');
   assert.ok(blob.includes('https://example.com'), '普通值必须原样可见');
 });
+/* ---- 第七轮审计修复（2026-10-08）---- */
+
+t('掩码：≤12 字符的凭据也必须打码（旧实现直接原样返回，预览里明文可见）', () => {
+  // maskSecretsInText 的门槛是"值 ≥8 字符就值得打码"，而 maskOne 里又卡了一道
+  // "≤12 就原样返回" —— 8~12 落进缝里：被判定为密钥，然后原样写回预览，
+  // 而弹窗上写着"密钥已打码显示"。13 字符则正常打码，所以这条缝很隐蔽。
+  const home = newHome('mask-short');
+  const dir = path.join(home, '.claude');
+  fs.mkdirSync(dir, { recursive: true });
+  for (const v of ['abcdefgh', 'Zx9Qw8Er7Ty6', 'aB3xK9mQ2pL7w', 'sk-ant-abcdefghijklmnop']) {
+    fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: v } }, null, 2), 'utf8');
+    const p = writers.preview('claude-code', ctxFor(home));
+    assert.ok(!JSON.stringify(p).includes(v), v.length + " 字符的凭据在预览里是明文：" + v);
+  }
+});
+
+t('tomlValidate：未闭合的括号之后不得失明（写坏文件却报成功）', () => {
+  // 旧实现只在 depth === 0 时做行形状检查；一个未闭合的 [ 会把 depth 永久顶起来，
+  // 之后所有行的检查全部跳过 —— 校验函数就此失明，写坏的文件照样报 ok:true。
+  const bad = [
+    'x = [1, 2' + String.fromCharCode(10) + 'this line has no equals sign' + String.fromCharCode(10),
+    'x = {a = 1' + String.fromCharCode(10) + 'bad line here' + String.fromCharCode(10),
+  ];
+  for (const s of bad) assert.ok(util.tomlValidate(s), '应拦下未闭合括号：' + JSON.stringify(s));
+  // 合法写法不能被误伤（把行检查解禁会踩到这些）
+  const good = [
+    'x = [' + String.fromCharCode(10) + '  1,' + String.fromCharCode(10) + '  2,' + String.fromCharCode(10) + ']' + String.fromCharCode(10),
+    'x = {a = 1, b = 2}' + String.fromCharCode(10),
+    'x = ' + String.fromCharCode(34).repeat(3) + String.fromCharCode(10) + 'line1' + String.fromCharCode(10) + String.fromCharCode(34).repeat(3) + String.fromCharCode(10),
+    'x = 1' + String.fromCharCode(10) + 'y = 2' + String.fromCharCode(10),
+  ];
+  // 注意：合法输入返回的是空串而不是 null（调用方一律按真值判断，别把既有约定当 bug）。
+  for (const s of good) assert.ok(!util.tomlValidate(s), '合法 TOML 被误判：' + JSON.stringify(s));
+});
+
+t('TOML 写入保持原文行尾（CRLF 文件不得被整份改成 LF）', () => {
+  const CRc = String.fromCharCode(13), LFc = String.fromCharCode(10);
+  const home = newHome('crlf');
+  const dir = path.join(home, '.codex');
+  fs.mkdirSync(dir, { recursive: true });
+  const crlf = 'model = ' + JSON.stringify('g') + CRc + LFc + CRc + LFc + '[model_providers.corp]' + CRc + LFc + 'name = ' + JSON.stringify('c') + CRc + LFc;
+  fs.writeFileSync(path.join(dir, 'config.toml'), crlf, 'utf8');
+  writers.get('codex').apply(ctxFor(home));
+  const after = fs.readFileSync(path.join(dir, 'config.toml'), 'utf8');
+  assert.ok(after.indexOf(CRc) >= 0, 'CRLF 文件写后一个 CR 都没有了（整份被改成 LF）：' + JSON.stringify(after.slice(0, 200)));
+  const home2 = newHome('lf');
+  const dir2 = path.join(home2, '.codex');
+  fs.mkdirSync(dir2, { recursive: true });
+  fs.writeFileSync(path.join(dir2, 'config.toml'), 'model = ' + JSON.stringify('g') + LFc + LFc + '[model_providers.corp]' + LFc, 'utf8');
+  writers.get('codex').apply(ctxFor(home2));
+  const after2 = fs.readFileSync(path.join(dir2, 'config.toml'), 'utf8');
+  assert.ok(after2.indexOf(CRc) < 0, 'LF 文件写后混进了 CR：' + JSON.stringify(after2.slice(0, 200)));
+});
 run();

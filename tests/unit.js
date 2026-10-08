@@ -1014,14 +1014,31 @@ t('clientProfile：主进程校验白名单与引擎分支一一对应（曾经�
   assert.ok(sel, '应能找到 #edProfile 的 select 块');
   const uiProfiles = new Set([...sel[1].matchAll(/<option value="([a-z]+)"/g)].map((m) => m[1]));
 
+  // ③b 设置页的**第二个**下拉（#stProfile）也要算进来。
+  //     实测事故（2026-10-08 审计复现）：这个全局下拉当初漏了 opencode ——
+  //     磁盘上是 clientProfile:"opencode" 时，给 <select> 赋一个不存在的值得到空串，
+  //     用户随便改一个设置再保存，readSettingsInto() 就走
+  //     `else if (c.clientProfile !== undefined) delete c.clientProfile`，
+  //     **把合法配置静默删掉**，之后 OpenCode 端点会 400 MissingSessionID。
+  //     旧版守卫只解析 providers.js 的 #edProfile，所以这个位置漂了也测不出来。
+  const htmlSrc = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
+  const sel2 = /<select id="stProfile"[^>]*>([\s\S]*?)<\/select>/.exec(htmlSrc);
+  assert.ok(sel2, '应能找到 index.html 里 #stProfile 的 select 块');
+  const uiProfiles2 = new Set([...sel2[1].matchAll(/<option value="([a-z]+)"/g)].map((m) => m[1]));
+
   // 三份清单必须完全一致
   const sortJoin = (s) => [...s].sort().join(',');
   assert.strictEqual(sortJoin(mgrProfiles), sortJoin(engineProfiles),
     '主进程白名单与引擎分支不一致：\n  引擎 = ' + sortJoin(engineProfiles) + '\n  白名单 = ' + sortJoin(mgrProfiles)
       + '\n  → 引擎支持但白名单没有的档，保存时会被拒（功能等于没做）；反之则是放行了引擎不认的值（静默回落）');
   assert.strictEqual(sortJoin(uiProfiles), sortJoin(engineProfiles),
-    '界面下拉选项与引擎分支不一致：\n  引擎 = ' + sortJoin(engineProfiles) + '\n  下拉 = ' + sortJoin(uiProfiles)
+    '界面下拉（#edProfile）选项与引擎分支不一致：\n  引擎 = ' + sortJoin(engineProfiles) + '\n  下拉 = ' + sortJoin(uiProfiles)
       + '\n  → 下拉里没有的档，打开编辑器时会被 value 匹配失败重置成空串，点「应用」时静默删掉该字段');
+  assert.strictEqual(sortJoin(uiProfiles2), sortJoin(engineProfiles),
+    '设置页下拉（#stProfile）选项与引擎分支不一致：\n  引擎 = ' + sortJoin(engineProfiles) + '\n  下拉 = ' + sortJoin(uiProfiles2)
+      + '\n  → 下拉里没有的档，改任一设置再保存就会把 clientProfile 静默删掉（配置合法却被打回默认）');
+  assert.strictEqual(sortJoin(uiProfiles2), sortJoin(uiProfiles),
+    '两处下拉的档位不一致（#stProfile vs #edProfile）—— 同一个值在两个界面里表现不同，用户会以为配置坏了');
 });
 
 /* ---- 第六轮审计：tomlValidate 的复杂度守卫 ---- */

@@ -555,7 +555,26 @@ function tomlUpsertTopKey(text, key, rawValue) {
     while (at < lines.length && (/^\s*$/.test(lines[at]) || /^\s*#/.test(lines[at]))) at++;
     lines.splice(at, 0, line, '');
   }
-  return lines.join('\n');
+  return keepEol(lines.join('\n'), src);
+}
+
+/**
+ * 还原原文的行尾风格（LF / CRLF）。
+ *
+ * ⚠ 读入时用 `split(/\r?\n/)` 会丢掉 `\r`，写回时一律用 `\n` 拼 —— 于是**整份文件**的行尾
+ * 被改写，而不只是被编辑的那几行。实测（2026-10-08 审计复现）：CRLF 的 config.toml
+ * 原有 5 个 CR，写后剩 0 个。这类"内容没变、diff 全红"的改动最招人烦，
+ * 而且因为它仍然是合法 TOML，`tomlValidate` 不会提示任何东西。
+ *
+ * 判据用"哪种行尾更多"而不是"有没有 CR"：混排文件按主要风格走，不会把少数派也翻过来。
+ */
+function keepEol(result, originalText) {
+  const src = String(originalText || '');
+  const crlf = (src.match(/\r\n/g) || []).length;
+  if (crlf === 0) return result;
+  const lfOnly = (src.match(/\n/g) || []).length - crlf;
+  if (crlf < lfOnly) return result;          // 少数派是 CRLF → 保持 LF
+  return String(result).replace(/\r?\n/g, '\r\n');
 }
 
 /**
@@ -577,7 +596,7 @@ function tomlUpsertTable(text, header, bodyLines) {
     if (lines.length) lines.push('');
     lines.push(...block);
   }
-  return foldBlankLines(lines) + '\n';
+  return keepEol(foldBlankLines(lines) + '\n', text);
 }
 
 /**
@@ -731,6 +750,17 @@ function tomlValidate(text) {
       return false;
     });
     if (bad) return 'TOML 语法有问题：' + bad;
+    // ⚠ 括号必须回到 0。
+    // 旧实现只在 `depth === 0` 时才做行形状检查，于是一个未闭合的 `[`
+    //（最典型：`x = [1, 2` 手滑少写 `]`）会把 depth 永久顶在 >0，
+    // **它之后所有行的检查全部被跳过** —— 校验函数就此失明。
+    // 实测（2026-10-08 审计复现）：`x = [1, 2\nthis line has no equals sign\n` 一路放行，
+    // preview.guard 一条理由都没有、apply.ok === true，而磁盘上的 config.toml 依然非法。
+    //
+    // 修法刻意只加这一条**平衡检查**，不把行形状检查解禁 —— 后者会误伤合法的多行数组
+    //（`x = [\n  1,\n  2,\n]` 的中间几行本来就不长成"键 = 值"）。
+    // 不平衡本身就是确定的语法错误，加这一条即可覆盖同一个洞。
+    if (depth !== 0) return 'TOML 语法有问题：方括号/花括号没有闭合（多半是少写了一个 ] 或 }）';
   }
 
   // 1) 未闭合的多行字符串（用词法扫描的结果，而不是"数引号奇偶"——后者会把

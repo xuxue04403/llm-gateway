@@ -3629,6 +3629,43 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(upChat); closeUp(upResp); }
   });
 
+
+  t('非流式：有 tool_calls 就必须是 tool_use（不能看 finish_reason）', async () => {
+    // OpenAI 世界里"给了 tool_calls 却把 finish_reason 写成 stop"是被普遍容忍的写法。
+    // 旧实现照 finish_reason 翻，于是同一个上游、同一份 body：
+    //   流式 → stop_reason:"tool_use"（工具照常执行）
+    //   非流式 → stop_reason:"end_turn"（Anthropic 客户端**不执行工具**，当最终答案收尾）
+    // 同一条翻译链的两条路径给出相反结论 —— 必须消除。
+    // 这里自带一个假上游（startFakeUpstream 的响应体是固定的，给不出这种畸形组合）。
+    const srv = http.createServer((q, s) => {
+      q.resume();
+      q.on('end', () => {
+        s.writeHead(200, { 'content-type': 'application/json' });
+        s.end(JSON.stringify({
+          id: 'c1', object: 'chat.completion', model: 'test-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'f', arguments: '{"a":1}' } }] }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 5, completion_tokens: 5 },
+        }));
+      });
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const up = { srv, port: srv.address().port, st: { modelsReqs: 0 } };
+    const p = providerOf('tcu', up, { priority: 1 });
+    p.protocol = 'openai-chat';
+    const gw = await startGatewayWith([p], 'tooluse');
+    try {
+      assert.ok(gw.ready, '应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      const j = JSON.parse(r.text);
+      assert.ok((j.content || []).some((b) => b.type === 'tool_use'), '应有 tool_use 块：' + r.text.slice(0, 200));
+      assert.strictEqual(j.stop_reason, 'tool_use',
+        'finish_reason=stop 但带 tool_calls 时必须报 tool_use，否则客户端不执行工具；实际 ' + j.stop_reason);
+    } finally {
+      killGw(gw);
+      try { srv.close(); } catch { /* 忽略 */ }
+    }
+  });
   // 执行
   // 2026-09-23 实测事故：上游说"**这家**没有这个模型"，旧实现当"请求本身有错"终止 failover，
   // 用户直接拿到 400 —— 而同一逻辑模型在下一家完全可用。

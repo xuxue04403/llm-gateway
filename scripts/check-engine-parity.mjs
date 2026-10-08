@@ -167,6 +167,13 @@ const DECLARED = [
   { name: 'drainCanonicalStream', why: '新增：把上游流读成 canonical（聚合用）' },
   { name: 'chatCompletionToCanonicalEvents', why: '新增：完整 chat completion → canonical 事件（上游非流式而客户端要流式时，合成一条 SSE 流回给客户端）' },
   { name: 'forwardMatrixResponse', why: '新增：矩阵响应分支的总入口。位置刻意在"首事件偷看之后、任何 writeHead 之前"' },
+
+  // —— 2026-10-08 第七轮全面审计（4 路并行子代理 + 自查）的修复 ——
+  { name: 'openaiToAnthropicMessage', why: '修：有 tool_calls 时必须报 tool_use，不能看 finish_reason。旧实现在"上游给了 tool_calls 却把 finish_reason 写成 stop"（OpenAI 世界里被普遍容忍）时报 end_turn，Anthropic 客户端据此**不执行工具**；而同一份代码的流式路径报的是 tool_use —— 同一条翻译链自相矛盾' },
+  { name: 'routeRequest', why: '修：新增 CORS 预检（OPTIONS）分支，且**放在鉴权之前**。预检请求按规范不带凭据，放在 authorized() 后面必然 401；旧实现根本没有 OPTIONS 分支（无凭据 401 / 带凭据 404），浏览器端客户端一律用不了。同时补 access-control-allow-headers —— 原来只回 allow-origin，即便预检通过了浏览器也不允许发 anthropic-version 这类自定义头' },
+  { name: 'responsesInputToChatMessages', why: '修：input 是**单个对象**时整段输入被丢光（旧实现 `Array.isArray(input) ? input : []`），客户端却拿到 200、模型对空输入作答' },
+  { name: 'drainCanonicalStream', why: '修：补收尾 flush（与 pumpMatrixStream 同一个坑的未修版本）。偷看过的字节可能整条都在缓冲区里，只在循环体内解析会静默吞掉最后一帧' },
+  { name: 'forwardAnthropicViaOpenAI', why: '修：上游 200 却返回非 JSON（反代 HTML 错误页）时不再 `return false` 而是 `{stop:{status:502,reason}}`。`false` 的契约是"换下一家"，但这不是换一家能解决的 —— 上游已处理过请求（可能已计费），failover 只是 N 倍计费，用户最终拿到网关自己的 503 而真因只在日志里。这是 Anthropic→chat 这条**最常用**路径' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

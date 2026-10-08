@@ -78,8 +78,15 @@ function wireModal() {
   $('#btnModalClose').addEventListener('click', () => Modal.close());
   $('#modalMask').addEventListener('click', (e) => { if (e.target === $('#modalMask')) Modal.close(); });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && Modal.isOpen()) Modal.close();
-    if (e.key === 'Escape') closeEditor();
+    if (e.key === 'Escape') {
+      // ⚠ **必须是 else**：弹窗是从抽屉里打开的（选模型要往 #edModelTable 写行，
+      // 抽屉得开着），所以"抽屉 + 弹窗"两层同开是常规状态。
+      // 旧写法是两个独立 if —— 一次 Esc 把两层一起关掉，而 closeEditor() 会把
+      // 刚「＋添加供应商」还没确认的那条 splice 回滚：用户填的 ID/Base URL/Key
+      // 和刚拉回来的一整张模型表全部作废（实测复现：按一次 Esc，providers 从 2 变回 1）。
+      if (Modal.isOpen()) Modal.close();
+      else closeEditor();
+    }
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
       e.preventDefault();
       if (LG.dirty) saveConfig();

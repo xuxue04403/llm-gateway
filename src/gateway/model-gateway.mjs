@@ -4390,7 +4390,13 @@ function resolveUpstreamWire(provider, logical, hasImage) {
 /** Responses `input` 项 → chat messages。 */
 function responsesInputToChatMessages(input) {
   const out = [];
-  const items = typeof input === 'string' ? [{ type: 'message', role: 'user', content: input }] : (Array.isArray(input) ? input : []);
+  // ⚠ 三种形态都要接住：字符串 / 数组 / **单个对象**。
+  // 旧实现只认前两种（`Array.isArray(input) ? input : []`），于是 `input` 是单个对象时
+  // 整段用户输入被丢光 —— 实测（2026-10-08 审计复现）：上游收到 `messages: []`，
+  // 客户端却拿到 **HTTP 200**，模型对空输入作答。这种"200 + 默默答错"最难排查。
+  const items = typeof input === 'string' ? [{ type: 'message', role: 'user', content: input }]
+    : Array.isArray(input) ? input
+      : (input && typeof input === 'object' ? [input] : []);
   for (const it of items) {
     if (!it || typeof it !== 'object') continue;
     if (it.type === 'function_call') {
@@ -4953,6 +4959,15 @@ function makeStreamEncoder(wire, ctx) {
   let usageIn = ctx.inputTokens || 0;
   let usageOut = 0;
   let ended = false;
+  // ⚠ Responses 的 id 必须**整条流共用一个**。旧实现在 response.created 和 response.completed
+  // 里各调一次 randomUUID()，于是同一条响应出现两个 id（实测 resp_2537c6… vs resp_008f6f…），
+  // 客户端拿 created.id 去做 previous_response_id / GET /v1/responses/{id} 会找不到。
+  // 同时把 output 累积起来回填到 completed —— 旧实现恒为 []，客户端拿不到最终内容。
+  const respId = 'resp_' + crypto.randomUUID().replace(/-/g, '').slice(0, 20);
+  let outText = '';
+  let outThink = '';
+  const outTools = [];
+  const toolBySlot = new Map();   // canonical 槽位 → outTools 里的对象（用于把参数增量拼回同一个调用）
 
   const start = () => {
     if (started) return;
@@ -4972,7 +4987,7 @@ function makeStreamEncoder(wire, ctx) {
     if (wire === 'openai-responses') {
       sseWrite(res, 'response.created', {
         type: 'response.created',
-        response: { id: 'resp_' + crypto.randomUUID().replace(/-/g, '').slice(0, 20), object: 'response', status: 'in_progress', model: ctx.model, output: [] },
+        response: { id: respId, object: 'response', status: 'in_progress', model: ctx.model, output: [] },
       });
       return;
     }
@@ -5003,11 +5018,18 @@ function makeStreamEncoder(wire, ctx) {
         return;
       }
       if (wire === 'openai-responses') {
+        // 与 response.created 用**同一个** respId，并回填真实 output
+        const output = [];
+        if (outThink) output.push({ id: 'rs_out', type: 'reasoning', summary: [{ type: 'summary_text', text: outThink }] });
+        if (outText) output.push({ id: 'msg_out', type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: outText, annotations: [] }] });
+        for (const t of outTools) {
+          output.push({ id: t.id || 'fc_out', type: 'function_call', status: 'completed', call_id: t.id || '', name: t.name || '', arguments: t.args || '{}' });
+        }
         sseWrite(res, 'response.completed', {
           type: 'response.completed',
           response: {
-            id: 'resp_' + crypto.randomUUID().replace(/-/g, '').slice(0, 20),
-            object: 'response', status: 'completed', model: ctx.model, output: [],
+            id: respId,
+            object: 'response', status: 'completed', model: ctx.model, output,
             usage: { input_tokens: usageIn, output_tokens: usageOut, total_tokens: usageIn + usageOut },
           },
         });
@@ -5023,6 +5045,17 @@ function makeStreamEncoder(wire, ctx) {
     emit(events) {
       for (const e of events) {
         if (!e) continue;
+        // 累积最终内容（供 Responses 的 completed.output 回填；顺带让收尾帧不依赖上游再给一次全量）
+        if (e.t === 'text') outText += e.d;
+        else if (e.t === 'think') outThink += e.d;
+        else if (e.t === 'tool') {
+          const t = { id: e.id, name: e.name, args: '' };
+          outTools.push(t);
+          toolBySlot.set(e.i, t);
+        } else if (e.t === 'args') {
+          const t = toolBySlot.get(e.i);
+          if (t) t.args += e.d;
+        }
         start();
         if (wire === 'anthropic-messages') {
           if (e.t === 'text' || e.t === 'think') {
@@ -5207,25 +5240,36 @@ async function drainCanonicalStream({ upstream, upstreamWire, collector, headByt
   const td = new TextDecoder();
   let buf = headBytes ? Buffer.from(headBytes).toString('utf8') : '';
   let curEvent = '';
+  // ⚠ 与 `pumpMatrixStream` 同一个坑，必须同样的修法：flush 要能重复调用，
+  // 且**循环结束后再调一次**。原因：forward 的"首事件偷看"会把开头那段先读进 headBytes，
+  // 流短的时候循环第一次就可能拿到 done:true，只在循环体里解析会让那些字节永远不被解析。
+  // （审计发现：本函数当初漏了这一手，而上游流式 + 客户端非流式的组合正好走这里，
+  //   表现为**最后一帧被静默吞掉**、usage 记 0。）
+  const flush = () => {
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).replace(/\r$/, '');
+      buf = buf.slice(nl + 1);
+      if (line.startsWith('event:')) { curEvent = line.slice(6).trim(); continue; }
+      if (!line.startsWith('data:')) { if (line === '') curEvent = ''; continue; }
+      const payload = line.slice(5).trim();
+      if (!payload || payload === '[DONE]') continue;
+      let json = null;
+      try { json = JSON.parse(payload); } catch { continue; }
+      collector.feed(decoder.feed(curEvent, json));
+    }
+  };
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += td.decode(value, { stream: true });
-      let nl;
-      while ((nl = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, nl).replace(/\r$/, '');
-        buf = buf.slice(nl + 1);
-        if (line.startsWith('event:')) { curEvent = line.slice(6).trim(); continue; }
-        if (!line.startsWith('data:')) { if (line === '') curEvent = ''; continue; }
-        const payload = line.slice(5).trim();
-        if (!payload || payload === '[DONE]') continue;
-        let json = null;
-        try { json = JSON.parse(payload); } catch { continue; }
-        collector.feed(decoder.feed(curEvent, json));
-      }
+      flush();
     }
+    flush();
   } finally {
+    // 尾部还剩着不成帧的残句 → 记一条，否则"少了一帧"永远没人知道
+    if (buf.trim()) log(`[matrix] 上游流结束时仍有未成帧的残句（${buf.length}B），已丢弃：${buf.slice(0, 80)}`);
     try { reader.releaseLock(); } catch { /* 忽略 */ }
   }
 }
@@ -5281,12 +5325,24 @@ async function forwardMatrixResponse({ res, upstream, bodyStream, ctype, pending
       }
     } catch (e) {
       log(`matrix: 读上游响应失败：${e && e.message}`);
-      return false;
+      // ⚠ 返回 false 在 forward 的契约里是「**这家**失败，换下一家」。
+      // 但"读不出上游响应"不是换一家就能好的 —— 上游已经处理了这次请求（可能已计费），
+      // 一路 failover 只会 N 倍计费，而用户最终拿到的是网关自己的
+      // `all providers ... are unavailable`，真实原因只躺在日志里。
+      // 所以要 stop 并把上游状态透出去。
+      return { stop: { status: 502, upstreamStatus: upstream.status, reason: '上游响应读取失败' } };
     }
     let json = null;
     try { json = JSON.parse(text); } catch (e) {
+      // 最常见的真实形态：反代/网关插在中间，上游 200 但返回 HTML 错误页。
       log(`matrix: 上游响应不是合法 JSON（${mx.upstreamWire} → ${mx.clientWire}）：${String(text).slice(0, 120)}`);
-      return false;
+      return {
+        stop: {
+          status: 502,
+          upstreamStatus: upstream.status,
+          reason: `上游返回的不是 JSON（Content-Type: ${ctype || '未声明'}）—— 通常是上游前面有反代/网关插了错误页`,
+        },
+      };
     }
     // 已经是 canonical(chat) 就不用再过一遍 collector
     if (mx.upstreamWire === 'openai-chat') canon = json;
@@ -5370,13 +5426,24 @@ function openaiToAnthropicMessage(json, model, fallbackInTokens) {
   const outTok = Number(usage.completion_tokens) > 0
     ? Number(usage.completion_tokens)
     : estimateTokens(content.map((c) => c.text || c.thinking || JSON.stringify(c.input || '')).join(''));
+  // ⚠ 有 tool_calls 就必须是 tool_use，**不能**看 finish_reason。
+  // OpenAI 世界里"给了 tool_calls 却把 finish_reason 写成 stop"是被普遍容忍的写法，
+  // 而 Anthropic 客户端见到 end_turn 就**不执行工具**、直接把这轮当最终答案收尾。
+  // 实测（2026-10-08 审计复现）：同一个上游、同一份 body，
+  //   流式 → stop_reason:"tool_use"（工具照常执行）
+  //   非流式 → stop_reason:"end_turn"（工具被丢掉）
+  // ——同一条翻译链的两条路径给出相反结论，属于必须消除的自相矛盾。
+  // 对齐 `canonicalToChatCompletion` 与 `responsesToChatCompletion` 里同样的写法。
+  const stopReason = content.some((c) => c.type === 'tool_use')
+    ? 'tool_use'
+    : stopReasonFromFinish(choice.finish_reason);
   return {
     id: (json && json.id) || ('msg_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24)),
     type: 'message',
     role: 'assistant',
     model,
     content: content.length ? content : [{ type: 'text', text: '' }],
-    stop_reason: stopReasonFromFinish(choice.finish_reason),
+    stop_reason: stopReason,
     stop_sequence: null,
     usage: { input_tokens: inTok, output_tokens: outTok },
   };
@@ -5822,10 +5889,22 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       }
       const text = await readTextWithTimeout(upstream, 30_000, 4 * 1024 * 1024);
       let parsed = null;
-      try { parsed = JSON.parse(text); } catch { /* 非 JSON：按失败处理 */ }
+      try { parsed = JSON.parse(text); } catch { /* 非 JSON：见下 */ }
       if (!parsed) {
-        log(`upstream ${provider.id} 非 JSON 响应（anthropic→openai 翻译路径）`);
-        return false;
+        // ⚠ `return false` 的契约是「**这家**失败，换下一家」。
+        // 但"上游 200 却给了非 JSON"不是换一家能解决的 —— 上游已经处理过这次请求（可能已计费），
+        // 一路 failover 只是 N 倍计费，而用户最终拿到的是网关自己的
+        // `all providers ... are unavailable`，真正的原因（反代插了 HTML 错误页）只躺在日志里。
+        // 实测（2026-10-08）：这是 Anthropic 客户端 → chat 上游这条**最常用**路径上的行为，
+        // 与矩阵路径的 502 处置不一致。
+        log(`upstream ${provider.id} 非 JSON 响应（anthropic→openai 翻译路径，Content-Type: ${ctype || '未声明'}）：${String(text).slice(0, 120)}`);
+        return {
+          stop: {
+            status: 502,
+            upstreamStatus: upstream.status,
+            reason: `上游返回的不是 JSON（Content-Type: ${ctype || '未声明'}）—— 通常是上游前面有反代/网关插了错误页`,
+          },
+        };
       }
       json(res, 200, openaiToAnthropicMessage(parsed, body.model, inputTokens));
       return true;
@@ -6135,7 +6214,13 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
     if (out && out.stop) {
       log(`failover stopped (${model} via ${p.id} HTTP ${out.stop.upstreamStatus} → ${out.stop.status})`);
       logCall(`via=${viaTag(p.id)}`, 'fail:' + out.stop.status);
-      return json(res, out.stop.status, { error: { message: stopFailoverMessage(p.id, model, out.stop.upstreamStatus) } });
+      // 矩阵分支会带 `reason`（例如"上游返回的不是 JSON"）—— 那种情况下
+      // stopFailoverMessage 的"请求本身有问题"是**错的**文案，会把用户引向排查自己的请求。
+      // 有 reason 就用 reason，并把上游状态附上。
+      const msg = out.stop.reason
+        ? `${out.stop.reason}（上游 ${p.id} 返回 HTTP ${out.stop.upstreamStatus}）`
+        : stopFailoverMessage(p.id, model, out.stop.upstreamStatus);
+      return json(res, out.stop.status, { error: { message: msg } });
     }
     // R25（审计修复）：响应头已发出（流中途失败/客户端断开）→ failover 无意义，
     // 继续只会对剩余供应商重复计费/风控
@@ -6440,8 +6525,13 @@ async function handleMessages(cfg, req, res, body) {
       log(`failover stopped (${model} via ${p.id} HTTP ${out.stop.upstreamStatus} → ${out.stop.status}, anthropic)`);
       logCall(`via=${viaTag(p.id)}`, 'fail:' + out.stop.status);
       return json(res, out.stop.status, { type: 'error', error: {
-        type: 'invalid_request_error',
-        message: stopFailoverMessage(p.id, model, out.stop.upstreamStatus),
+        // 与 handleCompletion 对齐：矩阵分支会带 `reason`（如"上游返回的不是 JSON"）。
+        // 那种情况下 `stopFailoverMessage` 的"请求本身有问题"是**错的**文案 ——
+        // 会把用户引向反复排查自己的请求，而真正的问题在上游前面的反代。
+        type: out.stop.status >= 500 ? 'api_error' : 'invalid_request_error',
+        message: out.stop.reason
+          ? `${out.stop.reason}（上游 ${p.id} 返回 HTTP ${out.stop.upstreamStatus}）`
+          : stopFailoverMessage(p.id, model, out.stop.upstreamStatus),
       } });
     }
     // R25（审计修复）：响应头已发出（流中途失败/客户端断开）→ failover 无意义
@@ -6605,6 +6695,26 @@ async function routeRequest(cfg, req, res) {
       // 代理可见性（v1.8.2）：把"是否走代理 / 哪些域名直连"也放进来——2026-09-16 事故里
       // 上游 ECONNREFUSED 的真凶是 clash 端口没在监听，而 /health 当时只有 accounts。
       json(res, 200, { ok: true, accounts: accountPoolSnapshot(cfg), proxy: proxyStatus() });
+      return;
+    }
+
+    // CORS 预检（OPTIONS）：**必须放在鉴权之前**。
+    // 按 CORS 规范，浏览器的预检请求**不携带凭据**（没有 Authorization / x-api-key），
+    // 所以把它放在 authorized() 后面必然 401 → 任何浏览器端客户端都永远发不出请求。
+    // 实测（2026-10-08 全面测试）：OPTIONS 无凭据 → 401 invalid x-api-key；
+    // 带凭据 → 落在 404（根本没写 OPTIONS 分支）—— 两种都不是合法的预检响应。
+    // 另外原来所有响应只回了 `access-control-allow-origin`，没有 `allow-headers`，
+    // 于是即使预检侥幸过了，浏览器也不会允许发 `anthropic-version` 这类自定义头。
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, {
+        'access-control-allow-origin': '*',
+        'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS',
+        // 回显客户端声明的头最省事也最不容易漏（本地网关，不存在跨站滥用面）
+        'access-control-allow-headers': req.headers['access-control-request-headers']
+          || 'authorization, x-api-key, anthropic-version, anthropic-beta, content-type, accept',
+        'access-control-max-age': '86400',
+        'content-length': '0',
+      });
       return;
     }
 

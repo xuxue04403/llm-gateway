@@ -130,7 +130,13 @@ const SECRET_KEY_NOISE_PATHLIKE = /^(?:"?)(?:file|keyring|none|auto|env|inherit|
 
 function maskOne(whole) {
   const s = String(whole);
-  if (s.length <= 12) return s;
+  // ⚠ 这里**不能**再设一个"太短就原样返回"的下限。调用方 `maskSecretsInText` 已经用
+  // `inner.length >= 8` 判定过"这个值值得打码"，在本函数里再卡一道更高的线（旧值是 12），
+  // 8~12 字符的凭据就落进了「被判为密钥 → 然后原样写回」的缝里 ——
+  // 而预览弹窗上明确写着"密钥已打码显示"。实测（2026-10-08 审计复现）：
+  // 12 字符的高熵凭据在预览的 `before` 里**明文可见**，13 字符则正常打码。
+  // 短值不做"保留首尾"（那会暴露大部分内容），直接整体替换。
+  if (s.length <= 12) return '<已打码>';
   return s.slice(0, 6) + '…' + s.slice(-4) + '（已打码）';
 }
 

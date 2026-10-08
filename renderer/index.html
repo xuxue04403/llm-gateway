@@ -224,6 +224,14 @@
                 <option value="claude">Claude Code（Anthropic 协议）</option>
                 <option value="codex">Codex（OpenAI 协议）</option>
                 <option value="cline">Cline（OpenAI 协议 + 身份头）</option>
+                <!-- ⚠ 这一项必须与 gateway-manager.js 的 CLIENT_PROFILES 和 providers.js 的
+                     #edProfile 三处保持一致。旧的这里漏了 opencode：磁盘配置里是
+                     clientProfile:"opencode" 时，给 <select> 赋一个不存在的值会得到空串，
+                     用户随便改一个设置再保存，readSettingsInto() 就走
+                     `else if (c.clientProfile !== undefined) delete c.clientProfile`
+                     —— **把合法配置静默删掉**，之后 OpenCode 端点会 400 MissingSessionID。
+                     tests/unit.js 的三份清单守卫现在同时覆盖这里。 -->
+                <option value="opencode">OpenCode（OpenAI 协议 + 会话头 + 工具指纹）</option>
               </select>
               <span class="hint">决定发往上游的请求头形态，也决定写入 dsh 时的协议（claude → Anthropic）</span>
             </div>
