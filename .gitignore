@@ -13,3 +13,6 @@ out/_test-leak-settings.yaml
 *.bak-llmgateway-before-restore
 *.bak-import
 *.bak-broken
+
+# 我用来写 commit message 的临时文件（忘了删就会被提交 —— 已经犯过两次）
+*.txt

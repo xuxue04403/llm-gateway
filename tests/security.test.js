@@ -166,16 +166,31 @@ t('写保护：writeAtomic 对"存在但读不出来"的目标一律拒绝（这
   assert.ok(/读不出来|中止/.test(r.error || ''), r.error);
 });
 
-t('写保护：rename 失败时不得留下含明文内容的 .tmp 文件', () => {
+t('写保护：写入失败时不得留下含明文内容的 .tmp 文件，且必须如实上报', () => {
   const dir = fs.mkdtempSync(path.join(tmp, 'tmpclean-'));
   const file = path.join(dir, 'settings.json');
   fs.writeFileSync(file, '{}', 'utf8');
-  // 把 tmp 路径先占成目录 → writeFileSync(tmp) 失败 → 走 catch
-  const tmpPath = file + '.tmp-llmgateway-' + process.pid;
-  fs.mkdirSync(tmpPath);
-  const r = util.writeAtomic(file, '{"a":1}');
+  // 注入失败的方式刻意**不依赖临时文件的具体名字**（旧版把 `file + '.tmp-llmgateway-' + pid`
+  // 这个路径先占成目录来制造失败 —— 给临时名加个随机后缀就让这条测试失效了，
+  // 而它要守的行为其实与名字无关）。
+  // 这里改成桩掉 fs.writeFileSync：先真的把明文写下去、再抛 ENOSPC（模拟磁盘写满的**半写**形态），
+  // 于是同时覆盖两件事：① 失败要如实上报 ② 失败后临时文件必须被清掉（旧版没断言这一条）。
+  const real = fs.writeFileSync;
+  fs.writeFileSync = (p, ...rest) => {
+    if (String(p).includes('.tmp-llmgateway-')) {
+      real(p, '{"a":1,"secret":"PLAINTEXT-LEAK"}', 'utf8');
+      throw new Error('ENOSPC: no space left on device');
+    }
+    return real(p, ...rest);
+  };
+  let r;
+  try { r = util.writeAtomic(file, '{"a":1,"secret":"PLAINTEXT-LEAK"}'); }
+  finally { fs.writeFileSync = real; }
   assert.strictEqual(r.ok, false, '写入失败必须如实上报');
   assert.strictEqual(fs.readFileSync(file, 'utf8'), '{}', '原文件不得被改动');
+  const leftovers = fs.readdirSync(dir).filter((n) => n.includes('.tmp-llmgateway-'));
+  assert.deepStrictEqual(leftovers, [],
+    '失败后不得留下含明文内容的临时文件，实际残留：' + leftovers.join(', '));
 });
 
 /* ================================================================

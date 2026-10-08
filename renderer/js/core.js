@@ -100,6 +100,12 @@ function setConfigFromText(text) {
     LG.config = { port: 3091, apiKey: '', providers: [] };
   }
   if (!Array.isArray(LG.config.providers)) LG.config.providers = [];
+  // ⚠ 过滤掉非对象条目。手改 JSON、别的工具写出、或删除条目时留下 `null` 都会出现这种配置，
+  // 而**下游全都假设 providers[i] 是对象**：dashboard 读 `p.enabled`、providers 读 `p.id` …
+  // 一旦抛错，renderAll 的 try/catch 会**逐视图吞掉**，表现为"概览页统计卡停在 0/0、
+  // 接入信息整块不渲染"，界面上没有任何提示（用户只会觉得"这软件坏了"）。
+  // 在这里一次性收口，比在十几处渲染代码里各加一个判空可靠。
+  LG.config.providers = LG.config.providers.filter((p) => p && typeof p === 'object' && !Array.isArray(p));
   LG.configLoaded = true;
   LG.dirty = false;
   updateDirtyBar();

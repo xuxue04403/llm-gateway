@@ -437,6 +437,9 @@ class GatewayManager extends EventEmitter {
 
     this.proc = null;
     this.running = false;
+    // 进程在跑 != 端口在监听。ready 由 _doStart 的就绪探测结果给出，
+    // 界面据此判断"真的能用了"（见 main.js 的 gw:action start）。
+    this.ready = false;
     this.stopping = false;
     this.logTail = '';
     this.port = 3091;
@@ -767,6 +770,11 @@ class GatewayManager extends EventEmitter {
     });
     const spawned = this.proc;   // 身份快照：restart 期间旧进程迟到的 error/exit 不得改写新状态
     this.running = true;
+    // `running` 只表示"子进程对象还在"，不表示"端口真的在监听"。
+    // 下面 796 行会算出 `healthy`，但那以前只写一行日志 —— 于是"子进程活着但没 listen"
+    //（首启被杀软/磁盘拖慢）时，界面弹「网关已启动」+ 状态点变绿，而每个客户端请求都失败。
+    // 这正是本文件注释里说要修的那类"谎报已启动"，只是当时只覆盖了"子进程退出"那一半。
+    this.ready = false;
     this.emit('state');
 
     const onData = (chunk) => { this.pushLog(chunk.toString('utf8')); };
@@ -802,6 +810,9 @@ class GatewayManager extends EventEmitter {
     }
     if (healthy) this.log('网关已就绪：http://127.0.0.1:' + this.port + '/v1');
     else this.log('网关端口探测未通过（可能配置错误，请查看日志）。');
+    // 只有真的探测通过才算"就绪"。子进程已经退出时不要把它标成 ready
+    //（下面 this.proc !== spawned 说明期间发生了 exit/restart）。
+    this.ready = healthy && this.proc === spawned;
     this.emit('state');
   }
 
@@ -853,7 +864,7 @@ class GatewayManager extends EventEmitter {
     }
     const p = this.proc;
     this.proc = null;
-    this.running = false;          // 提前返回路径也要复位，否则界面一直显示"运行中"
+    this.running = false; this.ready = false;   // 提前返回路径也要复位，否则界面一直显示"运行中"
     if (!p || p.exitCode !== null) { this.emit('state'); return; }
     try {
       const r = spawnSync('taskkill', ['/pid', String(p.pid), '/T', '/F'], { windowsHide: true });
@@ -922,6 +933,7 @@ class GatewayManager extends EventEmitter {
     const port = this.running ? this.port : this.configPort();
     return {
       running: this.running,
+    ready: !!this.ready,
       port,
       configPath: this.configPath,
       baseUrl: 'http://127.0.0.1:' + port + '/v1',

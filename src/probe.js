@@ -134,7 +134,12 @@ function getJson(urlStr, opts) {
     const t0 = Date.now();
     const mod = (useProxy && !isHttps) ? http : (isHttps ? https : http);
     let req;
-    const finish = (obj) => resolve(Object.assign({ ms: Date.now() - t0, via }, obj));
+    let hardTimer = null;
+    // finish 现在负责清掉下面的绝对墙钟。`resolve` 天然幂等，重复调用无副作用。
+    const finish = (obj) => {
+      if (hardTimer) { clearTimeout(hardTimer); hardTimer = null; }
+      resolve(Object.assign({ ms: Date.now() - t0, via }, obj));
+    };
     try {
       req = mod.request(reqOpts, (res) => {
         let body = '';
@@ -187,6 +192,23 @@ function getJson(urlStr, opts) {
     // （恶意/黑洞/TLS-only 代理）时 Promise 永不 settle：界面"测试连通性"永久转圈、
     // 每挂一次泄漏一条 TCP+TLS 句柄，而 gw:test-providers 是串行遍历最多 40 家的。
     // 手动 setTieout 已被实测证明有效（直连路径本来就有超时，两者现在一致）。
+    // ⚠⚠ **绝对墙钟**兜底（与"有没有数据在流"无关）。
+    //
+    // 上面那个 `req.setTimeout` 是**不活动**超时：任何一次 `res.on('data')` 都会重置它。
+    // 于是对端只要每隔 < timeoutMs 吐一个**字节**，这个 Promise 就永不 settle ——
+    // 实测（2026-10-08 审计）：timeoutMs=500 的情况下一路读到 4 秒仍未返回，
+    // 而"连上后不发数据"的对照组如期 504ms 超时。
+    // 后果有三个，都不轻：
+    //   ① 「测试全部连通性」的 90 秒预算只在**两次探测之间**检查，管不了正在飞行的这一次；
+    //   ② 「⚡一键获取全部模型」的按钮靠 finally 复位 `disabled`，永不复位；
+    //   ③ 每挂死一次泄漏一条 TCP/TLS 句柄。
+    // 这里补一个不看数据流的截止时间。+500ms 是留给"刚好卡在边界上的正常慢响应"。
+    hardTimer = setTimeout(() => {
+      try { req.destroy(); } catch (_) { /* 忽略 */ }
+      finish({ ok: false, error: '超时 ' + timeoutMs + 'ms（整体墙钟：对端持续有数据流入但始终读不完）' });
+    }, timeoutMs + 500);
+    if (hardTimer && typeof hardTimer.unref === 'function') hardTimer.unref();
+
     req.setTimeout(timeoutMs, () => {
       try { req.destroy(); } catch (_) { /* 忽略 */ }
       finish({ ok: false, error: '超时 ' + timeoutMs + 'ms' });

@@ -174,6 +174,16 @@ const DECLARED = [
   { name: 'responsesInputToChatMessages', why: '修：input 是**单个对象**时整段输入被丢光（旧实现 `Array.isArray(input) ? input : []`），客户端却拿到 200、模型对空输入作答' },
   { name: 'drainCanonicalStream', why: '修：补收尾 flush（与 pumpMatrixStream 同一个坑的未修版本）。偷看过的字节可能整条都在缓冲区里，只在循环体内解析会静默吞掉最后一帧' },
   { name: 'forwardAnthropicViaOpenAI', why: '修：上游 200 却返回非 JSON（反代 HTML 错误页）时不再 `return false` 而是 `{stop:{status:502,reason}}`。`false` 的契约是"换下一家"，但这不是换一家能解决的 —— 上游已处理过请求（可能已计费），failover 只是 N 倍计费，用户最终拿到网关自己的 503 而真因只在日志里。这是 Anthropic→chat 这条**最常用**路径' },
+
+  // —— 2026-10-08 第七轮审计的"未修项"补齐 ——
+  { name: 'breakerRecordSuccess', why: '修：不再整条 delete。`opens`（连续开闸次数）存在条目里，而退避是 `base * 2**(opens-1)` —— 删掉等于把阶梯历史清零，于是"3 次失败→冷却→探活成功→又 3 次失败"的**抖动型坏家**永远停在第一档 90s（而它恰恰最该退避）。改成只清 fails/state/openUntil' },
+  { name: 'breakerCooldownSecs', why: '修：过滤掉非对象条目。配置里出现 `providers: [null]` 时旧实现直接 `p.id` 抛 TypeError，而它是在**构造 503 响应体**时被调用的 → 真正的信息"全部候选都在熔断"被兜底 catch 换成不透明的 500' },
+  { name: 'maskSecrets', why: '修：补"裸高熵串"兜底。实测上游 401 时裸回显收到的凭据（无前缀、无关键词），前面所有规则都不命中 → 明文进 gateway.log，并经 accountPool.reason 进入**免鉴权**的 /health。兜底刻意保守：≥28 字符 + 同时含字母数字 + 不是纯 hex 才打码' },
+  { name: 'accountPoolSnapshot', why: '修：顺带清理过期条目。旧实现什么都不清，而它渲染的是**免鉴权**的 /health —— 响应体与 accountPool 规模同步增长（实测连打 200 次 /health，每次序列化 300 条 / 47KB）' },
+  { name: 'ACCOUNT_POOL_MAX', why: '新增：账户池容量上界 512（与 sessionAffinity/responseAffinity 同量级）。键含上游模型 ID，"上游逐模型限流"时每模型一条 → 客户端可逐个模型把它撑大' },
+  { name: 'responsesInputToChatMessages', why: '（同上）另修两处：input 为单个对象时不再丢光；`input_image` 不再被降级成字面量 "[image]" —— 那等于把图换成四个字母，而 imageBlockStats 仍按图片计数（路由到支持图片的家却发过去一句占位符）' },
+  { name: 'chatToResponsesRequest', why: '修：补回停止序列（唯一漏掉它的一格）；对 previous_response_id/store/include/truncation/parallel_tool_calls 这些 chat 上游没有对应概念的**有状态字段**记日志，而不是静默丢弃' },
+  { name: 'forward', why: '修：直通路径新增"上游 200 但 content-type 既不是 JSON 也不是 SSE"检测 → 502。真实高频形态是反代插的 HTML 错误页，旧实现把它原样配 200 透传，客户端拿到"成功"却解析失败而网关日志一片干净（四条路径里只有这条不一致）' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

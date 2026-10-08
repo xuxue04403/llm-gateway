@@ -84,7 +84,10 @@ function writeAtomic(file, text) {
         }
       }
     }
-    const tmp = file + '.tmp-llmgateway-' + process.pid;
+    // 临时名带随机后缀：只带 pid 时，**同进程内并发写同一个文件**会共用同一个临时路径
+    // （rename 成功但内容是最后一次写入，返回值还都是 ok:true）。跨进程因 pid 不同不会撞，
+    // 所以这是个潜伏的坑 —— 加个随机后缀的成本是零。
+    const tmp = file + '.tmp-llmgateway-' + process.pid + '-' + Math.random().toString(36).slice(2, 10);
     try {
       fs.writeFileSync(tmp, text, 'utf8');
       fs.renameSync(tmp, file);
@@ -155,7 +158,7 @@ function restore(file, suffixes) {
   // 实测（审计脚本 audit-restore-atomic）：模拟 ENOSPC 后 settings.json 只剩
   // `{"env": {"ANTHROPIC_AU`（30 字节，JSON.parse 报 Unterminated string）。
   // rename 在同一文件系统内是原子的 —— 要么全换、要么完全不换。
-  const tmp = file + '.tmp-llmgateway-restore-' + process.pid;
+  const tmp = file + '.tmp-llmgateway-restore-' + process.pid + '-' + Math.random().toString(36).slice(2, 10);
   try {
     fs.copyFileSync(info.path, tmp);
     fs.renameSync(tmp, file);

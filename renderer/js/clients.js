@@ -165,8 +165,11 @@ LG.renders.clients = function renderClients() {
       const handler = () => {
         o[k] = (n.type === 'checkbox') ? n.checked : n.value;
       };
+      // 只挂一次。旧实现在下面又对 SELECT 挂了一遍**同一个** handler ——
+      // 当前幂等（同一赋值执行两次），但那是"重复执行 N 次"类 bug 的同型残留，
+      // 一旦 handler 将来带上副作用（埋点、置脏、发请求）就会翻倍。
+      // 注：<select> 的 change 事件本来就会冒泡并在元素上触发，不需要单独补。
       n.addEventListener('change', handler);
-      if (n.tagName === 'SELECT') n.addEventListener('change', handler);
     });
     card.querySelectorAll('[data-act]').forEach((b) => {
       b.addEventListener('click', () => {

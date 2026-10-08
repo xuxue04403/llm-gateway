@@ -664,12 +664,29 @@ function breakerRecordFail(providerId, httpStatus, serverRetryMs) {
   breaker.set(providerId, b);
 }
 function breakerRecordSuccess(providerId) {
-  if (breaker.has(providerId)) breaker.delete(providerId);
+  const b = breaker.get(providerId);
+  if (!b) return;
+  // ⚠ **不要整条删除**。`opens`（连续开闸次数）存在这个条目里，而退避阶梯是
+  // `base * 2**(opens-1)` —— 删掉条目就等于把阶梯历史清零。
+  // 后果实测（2026-10-08 审计）：一个"3 次失败 → 冷却 → 探活成功 → 又 3 次失败"的
+  // **抖动型坏家**永远停在第一档 90s；只有一路坏到底、中途一次都没成功的家才升到 30m。
+  // 而抖动型恰恰是最该退避的那一类（反复打扰正在限流的上游）。
+  // 改成只清"失败计数 + 开闸状态"，保留 opens 让阶梯继续爬。
+  // 安全性：`breakerIsOpen` 对 state==='closed' 返回 false，`breaker.has` 全文件只有这一处用过。
+  b.fails = 0;
+  b.state = 'closed';
+  b.openUntil = 0;
+  b.probeAt = 0;
 }
 
 /** 熔断冷却剩余秒数（客户端重试提示用）。 */
 function breakerCooldownSecs(providers) {
-  const until = Math.max(0, ...providers.map((p) => {
+  // ⚠ 必须过滤掉非对象条目。配置里出现 `providers: [null]`（手改 JSON / 别的工具写出）时，
+  // 旧实现直接 `p.id` 抛 TypeError —— 而它是在**构造 503 响应体**的过程中被调用的，
+  // 于是真正的信息（"全部候选都在熔断"）被 startServer 的兜底 catch 换成了不透明的
+  // `500 gateway internal error`，用户看到的是一句和事实无关的报错。
+  const list = (Array.isArray(providers) ? providers : []).filter((p) => p && p.id);
+  const until = Math.max(0, ...list.map((p) => {
     const b = breaker.get(p.id);
     return b ? b.openUntil - Date.now() : 0;
   }));
@@ -708,7 +725,20 @@ function maskSecrets(text) {
     .replace(/((?:x-api-key|api-key|authorization)["':\s=]+)(Bearer\s+)?([^\s"',}]+)/gi, (m, p1, p2) => p1 + (p2 || '') + '***')
     // 裸 Bearer/Basic 兜底：上游回显鉴权头时未必带 "authorization" 关键词
     //（实测语境形如 `Authorization failed for key <token>`）
-    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._+/=\-]{12,}/gi, '$1 ***');
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._+/=\-]{12,}/gi, '$1 ***')
+    // 无前缀、无关键词的**裸高熵串**兜底。
+    // 实测（2026-10-08 审计）：上游 401 时把收到的凭据裸回显
+    //（`auth rejected for credential aB3xK9mQ2pL7wR4tY6uI8oP0sD5fG1hJ2k`），
+    // 前面所有规则都不命中 → 明文进 gateway.log，并经 accountPool.reason 进入**免鉴权**的 /health。
+    //
+    // ⚠ 这条必须**保守**，否则会把正常内容糊掉。同时满足四个条件才打码：
+    //   ① ≥28 字符  ② 同时含字母和数字  ③ 不含 `/` `.` `:`（排除路径/URL/域名/文件名）
+    //   ④ 不是纯 hex（排除 sha256 / 长 id —— 它们常见且不是凭据）
+    .replace(/\b[A-Za-z0-9_\-]{28,}\b/g, (m) => {
+      if (!/[A-Za-z]/.test(m) || !/[0-9]/.test(m)) return m;
+      if (/^[0-9a-f]+$/i.test(m)) return m;
+      return m.slice(0, 4) + '***' + m.slice(-4) + '（已打码:' + m.length + '）';
+    });
 }
 
 async function fetchCatalog(provider, force, clientUA, clientProfile, cfg) {
@@ -1250,6 +1280,11 @@ const ACCOUNT_CREDIT_COOLDOWN_MS = envMs('DSH_GATEWAY_ACCOUNT_CREDIT_COOLDOWN_MS
 const ACCOUNT_SESSION_COOLDOWN_MS = envMs('DSH_GATEWAY_ACCOUNT_SESSION_COOLDOWN_MS', 60 * 60_000); // 会话失效：等重新登录
 const ACCOUNT_RATE_COOLDOWN_MS = envMs('DSH_GATEWAY_ACCOUNT_RATE_COOLDOWN_MS', 90_000);            // 限流：短冷却（基准值）
 const ACCOUNT_RATE_COOLDOWN_MAX_MS = envMs('DSH_GATEWAY_ACCOUNT_RATE_COOLDOWN_MAX_MS', 30 * 60_000); // 限流冷却上限（含 Retry-After 的夹取）
+// 账户池容量上界。键含上游模型 ID（provider#acct@model），"上游逐模型限流"时每模型一条 ——
+// 没有上界就会被客户端逐个模型撑大，而 accountPoolSnapshot 会把它全量列进**免鉴权**的 /health。
+// 取 512 与 sessionAffinity / responseAffinity 同一量级（它们在无界增长那次审计里已经加过界）。
+const ACCOUNT_POOL_MAX = Number(process.env.DSH_GATEWAY_ACCOUNT_POOL_MAX) > 0
+  ? Number(process.env.DSH_GATEWAY_ACCOUNT_POOL_MAX) : 512;
 
 function accountKey(providerId, acctId) { return providerId + '#' + acctId; }
 /** 模型作用域的冷却键（仅限流类用，见 markAccountFailure 的 model 参数说明）。 */
@@ -1327,14 +1362,25 @@ function rateCooldownMs(prevFails, serverMs) {
  *  · `credit` / `session`（额度耗尽 / 登录失效）仍是**账户级** —— 这两类确实整把 Key 都不能用。
  */
 function markAccountFailure(providerId, acct, kind, detail, model, serverMs) {
-  // D13：账户池只在"标记失败"与"成功"时增删，冷却条目过期后**不会被删除**（coolEntryUsable 是懒判定），
-  // 而键里含上游模型 ID（provider#acct@model）→ 多供应商×多账户×多模型的 429 只增不减，
-  // 且这些孤儿条目会被 accountPoolSnapshot 全量列进 /health，响应体随时间单调膨胀。
-  // 这里借"标记失败"这一低频时机顺带清理（无需定时器，也不影响正在冷却的条目）。
-  if (accountPool.size > 64) {
+  // D13 + 第七轮审计：账户池必须有**硬上界**。
+  // 旧实现只在 size > 64 时清一次，而且判据是 `now >= st.until`（**已过期**才删）——
+  // 正在冷却的模型级条目（最长 30 分钟）一个都不删，于是"上游逐模型限流"时每个模型留一条，
+  // 表只增不减；`accountPoolSnapshot` 又会把它**全量**列进**免鉴权**的 /health。
+  // 实测：300 次请求（每模型一次）→ 301 条 / 47 KB；两把 Key → 602 条 / 125 KB；
+  // 进程内直测 2000 个模型 → 254 KB。客户端可以逐个模型把它撑起来。
+  {
     const now = Date.now();
     for (const [k, st] of accountPool) {
       if (st && st.state !== 'ok' && now >= st.until) accountPool.delete(k);
+    }
+    // 仍然超上界 → 按 until 升序淘汰（最该忘记的先走）。用 LRU 而不是"直接清空"：
+    // 清空会让所有正在冷却的账户立刻复活、又去撞刚被限流的上游。
+    if (accountPool.size > ACCOUNT_POOL_MAX) {
+      const byUntil = [...accountPool.entries()].sort((a, b) =>
+        ((a[1] && a[1].until) || 0) - ((b[1] && b[1].until) || 0));
+      for (let i = 0; i < byUntil.length && accountPool.size > ACCOUNT_POOL_MAX; i++) {
+        accountPool.delete(byUntil[i][0]);
+      }
     }
   }
   const scoped = kind === 'rate' && model;
@@ -1378,6 +1424,15 @@ function viaTag(providerId) {
  * @param {object} [cfg] 传入配置则连同未进入过冷却的账户一起列出（state='ok'）
  */
 function accountPoolSnapshot(cfg) {
+  // 顺带清理过期条目。旧实现什么都不清，于是 /health（**免鉴权**）的响应体
+  // 与 accountPool 的规模完全同步增长 —— 审计实测连打 200 次 /health，
+  // 每次都要序列化 300 条 / 47 KB，而表里绝大多数是早已过期的冷却记录。
+  {
+    const now = Date.now();
+    for (const [k, st] of accountPool) {
+      if (st && st.state !== 'ok' && now >= st.until) accountPool.delete(k);
+    }
+  }
   const out = [];
   const seen = new Set();
   const modelScoped = [];   // 模型级冷却条目（rate）单独列出，不混进账户级状态
@@ -3984,6 +4039,26 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     json(res, 200, completion);
     return true;
   }
+  // ── 直通路径的"上游 200 但不是我们要的东西"检测 ──
+  // 真实高频形态：上游前面挂了反代/CDN，它自己出错时回 **200 + text/html 错误页**
+  //（或 200 + 纯文本）。直通路径不解析响应体，于是旧实现把这页 HTML 原样配 200 发给客户端
+  // —— 客户端拿到"成功"却解析失败，而网关日志一片干净（实测 2026-10-08 审计：四条路径里
+  // 只有这条会把 HTML 当成功透传，与矩阵路径的 502 处置不一致）。
+  //
+  // 判据刻意只看响应头（零成本、不读 body）：客户端要 JSON 时，上游给回来的 content-type
+  // 既不是 JSON 也不是 SSE —— 那这个响应不可能是合法的模型输出。
+  // 同协议流式（客户端要 SSE）不在此列：SSE 帧的 content-type 本就多样，误判代价更大。
+  if (!wantsStream && upstream.status === 200 && !ctypeSaysSse && ctype && !/json/i.test(ctype)) {
+    log(`upstream ${provider.id} 返回 200 但 content-type=${ctype}（客户端要 JSON）→ 判定为上游/反代错误页，不再透传`);
+    try { await upstream.body?.cancel(); } catch { /* 忽略 */ }
+    return {
+      stop: {
+        status: 502,
+        upstreamStatus: upstream.status,
+        reason: `上游返回 200 但内容不是 JSON（Content-Type: ${ctype}）—— 通常是上游前面有反代/网关插了错误页`,
+      },
+    };
+  }
   // success: stream through
   try {
     res.writeHead(upstream.status, {
@@ -4420,18 +4495,29 @@ function responsesInputToChatMessages(input) {
       continue;
     }
     if (it.type === 'reasoning') continue;   // 推理项不回灌给上游（各家自己会重算）
-    // message / 其它：把 content 块拍平成文本
+    // message / 其它：把 content 块拍平成文本（图片按 OpenAI 的 image_url 块保留）
     const role = it.role === 'assistant' ? 'assistant' : (it.role === 'system' || it.role === 'developer' ? 'system' : 'user');
-    const text = typeof it.content === 'string' ? it.content
-      : (Array.isArray(it.content)
-        ? it.content.map((b) => {
-          if (!b || typeof b !== 'object') return '';
-          if (typeof b.text === 'string') return b.text;
-          if (b.type === 'input_image' || b.type === 'image_url') return '[image]';
-          return '';
-        }).join('')
-        : '');
-    out.push({ role, content: text });
+    let text = '';
+    const parts = [];
+    if (typeof it.content === 'string') text = it.content;
+    else if (Array.isArray(it.content)) {
+      for (const b of it.content) {
+        if (!b || typeof b !== 'object') continue;
+        if (typeof b.text === 'string') { text += b.text; parts.push({ type: 'text', text: b.text }); continue; }
+        // ⚠ 图片**必须原样映射成 image_url**，不能塞一个字面量占位符。
+        // 旧实现在这里 `return '[image]'` —— 等于把图换成四个字母：模型再也看不到图，
+        // 而 imageBlockStats 仍按图片计数（"带图请求只发给声明了 vision 的家"那套逻辑
+        // 照常生效），于是路由到支持图片的家、却发过去一句 "[image]"，两头都不对。
+        // 同项目的 anthropicPartsToOpenAI 对同义块是正确产出 image_url 的，这里补齐。
+        if (b.type === 'input_image' || b.type === 'image_url') {
+          const url = typeof b.image_url === 'string' ? b.image_url
+            : (b.image_url && b.image_url.url) || b.image_url || '';
+          if (url) parts.push({ type: 'image_url', image_url: { url: String(url) } });
+          continue;
+        }
+      }
+    }
+    out.push({ role, content: parts.some((p) => p.type === 'image_url') ? parts : text });
   }
   return out;
 }
@@ -4473,6 +4559,21 @@ function responsesToChatRequest(body) {
   if (b.top_p !== undefined) out.top_p = b.top_p;
   if (b.metadata !== undefined) out.metadata = b.metadata;
   if (b.reasoning && typeof b.reasoning === 'object' && b.reasoning.effort) out.reasoning_effort = b.reasoning.effort;
+  // 停止序列：三种协议叫法不同，但都得带上 —— 这是**唯一**一格漏掉它的地方
+  //（chatToAnthropicRequest 与 chatToResponsesRequest 都处理了，只有这一支漏了）。
+  // 漏掉的后果是"用户设了停止词却没生效"，不报错、只是行为不对，最难察觉。
+  if (b.stop !== undefined) out.stop = b.stop;
+  if (b.seed !== undefined) out.seed = b.seed;
+  if (b.presence_penalty !== undefined) out.presence_penalty = b.presence_penalty;
+  if (b.frequency_penalty !== undefined) out.frequency_penalty = b.frequency_penalty;
+  // ⚠ 这几个是 Responses 的**有状态**字段，chat 上游没有对应概念（它靠客户端把历史重发过来）。
+  // 静默丢掉它们会让"多轮只带 previous_response_id、不带 input"变成一次空对话且回 200 ——
+  // 与其装作无事发生，不如明确记一条，让用户在日志里看到"这段历史没能带过去"。
+  for (const k of ['previous_response_id', 'store', 'include', 'truncation', 'parallel_tool_calls']) {
+    if (b[k] !== undefined && b[k] !== null) {
+      log(`[matrix] Responses 的有状态字段 ${k} 在 chat 上游无对应概念，已丢弃（如需多轮请把历史放进 input）`);
+    }
+  }
   return out;
 }
 
@@ -4622,6 +4723,10 @@ function chatToResponsesRequest(body) {
   if (b.temperature !== undefined) out.temperature = b.temperature;
   if (b.top_p !== undefined) out.top_p = b.top_p;
   if (b.reasoning_effort) out.reasoning = { effort: b.reasoning_effort };
+  // 停止序列（chat 的 `stop` → Responses 的... Responses 规范里没有 stop 字段，
+  // 但多数兼容实现认 `stop`；带上它比丢掉更接近用户意图，且不影响不认它的上游）
+  if (b.stop !== undefined) out.stop = b.stop;
+  if (b.seed !== undefined) out.seed = b.seed;
   return out;
 }
 

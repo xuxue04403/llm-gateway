@@ -87,7 +87,11 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      // 打开 Chromium 的渲染进程 OS 级沙箱。旧实现显式关掉它，而这里的防护其实已经齐了
+      //（contextIsolation + 无 nodeIntegration + 严格 CSP + 导航白名单），
+      // preload 也只用 `require('electron')`、不需要 fs/path —— sandbox: true 下依然可用。
+      // 关掉它意味着"渲染层一旦被攻破就是完整用户权限"，而收益只是省掉一层沙箱开销。
+      sandbox: true,
       spellcheck: false,
     },
   });
@@ -248,10 +252,16 @@ function trayIcon() {
 
 function refreshTray() {
   if (!tray) return;
-  const running = !!(gateway && gateway.running);
-  tray.setImage(trayIcon());
-  tray.setToolTip(`${APP_NAME} · ${running ? '运行中 :' + gateway.port : '已停止'}`);
-  tray.setContextMenu(Menu.buildFromTemplate([
+  // ⚠ 整段包 try/catch。这里调的全是原生对象方法（tray.setImage / Menu.buildFromTemplate …），
+  // 而它是在 `gateway.on('state')` / `gateway.on('log')` 里被调用的 ——
+  // 一旦抛出（托盘被系统销毁后调用、explorer 重启、nativeImage 失败…），
+  // 异常会顺着 EventEmitter 冒成**主进程未捕获异常**，代价远大于"托盘图标没刷新"。
+  // createTray 本来就有兜底，这里补上。
+  try {
+    const running = !!(gateway && gateway.running);
+    tray.setImage(trayIcon());
+    tray.setToolTip(`${APP_NAME} · ${running ? '运行中 :' + gateway.port : '已停止'}`);
+    tray.setContextMenu(Menu.buildFromTemplate([
     { label: running ? `运行中 · 端口 ${gateway.port}` : '已停止', enabled: false },
     { type: 'separator' },
     { label: '打开面板', click: () => showWindow() },
@@ -263,7 +273,11 @@ function refreshTray() {
     { label: '打开数据目录', click: () => shell.openPath(dataDir) },
     { type: 'separator' },
     { label: '退出', click: () => { app.quit(); } },
-  ]));
+    ]));
+  } catch (err) {
+    // 托盘刷新失败不该带走主进程；记一条就够（这条路径可能每 800ms 走一次，别刷屏）
+    if (logger) logger.warn('托盘刷新失败（不影响主功能）：' + (err && err.message ? err.message : err));
+  }
 }
 
 function createTray() {
@@ -428,12 +442,16 @@ function registerIpc() {
     try {
       if (a === 'start') {
         await gateway.start();
-        // start() 内部对"端口被占用 / 运行时缺失 / 探测不通过"都是**记日志后正常返回**，
-        // 不抛错。旧实现无论成败一律回 ok:true，界面于是显示"网关已启动"而实际没起来。
-        // 这里以 running 为准如实回报。
-        return gateway.running
-          ? { ok: true }
-          : { ok: false, error: `网关未能启动（端口 ${gateway.configPort()}）——常见原因：端口被其他程序占用、配置有误、运行时缺失。详见「日志」页。` };
+        // start() 内部对"端口被占用 / 运行时缺失 / 探测不通过"都是**记日志后正常返回**，不抛错。
+        // 旧实现以 `running` 为准 —— 但 running 只表示"子进程对象还在"，**不表示端口在监听**：
+        // 子进程活着却没 listen（首启被杀软拖慢、启动慢于 8 次探测）时会回 ok:true，
+        // 界面弹「网关已启动」+ 状态点变绿，而每个客户端请求都失败。
+        // 改为要求 `running && ready`（ready = _doStart 里那次就绪探测的结果）。
+        if (gateway.running && gateway.ready) return { ok: true };
+        if (gateway.running) {
+          return { ok: false, error: `网关进程起来了，但端口 ${gateway.configPort()} 未通过就绪探测 —— 常见原因：启动慢于预期、端口被占用、配置有误。详见「日志」页。` };
+        }
+        return { ok: false, error: `网关未能启动（端口 ${gateway.configPort()}）——常见原因：端口被其他程序占用、配置有误、运行时缺失。详见「日志」页。` };
       }
       if (a === 'stop') {
         await gateway.stop();
@@ -441,9 +459,8 @@ function registerIpc() {
       }
       if (a === 'restart') {
         await gateway.restart();
-        return gateway.running
-          ? { ok: true }
-          : { ok: false, error: `网关重启后未处于运行状态（端口 ${gateway.configPort()}）。详见「日志」页。` };
+        if (gateway.running && gateway.ready) return { ok: true };
+        return { ok: false, error: `网关重启后未就绪（端口 ${gateway.configPort()}）。详见「日志」页。` };
       }
       if (a === 'get-config') return { ok: true, text: gateway.configText() };
       if (a === 'load-example') return { ok: true, text: gateway.exampleText() };
@@ -841,7 +858,11 @@ function writeCtx(options) {
  * 与所有已知密钥形态都会被整串抹掉。
  */
 function sanitizePreview(r) {
-  if (!r || !r.ok) return r;
+  // ⚠ 失败分支（!r.ok）过去**原样返回**，而 `errors[]` 恰恰是最可能带上游原文的地方
+  //（"写入失败：… <上游返回的错误体>"）。预览的承诺是"不把密钥送进渲染进程"，
+  // 那条承诺不该因为一次失败就失效 —— 失败路径反而是更容易漏的路径。
+  if (!r) return r;
+  if (!r.ok) return scrubDeepSecrets(r);
   return scrubDeepSecrets(r);
 }
 
