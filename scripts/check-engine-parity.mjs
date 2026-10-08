@@ -187,6 +187,17 @@ const DECLARED = [
   { name: 'UPSTREAM_BROKEN_4XX_RE', why: '新增：识别「上游自己坏了却包成 4xx」。bad_response_status_code 是 new-api/one-api 系的错误码，语义就是「我转发出去的那个上游返回了坏状态码」，属供应商侧故障；旧的「确定性 4xx 一律终止 failover」把它当成请求侧问题，于是优先级更高但坏掉的那家直接把请求打死。实测：h-e.top 优先级 1 对 glm-5.3-flash 回这个 400，而 opencode-go 优先级 3 明明能服务该模型却根本没被尝试。三处判据都已加。' },
   { name: 'DETERMINISTIC_4XX_STATUS', why: '仅前导注释块位置变化（常量本身一字未改）' },
   { name: 'resolveWorkBuddyCredential', why: '修：分辨「没登录」与「格式变了」。WorkBuddy 桌面版新版把 accessToken/refreshToken 改成 AES-GCM 加密存储（{ $wbEncrypted: 1, envelope }），而本程序读的是明文字段 → 必然 null。旧实现一律报「未登录或已失效」，把用户引向反复重新登录（徒劳）。现在检测到加密形态就明说：密钥不在本机、重新登录没用、可选处置有哪三条。' },
+  { name: 'WORKBUDDY_AT_REST_HELPER', why: '新增：喂给 WorkBuddy 自带 Electron 的一行脚本（ELECTRON_RUN_AS_NODE=1 下取 loggerGet()）。它是拿到 atRestSecretKey 的唯一途径' },
+  { name: 'WORKBUDDY_ELECTRON_BIN_ENV', why: '新增：环境变量 WORKBUDDY_ELECTRON_BIN，装机位置不标准时显式指定 WorkBuddy 主程序' },
+  { name: 'workbuddyElectronCandidates', why: '新增：WorkBuddy 主程序的候选路径（Windows 两个 Program Files + LOCALAPPDATA\Programs，macOS /Applications），环境变量优先' },
+  { name: 'workbuddyAtRestKeys', why: '新增：keyId → atRestSecretKey 的**内存**缓存（绝不落盘）' },
+  { name: 'workbuddyAtRestProbe', why: '新增：取密钥的单飞状态，并发请求共享一次探测' },
+  { name: 'probeWorkBuddyAtRest', why: '新增：以 ELECTRON_RUN_AS_NODE=1 跑 WorkBuddy 自己的 exe，取回 {version:1,atRestSecretKey} 并校验（base64 32 字节、非全零），派生 protectorKey=sha256(secret) 与 keyId=sha256(key).hex[0:16]。只记 keyId，绝不记密钥' },
+  { name: 'workbuddyAad', why: '新增：逐字节照抄 WorkBuddy 5.6.2 的 buildAuthenticatedContextAad（WB-AAD\0 | 0x01 | LP(WBEV1) | LP(sym-v1) | u32(suite) | LP(keyId) | 0x02 | 0x00 | 0x00）' },
+  { name: 'workbuddyIsWrapped', why: '新增：判定 {$wbEncrypted:1,envelope} 信封形态' },
+  { name: 'openWorkBuddyField', why: '新增：用 AES-256-GCM 解一个信封；GCM 校验失败即返回 null（不重试、不猜别的 framing）' },
+  { name: 'openWorkBuddyAuthText', why: '新增：把加密文档解成**明文 JSON 文本**再交给 parseWorkBuddyAuth —— 下游解析逻辑完全不用改；非加密文档零开销直通' },
+  { name: 'parseWorkBuddyAuth', why: '无改动（重新格式化导致块指纹变化）—— 解密在 openWorkBuddyAuthText 里完成，本函数仍只读明文' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

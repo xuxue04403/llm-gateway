@@ -43,6 +43,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+// 仅用于 WorkBuddy 的"静态加密凭据"：密钥必须由 WorkBuddy **自己的** Electron 二进制取回
+// （见 openWorkBuddyAuthText 的注释），本进程无法直接拿到。
+import { execFile } from 'node:child_process';
 
 // ⚠ 本文件是 dsh-app 网关引擎的**原样副本**（llm-gateway 拆分时整体搬入，功能一字未减）。
 // 与 dsh-app 版本的**唯一差异**是下面这一行的目录名：默认回退目录由 'DSHDesktop' 改为
@@ -1537,6 +1540,185 @@ function parseWorkBuddyAuth(text) {
   };
 }
 
+/* ---------------- WorkBuddy 5.6+：静态加密凭据的解封 ---------------- */
+
+/**
+ * 取回「静态加密」（at-rest）的密钥。
+ *
+ * ## 为什么必须借 WorkBuddy 自己的二进制
+ *
+ * WorkBuddy 5.6 起把 `auth.accessToken` / `auth.refreshToken` 从明文改成
+ * `{"$wbEncrypted":1,"envelope":"<base64>"}` 信封（AES-256-GCM）。开信封需要
+ * `atRestSecretKey`，而它只存在于 **WorkBuddy 定制版 Electron 的私有绑定**
+ * `process._linkedBinding('electron_browser_workbuddy_storage')` 里 —— 这是主进程内的
+ * native 绑定，本进程（普通 Node）**调不到**。
+ *
+ * 办法是：把 WorkBuddy **自己的 exe** 以 `ELECTRON_RUN_AS_NODE=1` 跑一次，让它当普通 Node
+ * 执行一小段脚本，把 `loggerGet()` 的返回值打到 stdout。那条路走的是它自己的绑定，合法且只读：
+ *   · 不碰它的任何文件（脚本只 `process.stdout.write`）
+ *   · 不改它的配置、不注入、不挂钩子
+ *   · 拿到的 payload 只在内存里缓存，绝不落盘、绝不记日志
+ *
+ * 算法与 AAD 逐字节照抄自 WorkBuddy 5.6.2 自己的 `buildAuthenticatedContextAad`
+ * （对照实现：github.com/corrinehu/dsh-workbuddy-connect 的
+ * `src/desktop-credential-protection.ts`，含活体验证记录）。
+ */
+const WORKBUDDY_AT_REST_HELPER =
+  'process.stdout.write(String(process._linkedBinding(\'electron_browser_workbuddy_storage\').loggerGet()))';
+
+/** 允许显式指定 WorkBuddy 的主程序（装机位置不标准时用）。 */
+const WORKBUDDY_ELECTRON_BIN_ENV = 'WORKBUDDY_ELECTRON_BIN';
+
+/** WorkBuddy 主程序在 Windows 上的常见位置（国内版）。 */
+function workbuddyElectronCandidates() {
+  const out = [];
+  const explicit = String(process.env[WORKBUDDY_ELECTRON_BIN_ENV] || '').trim();
+  if (explicit) out.push(explicit);
+  if (process.platform === 'win32') {
+    const pf = process.env.ProgramFiles || 'C:\\Program Files';
+    const pf86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+    const lad = process.env.LOCALAPPDATA || '';
+    out.push(path.join(pf, 'WorkBuddy', 'WorkBuddy.exe'));
+    out.push(path.join(pf86, 'WorkBuddy', 'WorkBuddy.exe'));
+    if (lad) out.push(path.join(lad, 'Programs', 'WorkBuddy', 'WorkBuddy.exe'));
+  } else if (process.platform === 'darwin') {
+    out.push('/Applications/WorkBuddy.app/Contents/MacOS/WorkBuddy');
+  }
+  return out;
+}
+
+/** keyId → 已解出的 atRestSecretKey（只在内存里）。 */
+const workbuddyAtRestKeys = new Map();   // keyId → Buffer
+let workbuddyAtRestProbe = null;         // 单飞：并发请求共享一次探测
+
+/** 跑一次 WorkBuddy 自己的 exe，取回 payload。 */
+function probeWorkBuddyAtRest() {
+  if (workbuddyAtRestProbe) return workbuddyAtRestProbe;
+  workbuddyAtRestProbe = (async () => {
+    const helperPath = path.join(os.tmpdir(), 'llm-gateway-wb-helper.js');
+    try { fs.writeFileSync(helperPath, WORKBUDDY_AT_REST_HELPER, 'utf8'); }
+    catch (e) { throw new Error('写 helper 脚本失败：' + (e && e.message)); }
+    const tried = [];
+    for (const exe of workbuddyElectronCandidates()) {
+      if (!exe || !fs.existsSync(exe)) { tried.push(exe + '(不存在)'); continue; }
+      let stdout = '';
+      try {
+        stdout = await new Promise((resolve, reject) => {
+          execFile(exe, [helperPath], {
+            // 关键：让它把自己当普通 Node 跑，而不是拉起 GUI。
+            env: Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' }),
+            timeout: 60000,
+            windowsHide: true,
+            maxBuffer: 1024 * 1024,
+          }, (err, so) => (err ? reject(err) : resolve(String(so))));
+        });
+      } catch (e) {
+        tried.push(exe + '(' + ((e && e.message) || 'spawn 失败').slice(0, 60) + ')');
+        continue;
+      }
+      let payload = null;
+      try { payload = JSON.parse(stdout.trim()); } catch { /* 不是 JSON */ }
+      if (!payload || payload.version !== 1 || typeof payload.atRestSecretKey !== 'string') {
+        tried.push(exe + '(返回的不是 version:1 payload)');
+        continue;
+      }
+      const secret = payload.atRestSecretKey;
+      const raw = Buffer.from(secret, 'base64');
+      if (raw.length !== 32 || raw.toString('base64') !== secret || raw.every((b) => b === 0)) {
+        tried.push(exe + '(secret 不是 32 字节规范 base64)');
+        continue;
+      }
+      const key = crypto.createHash('sha256').update(secret, 'utf8').digest();
+      const keyId = crypto.createHash('sha256').update(key).digest('hex').slice(0, 16);
+      workbuddyAtRestKeys.set(keyId, key);
+      // 只记"拿到了 + keyId"，绝不记密钥/payload 本身。
+      log(`WorkBuddy 静态加密密钥已取回（keyId=${keyId}，来自 ${path.basename(exe)}）`);
+      return keyId;
+    }
+    throw new Error('取不到 WorkBuddy 静态加密密钥。已尝试：' + tried.join('；')
+      + `。可设环境变量 ${WORKBUDDY_ELECTRON_BIN_ENV} 指向 WorkBuddy 主程序。`);
+  })().finally(() => { workbuddyAtRestProbe = null; });
+  return workbuddyAtRestProbe;
+}
+
+/** 构造 AAD —— 逐字节照抄 WorkBuddy 5.6.2 的 buildAuthenticatedContextAad。 */
+function workbuddyAad(keyId, suite) {
+  const lp = (v) => { const b = Buffer.from(v, 'utf8'); const h = Buffer.allocUnsafe(4); h.writeUInt32BE(b.length); return Buffer.concat([h, b]); };
+  const s = Buffer.allocUnsafe(4); s.writeUInt32BE(suite);
+  return Buffer.concat([
+    Buffer.from('WB-AAD\0', 'ascii'), Buffer.from([1]),
+    lp('WBEV1'),                        // framing magic（凭据字段固定 WBEV1）
+    lp('sym-v1'),                       // 方案
+    s,                                  // suite
+    lp(keyId),
+    Buffer.from([2]), Buffer.from([0]), Buffer.from([0]),
+  ]);
+}
+
+/** 判断一个字段值是不是加密信封。 */
+function workbuddyIsWrapped(v) {
+  return !!v && typeof v === 'object' && !Array.isArray(v) && v.$wbEncrypted === 1 && typeof v.envelope === 'string';
+}
+
+/** 解开一个信封；解不开返回 null（调用方据此给出准确报错）。 */
+function openWorkBuddyField(key, wrapped) {
+  let inner = null;
+  try { inner = JSON.parse(Buffer.from(wrapped.envelope, 'base64').toString('utf8')); } catch { return null; }
+  if (!inner || typeof inner !== 'object') return null;
+  const suite = Number(inner.suite) || 1;
+  const keyId = String(inner.keyId || '');
+  const b64 = (v) => { try { return Buffer.from(String(v || ''), 'base64'); } catch { return null; } };
+  const nonce = b64(inner.nonce);
+  const authTag = b64(inner.authTag);
+  const ciphertext = b64(inner.ciphertext);
+  if (!nonce || !authTag || !ciphertext || nonce.length !== 12 || authTag.length !== 16) return null;
+  try {
+    const d = crypto.createDecipheriv('aes-256-gcm', key, nonce, { authTagLength: 16 });
+    d.setAAD(workbuddyAad(keyId, suite));
+    d.setAuthTag(authTag);
+    return Buffer.concat([d.update(ciphertext), d.final()]).toString('utf8');
+  } catch {
+    // GCM 校验失败 = "不是这个密钥 / 不是这个格式"，不重试、不猜测别的 framing。
+    return null;
+  }
+}
+
+/**
+ * 把桌面凭据文档里的加密字段解成明文，返回**新的 JSON 文本**（其余字段原样保留）。
+ *
+ * 这样设计是为了让下游的 `parseWorkBuddyAuth` 完全不用改 —— 它读的仍然是明文形态。
+ * 非加密文档原样返回（零开销）。
+ */
+async function openWorkBuddyAuthText(text) {
+  let doc = null;
+  try { doc = JSON.parse(text); } catch { return text; }
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return text;
+  const nested = doc.auth && typeof doc.auth === 'object' && !Array.isArray(doc.auth);
+  const auth = nested ? doc.auth : doc;
+  const wrappedFields = ['accessToken', 'refreshToken'].filter((k) => workbuddyIsWrapped(auth[k]));
+  if (!wrappedFields.length) return text;   // 明文形态，直接放行
+
+  const first = JSON.parse(Buffer.from(auth[wrappedFields[0]].envelope, 'base64').toString('utf8'));
+  const wantKeyId = String((first && first.keyId) || '');
+  let key = wantKeyId ? workbuddyAtRestKeys.get(wantKeyId) : null;
+  if (!key) {
+    // 信封指名了别的 keyId → 重新探测一次（App 升级/换账号会换密钥）
+    await probeWorkBuddyAtRest();
+    key = wantKeyId ? workbuddyAtRestKeys.get(wantKeyId) : null;
+    if (!key && workbuddyAtRestKeys.size === 1) key = [...workbuddyAtRestKeys.values()][0];
+  }
+  if (!key) throw new Error(`密钥里没有信封指名的 keyId=${wantKeyId || '(空)'}`);
+
+  const out = JSON.parse(text);
+  const a = nested ? out.auth : out;
+  for (const k of wrappedFields) {
+    const plain = openWorkBuddyField(key, a[k]);
+    if (plain === null) throw new Error(`字段 ${k} 解封失败（GCM 校验不过：密钥或格式不匹配）`);
+    a[k] = plain;
+  }
+  return JSON.stringify(out);
+}
+
 /** 自留副本路径（网关自己的目录，绝不写桌面 App 的文件） */
 function workbuddyOwnPath(provider, acct) {
   const dir = path.join(path.dirname(CONFIG_PATH), 'workbuddy-auth');
@@ -1616,34 +1798,45 @@ async function resolveWorkBuddyCredential(provider, acct) {
     // authFile 留空 → 按平台默认位置自动发现（配置里不必写死机器相关路径）
     const authFile = acct.authFile || findWorkbuddyAuthFile();
     let authText = '';
+    // 解封失败的原因要留下来：加密形态下"读不到 token"和"没登录"必须区分对待。
+    let unsealError = null;
     try {
-      if (authFile) { authText = fs.readFileSync(authFile, 'utf8'); desktop = parseWorkBuddyAuth(authText); }
+      if (authFile) {
+        authText = fs.readFileSync(authFile, 'utf8');
+        // WorkBuddy 5.6+ 的凭据是静态加密的 → 先借它自己的 Electron 取密钥并解封。
+        // 明文形态时这个函数是零开销直通，老版本不受影响。
+        if (/"\$wbEncrypted"\s*:\s*1/.test(authText)) {
+          try {
+            authText = await openWorkBuddyAuthText(authText);
+          } catch (e) {
+            unsealError = (e && e.message) || String(e);
+          }
+        }
+        desktop = parseWorkBuddyAuth(authText);
+      }
     } catch (e) {
       if (!own) throw new Error(`读凭据文件失败：${authFile}（${e && e.message}）`);
     }
     // 身份优先：桌面文件是"当前登录的是谁"的权威；自留副本可能是旧账号
     let cred = desktop || own;
     if (!cred) {
-      // ⚠ 先分辨"没登录"和"**格式变了**"——这两种情况的处置完全不同，而旧实现一律报
-      // "未登录或已失效"，把用户引向反复重新登录（徒劳）。
-      //
-      // 实测（2026-10-08）：WorkBuddy 桌面版新版把 token 改成了**加密存储** ——
-      //   auth.accessToken 不再是字符串，而是 { $wbEncrypted: 1, envelope: "<base64>" }，
-      //   envelope 解出来是 { suite:1, keyId, nonce, authTag, ciphertext }（AES-GCM）。
-      // 本程序读的是明文字段（`typeof auth.accessToken === 'string'`），于是必然为 null。
-      // 解密密钥**不在本机可读位置**（CodeBuddyExtension 目录下只有这一个 .info 文件），
-      // 所以这不是"再登录一次"能好的 —— 必须等 WorkBuddy 侧提供可读凭据，
-      // 或者在配置里直接给该账户写 `apiKey`。
-      const encryptedForm = /"\$wbEncrypted"\s*:\s*1/.test(authText);
-      if (encryptedForm) {
+      // WorkBuddy 5.6+ 的凭据是静态加密的，本程序已支持解封（见 probeWorkBuddyAtRest）。
+      // 所以这里要分三种情况报错，而不是把它们混成一句"未登录或已失效"：
+      //   ① 解封过程本身失败（取不到密钥 / GCM 校验不过）→ 报真正的原因
+      //   ② 仍是加密形态却没解出 token        → 格式不认识
+      //   ③ 明文形态但没有 token              → 才是真的没登录
+      if (unsealError) {
         throw new Error(
-          `账户 ${acct.id} 的凭据文件是**加密格式**，本程序读不了：${authFile}`
-          + '｜WorkBuddy 桌面版新版把 accessToken/refreshToken 用 AES-GCM 加密存储'
-          + '（字段形如 {"$wbEncrypted":1,"envelope":"…"}），而本程序只能读明文 token。'
-          + '解密密钥不在 CodeBuddyExtension 目录里，**重新登录也没用**。'
-          + '可选处置：① 在该账户的配置里直接写 apiKey；'
-          + '② 用旧版 WorkBuddy 桌面端登录一次以生成明文凭据；'
-          + '③ 等本程序支持该加密格式。',
+          `账户 ${acct.id} 的凭据文件是**静态加密**格式，解封失败：${authFile}`
+          + `｜原因：${unsealError}`
+          + `｜提示：解封需要读取 WorkBuddy 自带的 Electron（可用环境变量 ${WORKBUDDY_ELECTRON_BIN_ENV} 指定主程序路径）；`
+          + '若 WorkBuddy 未安装/已被移动，也可在该账户配置里直接写 apiKey。',
+        );
+      }
+      if (/"\$wbEncrypted"\s*:\s*1/.test(authText)) {
+        throw new Error(
+          `账户 ${acct.id} 的凭据文件是**静态加密**格式，但里面没有可用的 accessToken 信封：${authFile}`
+          + '｜多半是 WorkBuddy 又改了格式，请把该文件的结构反馈给本项目。',
         );
       }
       throw new Error(authFile

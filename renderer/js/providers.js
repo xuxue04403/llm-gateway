@@ -272,7 +272,7 @@ function openEditor(i) {
     </h4>
     <div class="table-wrap" style="max-height:300px;">
       <table class="tbl" id="edModelTable">
-        <thead><tr><th style="width:34%">上游模型 ID</th><th style="width:22%">映射为（留空=同名）</th><th style="width:7%" title="勾选后才能向该模型发图">图片</th><th style="width:13%">上下文</th><th style="width:12%">最大输出</th><th style="width:12%" title="留空则用供应商级的超时">超时(ms)</th><th></th></tr></thead>
+        <thead><tr><th style="width:26%">上游模型 ID</th><th style="width:17%">映射为（留空=同名）</th><th style="width:9%" title="该模型的上游协议（逐模型）。留空 = 跟随供应商级 protocol，再不行跟随客户端。按模型区分协议的上游（如 opencode-go）留空会直接 400。">协议</th><th style="width:6%" title="勾选后才能向该模型发图">图片</th><th style="width:12%">上下文</th><th style="width:11%">最大输出</th><th style="width:11%" title="留空则用供应商级的超时">超时(ms)</th><th></th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -394,9 +394,22 @@ function renderEditorModels(list) {
 
 function modelRow(e) {
   const tr = el('tr');
+  // ⚠ `api` 这一列必须存在，哪怕它平时是「跟随」。
+  //
+  // 它决定**该模型用哪种上游协议**（一个供应商可以同时挂着三种协议的模型）。
+  // 旧实现的模型表只有 图片/上下文/最大输出/超时 四列，于是每次「应用」或
+  // 「⚡一键获取全部模型」重建列表时，`api` 都被**静默丢掉** —— 模型退回"跟随客户端协议"，
+  // 而 opencode-go 这类**按模型区分协议**的上游会直接回
+  // `ModelProtocolUnsupported`（实测：一键获取之后该家 11 个模型全部 400）。
+  //
+  // 显示为「跟随」是准确的语义：留空 = 用供应商级 protocol，再不行跟随客户端请求。
+  const apiVal = String(e.api || '');
+  const opts = [['', '跟随'], ['openai-chat', 'chat'], ['anthropic-messages', 'anth.'], ['openai-responses', 'resp.']]
+    .map(([v, label]) => `<option value="${v}"${apiVal === v ? ' selected' : ''}>${label}</option>`).join('');
   tr.innerHTML = `
     <td><input class="input" data-f="up" value="${attr(e.up || '')}" placeholder="上游真实模型 ID" style="width:100%" /></td>
     <td><input class="input" data-f="as" value="${attr(e.as && e.as !== e.up ? e.as : '')}" placeholder="留空 = 同名" style="width:100%" /></td>
+    <td><select class="input" data-f="api" title="该模型的上游协议。留空/跟随 = 用供应商级 protocol，再不行跟随客户端请求。同一家可以混用三种协议，所以这是**逐模型**的 —— 留空会在按模型区分协议的上游上直接 400。">${opts}</select></td>
     <td style="text-align:center;"><input type="checkbox" data-f="vision" ${e.vision ? 'checked' : ''} /></td>
     <td><input class="input" data-f="contextWindow" type="number" value="${attr(e.contextWindow || '')}" placeholder="—" style="width:100%" /></td>
     <td><input class="input" data-f="maxTokens" type="number" value="${attr(e.maxTokens || '')}" placeholder="—" style="width:100%" /></td>
@@ -407,7 +420,7 @@ function modelRow(e) {
     if (!tb2rows()) renderEditorModels([]);
     updateEditorModelCount();
   });
-  tr.querySelectorAll('input').forEach((n) => n.addEventListener('input', updateEditorModelCount));
+  tr.querySelectorAll('input, select').forEach((n) => n.addEventListener('input', updateEditorModelCount));
   return tr;
 }
 
@@ -620,6 +633,16 @@ function openModelPicker(fetched, probeProvider) {
 
     const replace = $('#mpReplace').checked;
     const tb = $('#edModelTable tbody');
+    // ⚠ **先**把旧表读出来再清空 —— 「⚡一键获取」只负责"有哪些模型"，
+    // 它**不知道**每个模型该用哪种上游协议（`api` 是配置里的事实，不在上游目录里）。
+    // 旧实现直接按拉回来的结果重建，于是 `api` 被静默抹掉：
+    // 用户点一次「一键获取」，opencode-go 的 11 个模型全部退回"跟随客户端协议"，
+    // 下一次请求全部 400 `ModelProtocolUnsupported`。
+    // 实测（2026-10-08）：整家供应商就是这样废掉的，且界面上看不出任何异常。
+    const prevApi = new Map();
+    readEditorModels().forEach((x) => {
+      if (x && typeof x === 'object' && x.api) prevApi.set(x.id, x.api);
+    });
     if (replace) {
       tb.innerHTML = '';
     } else if (tb.children.length === 1) {
@@ -628,9 +651,12 @@ function openModelPicker(fetched, probeProvider) {
     }
     const existing = new Set(readEditorModels().map((x) => (typeof x === 'string' ? x : x.id)));
     let added = 0;
+    let carried = 0;
     keep.forEach((e) => {
       if (!replace && existing.has(e.up)) return;
       existing.add(e.up);
+      // 名字没变就沿用原来的协议声明；用户仍可在表里逐行改。
+      if (!e.api && prevApi.has(e.up)) { e.api = prevApi.get(e.up); carried++; }
       tb.appendChild(modelRow(e));
       added++;
     });
@@ -638,6 +664,7 @@ function openModelPicker(fetched, probeProvider) {
     Modal.close();
     toast(`已写入 ${added} 个模型`
       + (replace ? '（替换了原列表）' : `（追加；跳过 ${keep.length - added} 个已存在的）`)
+      + (carried ? `，沿用原有协议声明 ${carried} 条` : '')
       + '，别忘了点「应用」', 'ok', 6000);
     btn.blur();
   }
@@ -651,12 +678,16 @@ function readEditorModels() {
     const up = String((tr.querySelector('[data-f="up"]') || {}).value || '').trim();
     if (!up) return;
     const as = String((tr.querySelector('[data-f="as"]') || {}).value || '').trim();
+    // ⚠ 逐模型协议必须一起读回来。漏了它 = 每次「应用」都把协议声明抹掉，
+    // 而按模型区分协议的上游（opencode-go）会因此整体 400（ModelProtocolUnsupported）。
+    const api = String((tr.querySelector('[data-f="api"]') || {}).value || '').trim();
     const vision = !!(tr.querySelector('[data-f="vision"]') || {}).checked;
     const ctx = Number((tr.querySelector('[data-f="contextWindow"]') || {}).value || 0);
     const mt = Number((tr.querySelector('[data-f="maxTokens"]') || {}).value || 0);
     const tmo = Number((tr.querySelector('[data-f="timeoutMs"]') || {}).value || 0);
     const obj = { id: up };
     if (as && as !== up) obj.as = as;
+    if (api) obj.api = api;
     if (vision) obj.vision = true;
     if (ctx > 0) obj.contextWindow = ctx;
     if (mt > 0) obj.maxTokens = mt;

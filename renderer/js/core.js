@@ -204,6 +204,13 @@ function modelEntriesOf(p) {
       // contextWindow/maxTokens 曾经被静默抹掉的地方，新字段不能再踩同一个坑。
       const tmo = Number(m.timeoutMs);
       if (Number.isFinite(tmo) && tmo > 0) e.timeoutMs = tmo;
+      // 逐模型协议（`api`）：**同一类坑的第三个受害者**。
+      // 上面那句注释写的就是它 —— 但它当时没被一起修，于是「读配置 → 填表 → 写回」
+      // 这一圈把 `api` 抹掉了：模型退回"跟随客户端协议"，而按模型区分协议的上游
+      // （opencode-go）会直接回 `ModelProtocolUnsupported`，整家 11 个模型全部 400，
+      // 且界面上完全看不出异常（实测 2026-10-08）。
+      const api = String(m.api ?? m.wire ?? m.upstreamApi ?? '').trim();
+      if (api) e.api = api;
       out.push(e);
     }
   }

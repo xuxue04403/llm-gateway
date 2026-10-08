@@ -58,15 +58,31 @@ function makeEl(tag) {
   };
 }
 
-/** 从 `innerHTML` 里抠出 `data-f="x"` 那个输入框的值 / 勾选状态。 */
+/**
+ * 从 `innerHTML` 里抠出 `data-f="x"` 那个控件的值 / 勾选状态。
+ *
+ * ⚠ `<select>` 的值不在标签的 `value=` 属性上，而在**被选中的那个 `<option>`** 里。
+ * 旧实现只认 `value="…"`，于是对下拉框一律返回 ''：`data-f="api"`（逐模型协议）
+ * 明明渲染出来了、也明明有值，往返测试却读到空 —— 这种"桩比被测代码更弱"的假阴性
+ * 正是 `api` 被静默抹掉却一直没被测出来的原因之一。
+ */
 function parseField(html, field) {
   const re = new RegExp(`data-f="${field}"[^>]*`, 'i');
   const tag = (html.match(re) || [''])[0];
+  const unesc = (s) => String(s == null ? '' : s)
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  // ⚠ 判据必须看 `html`，不能看 `tag`：`tag` 是从 `data-f="api"` **开始**匹配的，
+  // 里面根本不含 `<select` 本身（写成 /^<select/.test(tag) 永远为假，会静默退回下面的
+  // input 分支，于是下拉框一律读成空字符串）。
+  if (new RegExp(`<select[^>]*data-f="${field}"`, 'i').test(html)) {
+    // 取该 select 到 </select> 之间的内容，找带 selected 的 option
+    const seg = (html.match(new RegExp(`data-f="${field}"[\\s\\S]*?</select>`, 'i')) || [''])[0];
+    const opt = (seg.match(/<option[^>]*\bselected\b[^>]*>/i) || [])[0] || '';
+    const v = (opt.match(/value="([^"]*)"/) || [])[1];
+    return { value: unesc(v), checked: false };
+  }
   const val = (tag.match(/value="([^"]*)"/) || [])[1];
-  return {
-    value: val == null ? '' : val.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>'),
-    checked: /checked/.test(tag),
-  };
+  return { value: unesc(val), checked: /checked/.test(tag) };
 }
 
 /**
@@ -270,17 +286,20 @@ t('渲染层：选择器的三个快捷按钮与"实测超时"开关都能接上
  * 编辑抽屉的模型表往返（数据丢失那一类 bug）
  * ================================================================ */
 
-t('渲染层：编辑抽屉的模型行往返**不丢字段**（contextWindow / maxTokens / timeoutMs / vision）', () => {
+t('渲染层：编辑抽屉的模型行往返**不丢字段**（contextWindow / maxTokens / timeoutMs / vision / **api**）', () => {
   const { sandbox, setRows } = makeSandbox();
   // 造出"抽屉里已经有这几行"的状态：innerHTML 就是 modelRow 会生成的那种
   const rows = [
-    { up: 'm1', as: '', vision: false, contextWindow: 200000, maxTokens: 8000, timeoutMs: 25000 },
-    { up: 'm2', as: 'm2-alias', vision: true, contextWindow: 128000, maxTokens: 4096, timeoutMs: 0 },
+    { up: 'm1', as: '', vision: false, contextWindow: 200000, maxTokens: 8000, timeoutMs: 25000, api: 'openai-responses' },
+    { up: 'm2', as: 'm2-alias', vision: true, contextWindow: 128000, maxTokens: 4096, timeoutMs: 0, api: '' },
   ];
+  const sel = (v) => ['', 'openai-chat', 'anthropic-messages', 'openai-responses']
+    .map((x) => `<option value="${x}"${x === v ? ' selected' : ''}>${x || '跟随'}</option>`).join('');
   setRows(rows.map((e) => {
     const v = (x) => (x ? String(x) : '');
     return `<td><input data-f="up" value="${v(e.up)}" /></td>`
       + `<td><input data-f="as" value="${v(e.as)}" /></td>`
+      + `<td><select data-f="api">${sel(e.api)}</select></td>`
       + `<td><input type="checkbox" data-f="vision" ${e.vision ? 'checked' : ''} /></td>`
       + `<td><input data-f="contextWindow" value="${v(e.contextWindow)}" /></td>`
       + `<td><input data-f="maxTokens" value="${v(e.maxTokens)}" /></td>`
@@ -293,22 +312,42 @@ t('渲染层：编辑抽屉的模型行往返**不丢字段**（contextWindow / 
   assert.strictEqual(out[0].contextWindow, 200000, 'contextWindow 不能丢');
   assert.strictEqual(out[0].maxTokens, 8000, 'maxTokens 不能丢');
   assert.strictEqual(out[0].timeoutMs, 25000, 'timeoutMs 不能丢（新字段最容易漏）');
+  // 逐模型协议：漏了它 = 每次「应用」都把协议抹掉，按模型区分协议的上游会整体 400
+  assert.strictEqual(out[0].api, 'openai-responses', 'api（逐模型协议）不能丢');
   assert.strictEqual(out[1].as, 'm2-alias');
   assert.strictEqual(out[1].vision, true);
   assert.strictEqual(out[1].timeoutMs, undefined, '留空不应写成一个 0/NaN');
+  assert.strictEqual(out[1].api, undefined, '「跟随」不应写成一个空字符串');
 });
 
-t('渲染层：modelEntriesOf 必须带出 timeoutMs（否则打开编辑再应用就把它抹掉了）', () => {
+t('渲染层：modelRow **真的渲染出协议下拉框**（手工拼 HTML 的测试测不到这一处）', () => {
+  // 上面那个往返测试的 HTML 是测试自己拼的 —— 就算 modelRow 完全不生成协议列，
+  // 它也照样通过。这一条专门守**渲染侧**：modelRow 必须产出 data-f="api"。
+  const { sandbox } = makeSandbox();
+  assert.strictEqual(typeof sandbox.modelRow, 'function', 'modelRow 应当可用（函数声明会挂到沙箱全局）');
+  const api = sandbox.modelRow({ up: 'x', as: '', api: 'anthropic-messages' }).innerHTML;
+  assert.ok(/data-f="api"/.test(api), 'modelRow 必须生成 data-f="api" 控件');
+  assert.ok(/<option value="anthropic-messages" selected/.test(api), '当前值必须被选中');
+  const none = sandbox.modelRow({ up: 'y', as: '' }).innerHTML;
+  assert.ok(/<option value="" selected/.test(none), '未声明时默认选中「跟随」');
+});
+
+t('渲染层：modelEntriesOf 必须带出 timeoutMs 与 api（否则打开编辑再应用就把它抹掉了）', () => {
   const { sandbox } = makeSandbox();
   const e = sandbox.modelEntriesOf({
-    models: [{ id: 'a/b', as: 'b', contextWindow: 1000, maxTokens: 500, timeoutMs: 20000, vision: true }, 'plain'],
+    models: [
+      { id: 'a/b', as: 'b', contextWindow: 1000, maxTokens: 500, timeoutMs: 20000, vision: true, api: 'openai-responses' },
+      'plain',
+    ],
   });
   assert.strictEqual(e.length, 2);
   assert.strictEqual(e[0].timeoutMs, 20000);
   assert.strictEqual(e[0].contextWindow, 1000);
   assert.strictEqual(e[0].maxTokens, 500);
   assert.strictEqual(e[0].vision, true);
+  assert.strictEqual(e[0].api, 'openai-responses', 'api 必须原样带出，否则往返即抹掉');
   assert.strictEqual(e[1].up, 'plain', '字符串形态的条目也要支持');
+  assert.strictEqual(e[1].api, undefined, '没声明就不该凭空造一个');
 });
 
 /* ================================================================
