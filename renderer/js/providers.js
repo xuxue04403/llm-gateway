@@ -962,22 +962,26 @@ function addProvider() {
 const FREE_CHANNEL_PRESETS = [
   {
     key: 'opencode-zen',
-    name: 'OpenCode Zen 免费车道',
+    name: 'OpenCode Zen（自带 key）',
     baseURL: 'https://opencode.ai/zen',
-    apiKey: 'public',
-    status: 'broken',
-    statusNote: '本机实测：模型清单仍公开（/zen/v1/models 无凭据即 200），但对话端点已要求真 key —— '
-      + 'chat/completions 与 messages 用 Bearer public / x-api-key / 不带凭据四种形态都是 '
-      + '401 AuthError "Missing API key"。该免费车道目前不可用。',
-    what: '凭据是公共池的 Bearer public；需要仿真官方桌面客户端的指纹头；上游按会话计费。',
+    apiKey: '',
+    status: 'verified',
+    statusNote: '本机实测（2026-10-08，用真实 key oc_sk_…）：'
+      + '模型清单不带凭据公开 87 个，<b>带 key 只可见 25 个</b>（那才是该账号能用的）。'
+      + '其中 8 个免费档报 403「free tier can only be used from within OpenCode」、'
+      + '16 个付费档报 402「Insufficient account funds」，'
+      + '<b>只有 space-bunny-free 实测可用</b>（普通对话 / 流式 / Anthropic 协议全部 200）。',
+    what: '用你自己的 OpenCode Zen key。带 key 后<b>不需要任何仿真头</b>，就是个普通 OpenAI 兼容供应商，'
+      + 'baseURL 是 https://opencode.ai/zen（网关会自动补 /v1）。认证用 Authorization: Bearer <key>。',
     risks: [
-      '这条车道的本质是<b>让上游把本网关的流量认成官方客户端</b> —— 用它给自家用户的公共额度。'
-        + '是否允许这样用由<b>该上游的条款</b>决定，与本项目无关。',
-      '上游按<b>会话</b>计费：网关已自动保证同一对话用同一会话 id（否则会直接 429）。',
-      '会被<b>地区策略</b>拦截（403 RegionError）。',
-      '<b>上游随时会关掉它</b> —— 上面那条状态就是实例。',
+      '免费档<b>大多用不了</b>：上游回 403「free tier can only be used from within OpenCode」'
+        + '—— 它要求请求确实来自官方客户端，不是靠加几个头就能过的。',
+      '付费档需要账户<b>有余额</b>，否则 402「Insufficient account funds」。',
+      '认证方式必须是 <code>Authorization: Bearer &lt;key&gt;</code>；用 <code>x-api-key</code> 会 401。',
+      '可用模型由上游随时增删 —— 上面那份"只有 space-bunny-free"就是实测快照，不是承诺。',
     ],
-    apply: (p) => { p.protocol = 'openai-chat'; p.clientProfile = 'opencode'; },
+    // 实测可用的那个模型直接填好，用户拿到就是能跑的配置
+    apply: (p) => { p.protocol = 'openai-chat'; p.models = ['space-bunny-free']; },
   },
   {
     key: 'kilo',

@@ -882,6 +882,66 @@ status: verified   | broken | unreachable
 真实 dsh profile：全程哈希不变
 ```
 
+### N.5 拿到真实 key 之后：结论被推翻并细化（同日晚些时候）
+
+N.2 里"免费车道已经关闭"是**用 `Bearer public` 这个公共池凭据**测出来的结论。
+用户随后提供了自己的 OpenCode Zen key，重新测了一遍 —— **结论需要细化，而且比原来乐观**。
+
+**① 认证通了，但清单不一样**
+
+```
+GET /zen/v1/models  不带凭据 → 200，87 个模型
+GET /zen/v1/models  带 key   → 200，25 个模型   ← 这 25 个才是该账号"可见"的
+```
+
+认证方式是 `Authorization: Bearer <key>`；用 `x-api-key` 会 401。
+
+**② 25 个逐个实测的结果**
+
+| 结果 | 数量 | 上游原话 |
+|---|---|---|
+| 免费档需官方客户端 | 8 | `403 OpenCode's free tier can only be used from within OpenCode` |
+| **实测可用** | **1** | `space-bunny-free` |
+| 余额不足 | 16 | `402 Upstream request failed: Insufficient account funds` |
+
+**关键的一条**：那 8 个 403 的免费档，**加上全套仿真头也照样 403**。
+上游要的是"确实在 OpenCode 客户端里"，不是"头看起来像"。这直接否掉了
+"靠复刻指纹头白嫖"这条路 —— 也是 N.2 里那句"上游随时会改规则"的又一次实例。
+
+**③ `space-bunny-free` 反而是最省事的一个**
+
+| 测试 | 结果 |
+|---|---|
+| 只要 `Bearer <key>` + UA（**不带任何 x-opencode-\* 头**） | 200 |
+| 流式 | 200，14 帧 SSE + `[DONE]` |
+| 换不换 `x-opencode-session` | 都是 200（**会话 id 无影响**） |
+| `/zen/v1/messages`（Anthropic 协议） | 200，正确的 message 形状 |
+
+**所以它就是个普通 OpenAI 兼容供应商** —— 不需要 `clientProfile: 'opencode'`、
+不需要工具指纹、不需要会话 id。N.2 里实现的那套仿真能力因此**降级为"备用"**：
+装上是为了通道恢复时能立刻试，但预设里**不再默认启用**。
+
+**④ 走网关端到端（`https://opencode.ai/zen` 作为普通供应商）**
+
+```
+/v1/models                    → 200，1 个模型（space-bunny-free）
+普通对话（/v1/chat/completions）→ 200，1807ms，回复「可用」
+流式                          → 200，15 帧 SSE + [DONE]
+Anthropic 入口（/v1/messages） → 200，正确的 message 形状（含 thinking 块）
+网关日志                      → [route]/[call] 全 ok，内部错误 0 条
+```
+
+**⑤ 预设按实测重写**
+
+状态从 `broken` 改成 `verified`，并写明：带 key 后不需要仿真头；
+`apiKey` 留空由用户自己粘贴（**真实 key 不进仓库** —— 全程用环境变量传，
+提交前全仓搜过一遍确认没落地）；`models` 预填实测可用的 `space-bunny-free`，
+用户拿到就是能跑的配置。
+
+预设的状态说明里保留了那两行上游原话（403 / 402），因为**它们比任何转述都有用**：
+用户看到 "free tier can only be used from within OpenCode" 就知道别再折腾头了。
+
+
 
 
 
