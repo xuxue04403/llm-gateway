@@ -1,7 +1,7 @@
 {
   "name": "llm-gateway",
   "productName": "LLM Gateway",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "通用桌面版 LLM 网关：多供应商统一代理（OpenAI / Anthropic / Responses 三协议）+ 一键写入 dsh / Claude Code / Codex 等客户端",
   "main": "src/main.js",
   "private": true,
