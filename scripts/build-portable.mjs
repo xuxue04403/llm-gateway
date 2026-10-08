@@ -37,8 +37,42 @@ if (!existsSync(exeSrc)) {
 }
 
 console.log('打绿色目录：' + OUT_DIR);
+
+// ⚠⚠ 重建前必须**保住 data\**。
+//
+// `OUT_DIR` 就是绿色版目录本身，而 `data\`（gateway.config.json / settings.json / logs\）
+// 是**用户的实际运行状态** —— 供应商、API Key、模型映射全在里面。
+// 旧实现直接 `rmSync(OUT_DIR)` 把 data\ 一并删掉，而下一次启动又会从"既有安装"导入一份
+// **旧配置**，于是用户新加的供应商**静默消失**，看起来就像"配置自己变回去了"。
+//
+// 这不是理论风险：2026-10-08 我为了发版本连续重建了 4 次，把用户当天新增的 3 个供应商
+// 删掉了，而且全盘找不到副本 —— 本脚本末尾那道"产物里绝不能有 data\"的闸门，
+// 保证了 zip 里也没有。
+//
+// 现在：先把 data\ 暂存到一边，重建完原样放回；同时额外留一份带时间戳的副本兜底。
+const dataDir = path.join(OUT_DIR, 'data');
+const stashDir = path.join(ROOT, 'out', '.data-stash');
+let stashed = false;
+if (existsSync(dataDir)) {
+  rmSync(stashDir, { recursive: true, force: true });
+  cpSync(dataDir, stashDir, { recursive: true });
+  try {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    cpSync(dataDir, path.join(ROOT, 'out', `data-backup-${stamp}`), { recursive: true });
+    console.log('  已额外备份 data\\（out\\data-backup-' + stamp + '）');
+  } catch (e) {
+    console.warn('  ⚠ 额外备份失败（不影响构建）：' + (e && e.message));
+  }
+  stashed = true;
+  console.log('  已暂存 data\\（构建后原样放回，配置不会丢）');
+}
 rmSync(OUT_DIR, { recursive: true, force: true });
 mkdirSync(OUT_DIR, { recursive: true });
+if (stashed) {
+  cpSync(stashDir, dataDir, { recursive: true });
+  rmSync(stashDir, { recursive: true, force: true });
+  console.log('  data\\ 已放回');
+}
 
 // 1) Electron 运行时（排除它自带的 default_app.asar —— 那是"没有 app 时"的占位页面）
 let copied = 0;

@@ -529,6 +529,13 @@ class GatewayManager extends EventEmitter {
     const v = validateConfigText(text);
     if (!v.ok) return v;
     try {
+      // ⚠ 保存前留一份**滚动备份**（保留最近 10 份，放在 data\config-backups\）。
+      // 起因是一次真实事故（2026-10-08）：构建脚本 `rmSync` 掉整个绿色目录（含 data\），
+      // 用户当天新增的 3 个供应商随之消失，而下一次启动又从"既有安装"导入了一份旧配置 ——
+      // 用户看到的是"配置自己变回去了"，且**全盘找不到可恢复的副本**。
+      // 单靠"改构建脚本"只是堵住了那一条路径；配置本身没有历史，
+      // 任何一次误删/误写都不可逆。这里补上历史。
+      try { this._backupConfig(); } catch (e) { this.log('配置备份失败（不影响保存）：' + (e && e.message)); }
       const tmp = this.configPath + '.tmp-' + process.pid;
       fs.writeFileSync(tmp, text, 'utf8');
       fs.renameSync(tmp, this.configPath);      // 原子写：半截 JSON 会让网关下次起不来
@@ -537,6 +544,23 @@ class GatewayManager extends EventEmitter {
       return { ok: true, error: null };
     } catch (err) {
       return { ok: false, error: '配置写入失败：' + (err && err.message ? err.message : err) };
+    }
+  }
+
+  /**
+   * 把当前配置复制进 data\config-backups\，只保留最近 10 份。
+   * 刻意保留"每次保存前"的版本，而不是"N 分钟一次" —— 用户改配置是低频动作，
+   * 按动作留档既能精确回到"上一次保存之前"，也不会把目录撑大。
+   */
+  _backupConfig() {
+    if (!fs.existsSync(this.configPath)) return;
+    const dir = path.join(path.dirname(this.configPath), 'config-backups');
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    fs.copyFileSync(this.configPath, path.join(dir, `gateway.config-${stamp}.json`));
+    const olds = fs.readdirSync(dir).filter((n) => /^gateway\.config-.*\.json$/.test(n)).sort();
+    for (const n of olds.slice(0, Math.max(0, olds.length - 10))) {
+      try { fs.unlinkSync(path.join(dir, n)); } catch (_) { /* 忽略 */ }
     }
   }
 
