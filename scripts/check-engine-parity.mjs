@@ -184,6 +184,8 @@ const DECLARED = [
   { name: 'responsesInputToChatMessages', why: '（同上）另修两处：input 为单个对象时不再丢光；`input_image` 不再被降级成字面量 "[image]" —— 那等于把图换成四个字母，而 imageBlockStats 仍按图片计数（路由到支持图片的家却发过去一句占位符）' },
   { name: 'chatToResponsesRequest', why: '修：补回停止序列（唯一漏掉它的一格）；对 previous_response_id/store/include/truncation/parallel_tool_calls 这些 chat 上游没有对应概念的**有状态字段**记日志，而不是静默丢弃' },
   { name: 'forward', why: '修：直通路径新增"上游 200 但 content-type 既不是 JSON 也不是 SSE"检测 → 502。真实高频形态是反代插的 HTML 错误页，旧实现把它原样配 200 透传，客户端拿到"成功"却解析失败而网关日志一片干净（四条路径里只有这条不一致）' },
+  { name: 'UPSTREAM_BROKEN_4XX_RE', why: '新增：识别「上游自己坏了却包成 4xx」。bad_response_status_code 是 new-api/one-api 系的错误码，语义就是「我转发出去的那个上游返回了坏状态码」，属供应商侧故障；旧的「确定性 4xx 一律终止 failover」把它当成请求侧问题，于是优先级更高但坏掉的那家直接把请求打死。实测：h-e.top 优先级 1 对 glm-5.3-flash 回这个 400，而 opencode-go 优先级 3 明明能服务该模型却根本没被尝试。三处判据都已加。' },
+  { name: 'DETERMINISTIC_4XX_STATUS', why: '仅前导注释块位置变化（常量本身一字未改）' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */
@@ -234,8 +236,12 @@ console.log('当前：' + CURRENT);
 console.log(`块总数：基线 ${a.size} / 当前 ${b.size}；有变化的块 ${changed.length} 个，新增 ${added.length} 个，删除 ${removed.length} 个`);
 console.log('');
 
+// 声明清单的索引。⚠ 这一行曾经被一次误插入覆盖掉（用脚本改本文件时插错了位置），
+// 表现是运行时报 `declaredNames is not defined` —— 改这个文件时请跑一次 `node --check`
+// 并**实际执行一次**，别只看语法。
 const declaredNames = new Set(DECLARED.map((d) => d.name));
-const problems = [];
+const problems = [
+];
 
 // ① 所有变化都必须被声明
 for (const n of [...changed, ...added, ...removed]) {

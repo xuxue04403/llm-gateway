@@ -2969,6 +2969,21 @@ const CLIENT_FINGERPRINT_RE = /unauthorized\s+client\s+detected|unauthorized_cli
 const DETERMINISTIC_4XX_STATUS = { 400: 400, 404: 404, 413: 413, 422: 422 };
 
 /**
+ * 「**上游自己坏了**」但被包在 4xx 里回给我们 —— 与"请求本身有错"处置相反，必须继续 failover。
+ *
+ * 最典型的是 new-api / one-api 系的 `bad_response_status_code`：字面意思就是
+ * "我转发出去的那个上游返回了坏状态码"，属于**供应商侧**故障。
+ *
+ * 实测（2026-10-08，本机真实配置）：`h-e.top`（priority 1）对 `glm-5.3-flash` 回
+ * `{"error":{"message":"openai_error","type":"bad_response_status_code",...}}` 的 400，
+ * 而 `opencode-go`（priority 3）明明能服务该模型 —— 旧判据把它当"确定性 4xx"终止了 failover，
+ * 用户直接拿到 400，后面能用的家一个都没试。
+ *
+ * 与 `MODEL_UNSUPPORTED_BY_PROVIDER_RE` 同一类修正：**别把供应商侧问题当成请求侧问题**。
+ */
+const UPSTREAM_BROKEN_4XX_RE = /bad_response_status_code|bad_response|upstream\s+(?:error|request\s+failed|returned)|invalid\s+response\s+from\s+upstream|上游[^\n]{0,10}?(?:错误|失败|异常)/i;
+
+/**
  * 「供应商侧」4xx（账号/额度/权限/套餐）——**不是**请求本身有错，而是"这家现在不能给你服务"。
  * 实测事故（2026-09-15）：b.ai 余额为 0 时回 HTTP **400** `credit insufficient balance: balance=0`，
  * 旧实现按"确定性 4xx"终止 failover → 用户明明还有可用的 chiyi-ds，却被欠费的那家直接打死
@@ -3923,6 +3938,22 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       if (MODEL_UNSUPPORTED_BY_PROVIDER_RE.test(detail)) {
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"这家不提供该模型"`
           + `（含地区/套餐受限）→ 继续 failover（不熔断该家；若长期如此，请从配置的 models 里移除该映射）`);
+        return rawMode ? { retryable: upstream.status } : false;
+      }
+      // 2026-10-08 新增：**上游自己坏了**，但被包在 4xx 里回给我们 → 同样要继续 failover。
+      //
+      // `bad_response_status_code` 是 new-api / one-api 系的错误码，语义是
+      // "**我转发出去的那个上游**返回了坏状态码" —— 这是**供应商侧**故障，
+      // 换一家重试完全有意义；而下面的"确定性 4xx 一律终止 failover"会把它当成
+      // "你的请求有问题"，于是优先级更高但坏掉的那家**直接把请求打死**。
+      //
+      // 实测（本机真实配置）：h-e.top（priority 1）对 `glm-5.3-flash` 回这个 400，
+      // 而 opencode-go（priority 3）明明能服务该模型，却根本没被尝试 —— 用户拿到 400。
+      // 这与 :3915 那条"这家没有这个模型"是同一类错误：**把供应商侧问题误判成请求侧问题**。
+      // 同样刻意不调 breakerRecordFail（可能是该模型个例，不该连坐整家）。
+      if (UPSTREAM_BROKEN_4XX_RE.test(detail)) {
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"上游侧故障被包成 4xx"`
+          + `（${String(detail || '').slice(0, 80)}）→ 继续 failover（不熔断该家）`);
         return rawMode ? { retryable: upstream.status } : false;
       }
       const status = DETERMINISTIC_4XX_STATUS[upstream.status] || 400;
@@ -5867,6 +5898,15 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
           + '若长期如此，请从配置的 models 里移除该映射）');
         return false;
       }
+      // 与直通路径同一条判据（见 UPSTREAM_BROKEN_4XX_RE 的定义处）：
+      // **上游自己坏了却包成 4xx** 不是"请求有错"，继续 failover 才有意义。
+      // 这条路径是 Anthropic 客户端 → chat 上游（DSH 走得最多的那条），
+      // 少了它，"优先级更高但坏掉的家"照样能把请求打死。
+      if (UPSTREAM_BROKEN_4XX_RE.test(String(lastDetail || ''))) {
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"上游侧故障被包成 4xx"`
+          + `（${String(lastDetail || '').slice(0, 80)}）→ 继续 failover（不熔断该家、不冷却账户）`);
+        return false;
+      }
       if (CLIENT_FINGERPRINT_RE.test(String(lastDetail || ''))) {
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"客户端指纹被拒" → 熔断该家并停止重试。`
           + '这类拒绝与账号无关（换 Key/重试都没用），继续请求只会加剧风控；'
@@ -6045,6 +6085,14 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
   if (MODEL_UNSUPPORTED_BY_PROVIDER_RE.test(String(lastDetail || ''))) {
     log(`provider ${provider.id} 的失败原因是"这家不提供该模型"（含地区/套餐受限）→ 交还半开名额，**不熔断该家**`
       + '（该家对别的模型仍然正常；若长期如此，请从配置的 models 里移除该映射）');
+    breakerRecordSuccess(provider.id);
+    return false;
+  }
+  // 同 UPSTREAM_BROKEN_4XX_RE 的定义处：上游自己坏了却包成 4xx → 该家不算"请求有错"，
+  // 交还半开名额、不熔断，让 failover 继续。
+  if (UPSTREAM_BROKEN_4XX_RE.test(String(lastDetail || ''))) {
+    log(`provider ${provider.id} 的失败原因是"上游侧故障被包成 4xx"（${String(lastDetail || '').slice(0, 80)}）`
+      + ' → 交还半开名额，**不熔断该家**，继续 failover');
     breakerRecordSuccess(provider.id);
     return false;
   }
