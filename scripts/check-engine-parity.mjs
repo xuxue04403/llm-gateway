@@ -200,6 +200,10 @@ const DECLARED = [
   { name: 'parseWorkBuddyAuth', why: '无改动（重新格式化导致块指纹变化）—— 解密在 openWorkBuddyAuthText 里完成，本函数仍只读明文' },
   { name: 'describeAbortIfOurs', why: '新增：区分「我们自己的超时中止」与「上游/代理主动断开」。undici 在 abort 时 message 恒为 This operation was aborted，两者完全同形；旧实现只记这一句，17 条一模一样的日志既看不出是主动放弃、也看不出阈值与实际等待时长 —— 而这三件事正是判断「上游慢」/「请求没发出去」/「阈值配太小」的全部依据。现在记为「上游无响应，超时，阈值 Nms，已等 Mms」，并在 M 明显小于 N 时点明「未到阈值就被中止，调大阈值无用」' },
   { name: 'describeFetchError', why: '无改动（附近插入了新函数导致块指纹变化）' },
+  { name: 'workbuddyAtRestCooldownUntil', why: '新增：探测失败后的冷却截止时刻。没有它时成功路径靠 keyId 缓存跳过探测，而**失败路径什么都不留** —— "装了 WorkBuddy 但候选路径都不对"的用户每个请求都会把全部候选串行重跑一遍（在请求热路径上同步等待）。默认 5 分钟，可用 DSH_GATEWAY_WB_KEY_COOLDOWN_MS 调整' },
+  { name: 'workbuddyAtRestLastError', why: '新增：上次探测失败的原因，冷却期内直接抛它（不再 spawn）' },
+  { name: 'WORKBUDDY_AT_REST_FAIL_COOLDOWN_MS', why: '新增：失败冷却时长，默认 5 分钟（DSH_GATEWAY_WB_KEY_COOLDOWN_MS 可覆盖，设 0 关闭）' },
+  { name: 'WORKBUDDY_AT_REST_TIMEOUT_MS', why: '修：单候选超时 60s → 15s。实测本机取 payload 只要 146–537ms，60s 是三个数量级的余量，而它乘上候选数就是最坏等待（一个卡住的候选挡住后面全部）。15s 仍是实测值的 30 倍以上，最坏路径从 3 分钟降到 45 秒。DSH_GATEWAY_WB_KEY_TIMEOUT_MS 可覆盖' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

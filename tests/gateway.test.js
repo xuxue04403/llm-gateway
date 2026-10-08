@@ -2001,6 +2001,85 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up); }
   });
 
+  t('WorkBuddy 凭据取舍：身份不同 → 桌面文件；身份相同 → 谁新用谁（两段式）', async () => {
+    // 依据（2026-10-08，参照 corrinehu/dsh-workbuddy-connect 的 auth.ts:405 两段式）：
+    //   ① 身份不同 → 桌面文件是"**现在**登录的是谁"的权威。自留副本是我们自己刷新时写的，
+    //      用户换账号后它还是上一个账号的，而且可能因为被我们刷新过而**过期更晚** ——
+    //      按过期时间选就会串号（把企业 A 的身份发给企业 B 的接口）。
+    //   ② 身份相同 → 谁过期更晚用谁。自留副本常是我们刚刷新过的那份，用它省一次刷新往返。
+    //
+    // ⚠ 旧实现是 `let cred = desktop || own;` + 一句"身份不同则用桌面" —— 那句是**死代码**
+    //（desktop 已经优先），于是 ② 从来没实现。这个用例专门把 ② 钉住：
+    // 身份完全相同时，必须选**过期更晚**的那份。
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-pick-'));
+    // 桌面文件：全新（未过期），token = AT-DESKTOP
+    const desktop = writeWorkBuddyAuth(dir, 'workbuddy-desktop.info', {
+      token: 'AT-DESKTOP', uid: 'uid-same', enterpriseId: 'ent-SAME',
+      domain: 'codebuddy.cn', expiresInMs: 3600_000, refreshToken: 'RT-D',
+    });
+    const gw = await startGatewayWith([
+      openaiProvider('wbp', up, { auth: 'workbuddy', accounts: [{ id: 'a1', authFile: desktop }] }),
+    ], 'wbpick');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      // 自留副本：**身份完全相同**，但过期更晚 → 按 ② 应该选它
+      const ownDir = path.join(path.dirname(gw.logPath), 'workbuddy-auth');
+      fs.mkdirSync(ownDir, { recursive: true });
+      fs.writeFileSync(path.join(ownDir, 'wbp-a1.json'), JSON.stringify({
+        version: 1,
+        credential: {
+          accessToken: 'AT-OWN-NEWER', refreshToken: 'rt-own',
+          expiresAtMs: Date.now() + 7200_000,     // 比桌面的 1 小时更晚
+          domain: 'codebuddy.cn', uid: 'uid-same', enterpriseId: 'ent-SAME',
+        },
+      }), 'utf8');
+
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const h = up.st.headers[up.st.headers.length - 1] || {};
+      assert.strictEqual(h.authorization, 'Bearer AT-OWN-NEWER',
+        '身份相同时应选过期更晚的自留副本（省一次刷新），实际 ' + h.authorization);
+      assert.strictEqual(up.st.refreshCalls || 0, 0, '不该触发刷新（两份都没临期）');
+      assert.strictEqual(h['x-enterprise-id'], 'ent-SAME', '身份相同，企业头应保持不变');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('WorkBuddy 凭据取舍：身份不同（企业变了）→ 必须用桌面文件，不得用自留副本的旧企业', async () => {
+    // ① 的反向用例：uid 相同但 enterpriseId 不同 = 换了企业身份。
+    // 自留副本**过期更晚**（正是最容易被误选的那种），必须仍然选桌面。
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-ent-'));
+    const desktop = writeWorkBuddyAuth(dir, 'workbuddy-desktop.info', {
+      token: 'AT-DESKTOP-NEW-ENT', uid: 'uid-same', enterpriseId: 'ent-NEW',
+      domain: 'codebuddy.cn', expiresInMs: 3600_000, refreshToken: 'RT-NEW',
+    });
+    const gw = await startGatewayWith([
+      openaiProvider('wbe', up, { auth: 'workbuddy', accounts: [{ id: 'a1', authFile: desktop }] }),
+    ], 'wbent2');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const ownDir = path.join(path.dirname(gw.logPath), 'workbuddy-auth');
+      fs.mkdirSync(ownDir, { recursive: true });
+      fs.writeFileSync(path.join(ownDir, 'wbe-a1.json'), JSON.stringify({
+        version: 1,
+        credential: {
+          accessToken: 'AT-OWN-STALE-ENTERPRISE', refreshToken: 'rt-own',
+          expiresAtMs: Date.now() + 7200_000,     // 更晚 → 按"谁新用谁"会误选它
+          domain: 'codebuddy.cn', uid: 'uid-same', enterpriseId: 'ent-OLD',
+        },
+      }), 'utf8');
+
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const h = up.st.headers[up.st.headers.length - 1] || {};
+      assert.ok(!/ent-OLD/.test(String(h['x-enterprise-id'] || '')),
+        '绝不能把自留副本里的旧企业身份发出去（串号），实际 X-Enterprise-Id=' + h['x-enterprise-id']);
+      assert.strictEqual(h['x-enterprise-id'], 'ent-NEW', '应使用桌面文件的当前企业，实际 ' + h['x-enterprise-id']);
+      assert.strictEqual(h.authorization, 'Bearer AT-DESKTOP-NEW-ENT', '也应使用桌面文件的 token，实际 ' + h.authorization);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
   t('WorkBuddy 区域守卫：国际版凭据配国际版端点 → 正常放行（不误伤）', async () => {
     // 反向用例：区域匹配时必须照常工作，证明守卫只拦不匹配的组合。
     // 这里的上游是本地假服务器（自定义端点），区域须由条目的 `region: "global"` 显式声明——

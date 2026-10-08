@@ -1597,7 +1597,21 @@ const WORKBUDDY_AT_REST_HELPER =
 /** 允许显式指定 WorkBuddy 的主程序（装机位置不标准时用）。 */
 const WORKBUDDY_ELECTRON_BIN_ENV = 'WORKBUDDY_ELECTRON_BIN';
 
-/** WorkBuddy 主程序在 Windows 上的常见位置（国内版）。 */
+/**
+ * WorkBuddy 主程序的候选路径（国内版）。
+ *
+ * ⚠ 可执行文件名不能想当然。macOS 上 WorkBuddy 是**改名过的 Electron**，
+ * 但 `Info.plist` 里 `CFBundleExecutable` 指向的是 `Electron` 而**不是** `WorkBuddy`
+ * —— 写 `Contents/MacOS/WorkBuddy` 会永远命不中（existsSync 恒为 false），
+ * 表现为"macOS 上 workbuddy 永远取不到密钥、永远连不上"，而日志只会说
+ * "取不到静态加密密钥"。
+ *
+ * 依据：参照实现 corrinehu/dsh-workbuddy-connect 的 `variants.ts:118`
+ * 实测确认的路径是 `/Applications/WorkBuddy.app/Contents/MacOS/Electron`
+ *（国际版 WorkBuddy AI 同理，见 `variants.ts:145`）。
+ *
+ * 两个名字都列（新版/旧版打包方式可能不同），代价只是多一次 existsSync。
+ */
 function workbuddyElectronCandidates() {
   const out = [];
   const explicit = String(process.env[WORKBUDDY_ELECTRON_BIN_ENV] || '').trim();
@@ -1610,7 +1624,14 @@ function workbuddyElectronCandidates() {
     out.push(path.join(pf86, 'WorkBuddy', 'WorkBuddy.exe'));
     if (lad) out.push(path.join(lad, 'Programs', 'WorkBuddy', 'WorkBuddy.exe'));
   } else if (process.platform === 'darwin') {
+    // 实测确认的名字在前（Electron），WorkBuddy 作为兜底
+    out.push('/Applications/WorkBuddy.app/Contents/MacOS/Electron');
     out.push('/Applications/WorkBuddy.app/Contents/MacOS/WorkBuddy');
+    const homeApps = process.env.HOME ? path.join(process.env.HOME, 'Applications') : '';
+    if (homeApps) {
+      out.push(path.join(homeApps, 'WorkBuddy.app', 'Contents', 'MacOS', 'Electron'));
+      out.push(path.join(homeApps, 'WorkBuddy.app', 'Contents', 'MacOS', 'WorkBuddy'));
+    }
   }
   return out;
 }
@@ -1619,9 +1640,48 @@ function workbuddyElectronCandidates() {
 const workbuddyAtRestKeys = new Map();   // keyId → Buffer
 let workbuddyAtRestProbe = null;         // 单飞：并发请求共享一次探测
 
+/**
+ * 探测失败后的冷却截止时刻。
+ *
+ * ⚠ 没有它是个**真实的性能坑**：成功路径靠 `workbuddyAtRestKeys` 命中来跳过探测，
+ * 但**失败路径什么都不留** —— 于是"装了 WorkBuddy 但候选路径都不对"的用户
+ * （最典型：macOS 上路径写错，见 workbuddyElectronCandidates 的注释）
+ * **每一个请求**都会把全部候选串行跑一遍。单次超时 60s × N 个候选，
+ * 而且是在请求热路径上同步等待 —— 表现为"workbuddy 的模型每次都卡几分钟"。
+ *
+ * 冷却期内直接抛上次的错，不再 spawn。默认 5 分钟：足够让用户装好/改好环境变量后
+ * 自动恢复，又不会每个请求都去撞一次。
+ */
+let workbuddyAtRestCooldownUntil = 0;
+let workbuddyAtRestLastError = '';
+const WORKBUDDY_AT_REST_FAIL_COOLDOWN_MS = (() => {
+  const n = Number(process.env.DSH_GATEWAY_WB_KEY_COOLDOWN_MS);
+  return Number.isFinite(n) && n >= 0 ? n : 5 * 60_000;
+})();
+
+/**
+ * 单个候选的最长等待。
+ *
+ * 实测（本机，Windows，4 次）：WorkBuddy.exe 取 payload 只要 146–537ms
+ *（首次冷启动最慢）。60s 是**三个数量级的余量**，而它乘上候选数就是最坏等待 ——
+ * 一个卡住的候选会把后面的候选全挡住。降到 15s：仍是实测值的 30 倍以上，
+ * 但最坏路径从"3 分钟"变成"45 秒"。
+ * 可用 DSH_GATEWAY_WB_KEY_TIMEOUT_MS 覆盖（装在慢盘/网络盘上的用户可能需要调大）。
+ */
+const WORKBUDDY_AT_REST_TIMEOUT_MS = (() => {
+  const n = Number(process.env.DSH_GATEWAY_WB_KEY_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 15_000;
+})();
+
 /** 跑一次 WorkBuddy 自己的 exe，取回 payload。 */
 function probeWorkBuddyAtRest() {
   if (workbuddyAtRestProbe) return workbuddyAtRestProbe;
+  // 冷却期内不再 spawn（见 workbuddyAtRestCooldownUntil 的注释）
+  if (Date.now() < workbuddyAtRestCooldownUntil) {
+    return Promise.reject(new Error(workbuddyAtRestLastError
+      + `（${Math.ceil((workbuddyAtRestCooldownUntil - Date.now()) / 1000)}s 内不再重试；`
+      + '设 DSH_GATEWAY_WB_KEY_COOLDOWN_MS=0 可关闭冷却）'));
+  }
   workbuddyAtRestProbe = (async () => {
     const helperPath = path.join(os.tmpdir(), 'llm-gateway-wb-helper.js');
     try { fs.writeFileSync(helperPath, WORKBUDDY_AT_REST_HELPER, 'utf8'); }
@@ -1635,7 +1695,7 @@ function probeWorkBuddyAtRest() {
           execFile(exe, [helperPath], {
             // 关键：让它把自己当普通 Node 跑，而不是拉起 GUI。
             env: Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' }),
-            timeout: 60000,
+            timeout: WORKBUDDY_AT_REST_TIMEOUT_MS,
             windowsHide: true,
             maxBuffer: 1024 * 1024,
           }, (err, so) => (err ? reject(err) : resolve(String(so))));
@@ -1659,12 +1719,22 @@ function probeWorkBuddyAtRest() {
       const key = crypto.createHash('sha256').update(secret, 'utf8').digest();
       const keyId = crypto.createHash('sha256').update(key).digest('hex').slice(0, 16);
       workbuddyAtRestKeys.set(keyId, key);
+      // 成功 → 清掉失败冷却（用户可能刚装好 WorkBuddy / 刚设好环境变量）
+      workbuddyAtRestCooldownUntil = 0;
+      workbuddyAtRestLastError = '';
       // 只记"拿到了 + keyId"，绝不记密钥/payload 本身。
       log(`WorkBuddy 静态加密密钥已取回（keyId=${keyId}，来自 ${path.basename(exe)}）`);
       return keyId;
     }
-    throw new Error('取不到 WorkBuddy 静态加密密钥。已尝试：' + tried.join('；')
-      + `。可设环境变量 ${WORKBUDDY_ELECTRON_BIN_ENV} 指向 WorkBuddy 主程序。`);
+    // 全部候选都失败 → 记冷却，避免**每个请求**都把候选串行重跑一遍（见 cooldown 注释）
+    const err = '取不到 WorkBuddy 静态加密密钥。已尝试：' + tried.join('；')
+      + `。可设环境变量 ${WORKBUDDY_ELECTRON_BIN_ENV} 指向 WorkBuddy 主程序。`;
+    workbuddyAtRestLastError = err;
+    workbuddyAtRestCooldownUntil = Date.now() + WORKBUDDY_AT_REST_FAIL_COOLDOWN_MS;
+    if (WORKBUDDY_AT_REST_FAIL_COOLDOWN_MS > 0) {
+      log(`WorkBuddy 静态加密密钥探测失败，${Math.round(WORKBUDDY_AT_REST_FAIL_COOLDOWN_MS / 1000)}s 内不再重试：${tried.join('；')}`);
+    }
+    throw new Error(err);
   })().finally(() => { workbuddyAtRestProbe = null; });
   return workbuddyAtRestProbe;
 }
@@ -1845,8 +1915,26 @@ async function resolveWorkBuddyCredential(provider, acct) {
     } catch (e) {
       if (!own) throw new Error(`读凭据文件失败：${authFile}（${e && e.message}）`);
     }
-    // 身份优先：桌面文件是"当前登录的是谁"的权威；自留副本可能是旧账号
-    let cred = desktop || own;
+    // 凭据取舍：**两段式**，照抄参照实现 corrinehu/dsh-workbuddy-connect 的 auth.ts:405
+    //   ① 身份不同 → 桌面文件是"**现在**登录的是谁"的权威，一律用桌面
+    //      （自留副本是我们自己刷新时写的，用户换账号后它还是上一个账号的，
+    //        而且可能因为被我们刷新过而**过期更晚** —— 按过期时间选就会串号）
+    //   ② 身份相同 → 谁过期更晚用谁
+    //      （自留副本常是我们刚刷新过的那份，用它可省掉一次刷新往返）
+    //
+    // ⚠ 身份判据必须同时比 `enterpriseId`，不能只比 `uid`：同一账号**加入/退出企业后
+    // uid 不变、只有 enterpriseId 变**，只比 uid 会把"个人号 → 加入企业"当成同一个人。
+    //
+    // ⚠ 旧实现写的是 `let cred = desktop || own;` 再补一句 `if (身份不同) cred = desktop;`
+    // —— 那句是**死代码**：`desktop || own` 已经让 desktop 优先，再赋一次同名值不改变结果，
+    // 于是 ② 从来没实现，且注释声称的"身份优先"与实际行为对不上。
+    let cred;
+    if (desktop && own) {
+      const sameIdentity = desktop.uid === own.uid && desktop.enterpriseId === own.enterpriseId;
+      cred = sameIdentity && own.expiresAtMs > desktop.expiresAtMs ? own : desktop;
+    } else {
+      cred = desktop || own;
+    }
     if (!cred) {
       // WorkBuddy 5.6+ 的凭据是静态加密的，本程序已支持解封（见 probeWorkBuddyAtRest）。
       // 所以这里要分三种情况报错，而不是把它们混成一句"未登录或已失效"：
@@ -1872,7 +1960,6 @@ async function resolveWorkBuddyCredential(provider, acct) {
         : `账户 ${acct.id} 未找到 WorkBuddy 登录凭据——请先安装并登录 WorkBuddy 桌面 App`
           + `（已探测：${workbuddyDefaultAuthFiles().slice(0, 2).join('、')} 等）`);
     }
-    if (desktop && own && desktop.uid !== own.uid) cred = desktop;
     // 区域守卫（2026-09-20，参照 dsh-workbuddy-connect 的安全红线）：国内版与国际版
     // 凭据**互不通用**，且共用同一个 CodeBuddyExtension auth 目录、只差文件名——
     // 配置里写错 authFile / 端点就会把一国账号的 token 发到另一国端点（实测 401，
