@@ -941,6 +941,139 @@ Anthropic 入口（/v1/messages） → 200，正确的 message 形状（含 thin
 预设的状态说明里保留了那两行上游原话（403 / 402），因为**它们比任何转述都有用**：
 用户看到 "free tier can only be used from within OpenCode" 就知道别再折腾头了。
 
+---
+
+## O. 第六轮全面审计 + OpenCode Go 接入（2026-10-08）
+
+### O.1 先纠正一个前提：那把 key 是 Go 套餐的
+
+N.5 里我把 `oc_sk_36f9…` 当成 Zen 端点的 key 来测，得出了"付费档余额不足"的结论。
+用户随后要求接入"同时支持 opencode-zen 和 opencode-go"，一查才发现：
+
+```
+~/.dsh/.credentials.yaml:  OPENCODE_GO_API_KEY: oc_sk_36f9…
+```
+
+**它本来就是 `opencode-go` 的凭据**。而 `opencode-go` 是 **DSH 自带的供应商路由**，
+对应 opencode 的 **Go 订阅套餐**，端点是 `https://opencode.ai/zen/go/v1` ——
+和 Zen（`/zen/v1`）是同一个网关的两个套餐面。
+
+所以 N.5 那句"余额不足"是**拿订阅 key 去问充值端点**得出的，它没错但不说明问题。
+换到正确端点后：
+
+```
+GET /zen/go/v1/models  带 key   → 200，37 个模型
+GET /zen/go/v1/models  不带凭据 → 200，43 个模型   ← 公开清单比账号可见的还多
+```
+
+### O.2 Go 端点比 Zen 多一条硬性要求
+
+```
+HTTP 400 {"type":"MissingSessionID",
+          "message":"Request is missing x-opencode-session and cannot be routed efficiently."}
+```
+
+**`x-opencode-session` 是无条件要求的** —— 这正是 N 节实现的那套客户端仿真真正派上用场的地方
+（Zen 端点反而不需要）。另外三条路径的认证方式也不同：
+
+| 路径 | 认证 | 谁走这条 |
+|---|---|---|
+| `/zen/go/v1/chat/completions` | `Authorization: Bearer` | 29 个模型 |
+| `/zen/go/v1/responses` | `Authorization: Bearer` | grok-4.6/4.7、gpt-5.6/6-luna |
+| `/zen/go/v1/messages` | **`x-api-key`** | claude-haiku-5-5、minimax-m2.7 |
+
+引擎**本来就按协议分开构造认证头**（Anthropic 路径发 `x-api-key`、OpenAI 路径发 `Bearer`），
+所以这一层不需要改 —— 但当时并不知道，是实测（`Bearer` 在 `/messages` 上 401、
+`x-api-key` 200）才确认它对得上。
+
+**37 个模型逐个定协议的结果**（chat → responses → messages 依次试）：
+
+```
+openai-chat         × 29    deepseek / glm / kimi / mimo / minimax / longcat / qwen / hy …
+openai-responses    ×  4    grok-4.6、grok-4.7、gpt-5.6-luna、gpt-6-luna
+anthropic-messages  ×  2    claude-haiku-5-5、minimax-m2.7
+三条都不通           ×  2    muse-spark-1.2/1.3-contributor（上游要求"训练数据同意"）
+```
+
+**31/37 可接入**。剩下 4 个卡在引擎缺 `openai-responses` 协议（`providerProtocol()` 只认
+`openai-chat` / `anthropic-messages`）—— 这是**已知缺口**，不硬塞进模型列表
+（塞了只会在用户选中后报 400 "Model does not support this protocol"，比不给更糟）。
+
+### O.3 本轮在自己新加的代码里揪出的三个 bug
+
+这一轮最该记的不是外部依赖，而是**前两轮我自己写的代码里的 bug**。三个都是实测抓到的：
+
+**① 工具指纹不分协议形状（`ensureFingerprintTools`）**
+
+往 Anthropic 的 `tools` 里推了 OpenAI 形状的条目。三种协议的 tools 结构完全不同：
+Anthropic 要 `{name, description, input_schema}`，OpenAI 要 `{type:'function', function:{…}}`。
+复现（`out/_fpbug.cjs`）：tools 里 5 条，**4 条是 OpenAI 形状** → 上游 400。
+
+修法：加 `style` 参数按当前线协议给形状。回归测试：`⑥ Anthropic 路径上补的工具必须是 Anthropic 形状`。
+
+**② 短对话拿不到会话头（`opencodeSessionId` 复用了 `sessionKeyOf`）**
+
+`sessionKeyOf` 带 **512 token 门槛**（那是"前缀太短不值得钉缓存"的启发式，见 N.1）。
+把它复用到会话 id 上之后，**「你好」「hi」「?」这类最常见的短对话全部返回 null** → 不发
+`x-opencode-session` → 上游 400。复现：四种短对话**全部** `(缺失)`。
+
+修法：把"派生"与"是否值得用"拆成两个函数 —— `deriveSessionKey`（只派生）与
+`sessionKeyOf`（带门槛，给亲和用）；`opencodeSessionId` 用前者并**保证永远返回 id**
+（实在没前缀就退化成进程级常量，满足上游但不 400）。
+
+教训：**一个函数里混了"算什么"和"要不要用"两件事，被第二个调用方复用时必然出事。**
+
+**③ 动态会话头只加在一条转发路径上**
+
+`forward()` 覆盖不到 **Anthropic→OpenAI 翻译路径**（`forwardAnthropicViaOpenAI`，provider 声明
+`protocol: 'openai-chat'` 时走这条）。后果是**同一个上游一半能跑一半 400**：
+
+```
+opencode-go-claude（无 protocol → 走 forward）        → 200 ✓
+opencode-go（openai-chat → 走翻译路径）→ 29 个模型全部 400 MissingSessionID ✗
+```
+
+这种"一半好一半坏、日志里只看得到上游 400"的现象**极难查**。修法：抽成幂等的
+`applyOpencodeLaneHeaders()`，两条路径都调（翻译路径的调用点与直通路径共用同一份 headers）。
+同时把它顺带发现的**工具指纹在翻译路径上也缺失**一并补上。
+
+### O.4 验收
+
+```
+293 项测试全绿（291 → +2：工具形状、短对话会话头）
+  unit 66 / writers 35 / edge 29 / security 19 / renderer 12 / gateway 132
+引擎差异校验：81 处声明改动，0 处未声明
+
+真实上游端到端（源码版引擎 + 真实 opencode-go 端点，8 个用例全 200）：
+  glm-5.3 / deepseek-v4-flash / kimi-k3 / qwen3.8-max  → 200
+  claude-haiku-5-5（Anthropic 透传）                    → 200
+  glm-5.3 + tools（验证指纹形状）                       → 200
+  流式                                                  → 200，24 个 SSE 事件
+  space-bunny-free（Zen 端点）                          → 200
+  两条路径的工具指纹日志都出现（翻译路径 + 直通路径）
+
+正在跑的网关配置已加入 3 条供应商：
+  opencode-go(29) / opencode-go-claude(2) / opencode-zen(1)
+```
+
+### O.5 三个 bug 的共同点
+
+回头看，① ② ③ 其实**同源**：
+
+| | 表面现象 | 真正的原因 |
+|---|---|---|
+| ① | Anthropic 上游 400 | 只在一条路径上验证过（OpenAI 路径）就以为通用 |
+| ② | 上游 400 MissingSessionID | 复用了一个**为别的目的设计**的函数，没注意它自带门槛 |
+| ③ | 一半模型 400 | 只在一条转发路径上接线 |
+
+**都是在"我验证过的那条路径"上正确、在"我没走的那条路径"上错。**
+而且三条的错误表现都是**上游 400** —— 从日志上看不出是网关的错，
+只会以为是上游抽风或者配置不对。
+
+这解释了为什么本轮要**逐模型、逐路径**地端到端实测：8 个用例里特意覆盖了
+「chat 类 / Anthropic 类 / 带工具 / 流式 / 另一个端点」，就是为了让每条路径都被真的走过一次。
+
+
 
 
 

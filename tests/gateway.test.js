@@ -3916,6 +3916,68 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up); }
   });
 
+  t('⑥ OpenCode 车道：Anthropic 路径上补的工具必须是 Anthropic 形状（补错形状比不补更糟）', async () => {
+    // 实测踩到：不分形状地往 Anthropic 的 tools 里推 OpenAI 形状（{type:'function',function:{…}}），
+    // 上游直接 400。三种协议的 tools 结构完全不同，必须按当前线协议给对形状。
+    const up = await startFakeUpstream({ status: 200 });
+    const p = providerOf('oc5', up, { priority: 1 });
+    p.clientProfile = 'opencode';
+    const gw = await startGatewayWith([p], 'oc-tools-anth');
+    try {
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: {
+          model: 'test-model', max_tokens: 32,
+          tools: [{ name: 'my_tool', description: 'x', input_schema: { type: 'object', properties: {} } }],
+          messages: [{ role: 'user', content: 'hi' }],
+        },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      const sent = up.st.bodies[up.st.bodies.length - 1];
+      const tools = sent.tools || [];
+      const openaiShaped = tools.filter((t) => t && t.function && !t.input_schema);
+      assert.strictEqual(openaiShaped.length, 0,
+        'Anthropic 路径不得出现 OpenAI 形状的工具条目，实际 ' + openaiShaped.length + ' 条：'
+          + tools.map((t) => JSON.stringify(Object.keys(t))).join(' '));
+      for (const need of ['bash', 'glob', 'grep', 'read']) {
+        const hit = tools.find((t) => t && t.name === need);
+        assert.ok(hit, '应补出 Anthropic 形状的 ' + need);
+        assert.ok(hit.input_schema, need + ' 必须带 input_schema（Anthropic 形状）');
+      }
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('⑥ OpenCode 车道：短对话也必须给会话头（上游无条件要求，少了一律 400）', async () => {
+    // 实测踩到：会话 id 曾复用会话亲和的 sessionKeyOf，而那个带 512 token 门槛
+    //（"前缀太短不值得钉缓存"）—— 于是「你好」「hi」「?」这类**最常见的短对话全部拿不到会话头**。
+    // 上游对 x-opencode-session 是无条件要求，少了直接 400 MissingSessionID，等于整条车道全废。
+    const up = await startFakeUpstream({ status: 200 });
+    const p = providerOf('oc6', up, { priority: 1 });
+    p.clientProfile = 'opencode';
+    const gw = await startGatewayWith([p], 'oc-short-sid');
+    try {
+      const cases = [
+        ['你好', { model: 'test-model', messages: [{ role: 'user', content: '你好' }] }],
+        ['hi', { model: 'test-model', messages: [{ role: 'user', content: 'hi' }] }],
+        ['单字', { model: 'test-model', messages: [{ role: 'user', content: '?' }] }],
+        ['带 system', { model: 'test-model', system: '你是助手', messages: [{ role: 'user', content: '你好' }] }],
+      ];
+      for (const [label, body] of cases) {
+        const r = await call({ port: gw.port, body });
+        assert.strictEqual(r.status, 200, label + ' 应转发成功，实际 ' + r.status);
+        const h = up.st.headers[up.st.headers.length - 1];
+        assert.ok(/^ses_/.test(h['x-opencode-session'] || ''),
+          label + ' 拿不到会话头（上游会 400 MissingSessionID），实际 ' + h['x-opencode-session']);
+      }
+      // 同一内容跨请求稳定（上游按会话计费，抖动会被当成新会话）
+      const first = up.st.headers.find((h) => h['x-opencode-session']);
+      await call({ port: gw.port, body: cases[0][1] });
+      const again = up.st.headers[up.st.headers.length - 1];
+      assert.strictEqual(again['x-opencode-session'], first['x-opencode-session'],
+        '相同内容的两轮应得到同一会话 id');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
   // 执行
   for (const { name, fn } of __tests) {
     await fn();

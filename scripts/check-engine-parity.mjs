@@ -131,6 +131,10 @@ const DECLARED = [
   { name: 'opencodeRequestId', why: '新增：每轮一个请求 id' },
   { name: 'OPENCODE_FINGERPRINT_TOOLS', why: '新增：免费档要求的工具四元组 bash/glob/grep/read' },
   { name: 'ensureFingerprintTools', why: '新增：补齐工具四元组（缺了上游 403 FreeTierError）。只"补声明"不"顶替"——纯转发网关无从知道客户端有什么真实工具，这一点与进程内插件的做法有意不同，日志里如实说明' },
+
+  // —— 2026-10-08 审计轮：三个实测出来的 bug 修复（详见 docs/AUDIT.md 的 O 节）——
+  { name: 'deriveSessionKey', why: '新增：把"派生会话键"与"是否值得用"拆开。原来 sessionKeyOf 既派生又带 512 token 门槛，被 opencode 车道复用后，**四种短对话全部拿不到会话头** → 上游 400 MissingSessionID' },
+  { name: 'applyOpencodeLaneHeaders', why: '新增：把 OpenCode 车道的动态会话头抽成辅助函数，**两条转发路径都要调** —— 只在 forward() 里加会让声明了 openai-chat 的那 29 个模型全部 400（翻译路径不经过 forward）' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

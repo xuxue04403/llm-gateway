@@ -959,26 +959,80 @@ function addProvider() {
  *   broken     本机实测已不可用（附证据）
  *   unreachable 本机网络到不了，无法判定
  */
+ // Go 端点实测走 chat/completions 的 29 个模型（2026-10-08 逐个探测得出）
+// 改这里之前请先重跑一次探测 —— 上游的模型清单和各自协议都会变。
+const OPENCODE_GO_CHAT_MODELS = [
+  'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp', 'deepseek-flash', 'deepseek-v4.1-flash',
+  'deepseek-v4-pro', 'glm-5.1', 'glm-5.2', 'glm-5.3',
+  'glm-5.3-flash', 'omen-alpha', 'hy3', 'hy4-preview',
+  'kimi-k2.6', 'kimi-k2.7-code', 'kimi-k3', 'mimo-v2.5',
+  'mimo-v2.6-flash', 'mimo-v2.5-pro', 'mimo-v2.6-pro', 'minimax-m2.5',
+  'minimax-m3', 'space-bunny', 'longcat-2.0', 'longcat-2.5-preview-free',
+  'qwen3.6-plus', 'qwen3.7-max', 'qwen3.8-max', 'qwen3.8-flash',
+  'qwen3.7-plus',
+];
+const OPENCODE_GO_ANTHROPIC_MODELS = ['claude-haiku-5-5', 'minimax-m2.7'];
+
 const FREE_CHANNEL_PRESETS = [
+  {
+    key: 'opencode-go',
+    name: 'OpenCode Go 套餐（自带 key）',
+    baseURL: 'https://opencode.ai/zen/go',
+    apiKey: '',
+    status: 'verified',
+    statusNote: '本机实测（2026-10-08，用真实 key oc_sk_…）：Go 端点带 key 返回 <b>37 个模型</b>，'
+      + '逐个定协议后 <b>31 个可用</b>（29 个走 chat、2 个走 Anthropic），4 个（grok/gpt）需要 Responses 协议，'
+      + '2 个（muse-spark）上游要求"训练数据同意"。',
+    what: 'opencode 的 Go **订阅套餐**端点（不是充值制）。它比 Zen 端点多一个硬性要求：'
+      + '<b>必须带 x-opencode-session</b>，少了直接 400 MissingSessionID —— '
+      + '选本预设会自动开启 OpenCode 客户端仿真，网关按对话内容派生稳定的会话 id。',
+    risks: [
+      '这是<b>订阅额度</b>：能不能用取决于你的套餐状态，用完了上游会直接拒。',
+      '上游按<b>会话</b>计费：网关已保证同一对话用同一会话 id（少了会被 400，抖动会被当成新会话）。',
+      '<b>grok / gpt 这 4 个模型需要 Responses 协议</b>，本网关暂不支持这条协议，因此它们不在模型列表里 —— '
+      + '强行加上会在选中后报 400 "Model does not support this protocol"。',
+      '可用模型由上游随时增删 —— 上面那份清单是实测快照，不是承诺。',
+    ],
+    apply: (p) => {
+      p.protocol = 'openai-chat';
+      p.clientProfile = 'opencode';
+      p.models = OPENCODE_GO_CHAT_MODELS.slice();
+    },
+  },
+  {
+    key: 'opencode-go-claude',
+    name: 'OpenCode Go · Anthropic 类模型',
+    baseURL: 'https://opencode.ai/zen/go',
+    apiKey: '',
+    status: 'verified',
+    statusNote: '本机实测（2026-10-08）：claude-haiku-5-5 与 minimax-m2.7 走 Anthropic 协议，'
+      + '该路径<b>要 x-api-key</b>（用 authorization: Bearer 会 401）—— 网关会自动按协议选对认证头。',
+    what: '和上一条是同一个端点，但这两个模型只认 /messages。因此这里**不设 protocol**，'
+      + '让客户端的 Anthropic 请求原样透传（网关在 Anthropic 路径上自动改用 x-api-key）。',
+    risks: [
+      '必须和「OpenCode Go 套餐」一起装（同一个 key）—— 单独装只会得到 401。',
+      'Claude 模型在该端点上可能触发 Anthropic 的提示词缓存计费，用量请自行留意。',
+    ],
+    apply: (p) => {
+      p.clientProfile = 'opencode';
+      p.models = OPENCODE_GO_ANTHROPIC_MODELS.slice();
+    },
+  },
   {
     key: 'opencode-zen',
     name: 'OpenCode Zen（自带 key）',
     baseURL: 'https://opencode.ai/zen',
     apiKey: '',
     status: 'verified',
-    statusNote: '本机实测（2026-10-08，用真实 key oc_sk_…）：'
-      + '模型清单不带凭据公开 87 个，<b>带 key 只可见 25 个</b>（那才是该账号能用的）。'
-      + '其中 8 个免费档报 403「free tier can only be used from within OpenCode」、'
-      + '16 个付费档报 402「Insufficient account funds」，'
-      + '<b>只有 space-bunny-free 实测可用</b>（普通对话 / 流式 / Anthropic 协议全部 200）。',
-    what: '用你自己的 OpenCode Zen key。带 key 后<b>不需要任何仿真头</b>，就是个普通 OpenAI 兼容供应商，'
-      + 'baseURL 是 https://opencode.ai/zen（网关会自动补 /v1）。认证用 Authorization: Bearer <key>。',
+    statusNote: '本机实测（2026-10-08）：Zen 端点带 key 只可见 25 个模型，其中 8 个免费档报 '
+      + '403「free tier can only be used from within OpenCode」、16 个付费档报 402「Insufficient account funds」，'
+      + '<b>只有 space-bunny-free 实测可用</b>。',
+    what: 'opencode 的 Zen 端点。带 key 后<b>不需要仿真头</b>，就是个普通 OpenAI 兼容供应商。',
     risks: [
       '免费档<b>大多用不了</b>：上游回 403「free tier can only be used from within OpenCode」'
         + '—— 它要求请求确实来自官方客户端，不是靠加几个头就能过的。',
-      '付费档需要账户<b>有余额</b>，否则 402「Insufficient account funds」。',
+      '付费档需要账户<b>有余额</b>，否则 402。',
       '认证方式必须是 <code>Authorization: Bearer &lt;key&gt;</code>；用 <code>x-api-key</code> 会 401。',
-      '可用模型由上游随时增删 —— 上面那份"只有 space-bunny-free"就是实测快照，不是承诺。',
     ],
     // 实测可用的那个模型直接填好，用户拿到就是能跑的配置
     apply: (p) => { p.protocol = 'openai-chat'; p.models = ['space-bunny-free']; },

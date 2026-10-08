@@ -394,17 +394,20 @@ function sessionAffinityGet(key) {
   return e.pid;
 }
 
-/** 会话键派生。取不到稳定标识时返回 null。 */
-function sessionKeyOf(body, req) {
+/**
+ * 只做**派生**，不设任何门槛。
+ * @returns {{key:string, prefixTokens:number}|null} 取不到任何可用标识时返回 null。
+ */
+function deriveSessionKey(body, req) {
   if (!body || typeof body !== 'object') return null;
   const meta = body.metadata && typeof body.metadata === 'object' ? body.metadata.user_id : null;
-  if (typeof meta === 'string' && meta.trim()) return 'u:' + sha16(meta.trim());
-  if (typeof body.user === 'string' && body.user.trim()) return 'u:' + sha16(body.user.trim());
+  if (typeof meta === 'string' && meta.trim()) return { key: 'u:' + sha16(meta.trim()), prefixTokens: Infinity };
+  if (typeof body.user === 'string' && body.user.trim()) return { key: 'u:' + sha16(body.user.trim()), prefixTokens: Infinity };
   const hdr = req && req.headers
     ? (req.headers['x-session-id'] || req.headers['x-session-affinity'] || req.headers['x-opencode-session'])
     : null;
-  if (typeof hdr === 'string' && hdr.trim()) return 'h:' + sha16(hdr.trim());
-  // 兜底：稳定前缀（system + 首条用户消息）。两者都取不到就不做亲和。
+  if (typeof hdr === 'string' && hdr.trim()) return { key: 'h:' + sha16(hdr.trim()), prefixTokens: Infinity };
+  // 兜底：稳定前缀（system + 首条用户消息）。两者都取不到就没得派生。
   const sys = typeof body.system === 'string' ? body.system
     : (Array.isArray(body.system)
       ? body.system.map((b) => (b && typeof b.text === 'string' ? b.text : '')).join('')
@@ -421,14 +424,46 @@ function sessionKeyOf(body, req) {
     break;
   }
   if (!sys && !firstUser) return null;
-  // 兜底键只在"确实有值得保护的缓存"时才用。
-  // 理由：亲和的**唯一动机**是别让长前缀的缓存作废；前缀本身就很短的会话没有可缓存的内容，
-  // 用它做键只会带来副作用 —— 不相干的会话因为开头恰好相同而被绑到同一家，
-  // 而且被钉住的那家再也不被尝试，其它家的熔断计数永远攒不够（实测踩到：
-  // "半开探测用短超时"用例因此不再触发 HALF-OPEN）。
-  // 512 token 与 Anthropic 的最小可缓存长度同量级。
-  if (roughTokens(sys) + roughTokens(firstUser) < SESSION_AFFINITY_MIN_TOKENS) return null;
-  return 'p:' + sha16(`${body.model || ''}\u0000${sys}\u0000${firstUser}`);
+  return {
+    key: 'p:' + sha16(`${body.model || ''}\u0000${sys}\u0000${firstUser}`),
+    prefixTokens: roughTokens(sys) + roughTokens(firstUser),
+  };
+}
+
+/**
+ * 会话键（给**会话亲和**用）。
+ *
+ * 兜底键只在"确实有值得保护的缓存"时才用。理由：亲和的**唯一动机**是别让长前缀的缓存作废；
+ * 前缀本身就很短的会话没有可缓存的内容，用它做键只会带来副作用 —— 不相干的会话因为开头
+ * 恰好相同而被绑到同一家，而且被钉住的那家再也不被尝试，其它家的熔断计数永远攒不够
+ *（实测踩到："半开探测用短超时"用例因此不再触发 HALF-OPEN）。
+ * 512 token 与 Anthropic 的最小可缓存长度同量级。
+ *
+ * ⚠ 这个门槛**只对亲和成立**。别拿它去给别的东西派生会话 id —— 见 opencodeSessionId。
+ */
+function sessionKeyOf(body, req) {
+  const d = deriveSessionKey(body, req);
+  if (!d) return null;
+  if (d.prefixTokens < SESSION_AFFINITY_MIN_TOKENS) return null;
+  return d.key;
+}
+
+/**
+ * OpenCode 车道的 `x-opencode-session`。
+ *
+ * ⚠ 与 sessionKeyOf **必须分开**：上游对这条头是**无条件**要求的，少了直接
+ * `400 MissingSessionID`。而 sessionKeyOf 带 512 token 门槛（那是"值不值得钉缓存"的启发式），
+ * 短对话（"你好"这种最常见的）会被它判成 null ——
+ * 实测踩到：**四种短对话全部拿不到会话头**，等于把这条车道在真实用法上全废掉。
+ *
+ * 所以这里**永远返回一个 id**：优先按对话内容派生（同一对话跨轮稳定，上游才好做路由）；
+ * 实在没有任何可用前缀时退化成**进程级常量**（所有会话共用一个 id —— 仍然满足上游，
+ * 只是它的路由聚合度低一些，不会 400）。
+ */
+function opencodeSessionId(body, providerId) {
+  const d = deriveSessionKey(body, null);
+  const hex = sha16(d ? d.key : `opencode-fallback\u0000${providerId || ''}`);
+  return 'ses_' + hex.slice(0, 12) + hex;   // ses_ + 28 位，形态与上游一致
 }
 
 /**
@@ -2246,21 +2281,30 @@ function opencodeClientHeaders(cfg) {
   };
 }
 
-/**
- * 会话 id：**必须由对话内容派生且跨轮稳定** —— 上游按会话计费，每请求换一个会直接 429。
- * 复用 sessionKeyOf 的派生逻辑（同一段对话的稳定前缀不变），再拼成上游认的 ses_ 形态。
- * 取不到稳定标识时返回 null（宁可不发这个头，也不每请求乱铸一个）。
- */
-function opencodeSessionId(body) {
-  const key = sessionKeyOf(body, null);
-  if (!key) return null;
-  const hex = sha16(key);
-  return 'ses_' + hex.slice(0, 12) + hex;   // ses_ + 28 位，形态与上游一致
-}
-
 /** 每轮一个请求 id。 */
 function opencodeRequestId() {
   return 'msg_' + sha16(Date.now() + '\u0000' + Math.random());
+}
+
+/**
+ * 把 OpenCode 车道的**动态头**补到一组上游请求头上（幂等）。
+ *
+ * ⚠⚠ 必须**两条转发路径都调**，否则会出现"有的模型能用、有的 400"这种极难查的现象：
+ *   · `forward()`                        —— OpenAI 入口、以及 Anthropic 直通（provider 未声明 protocol）
+ *   · `forwardAnthropicViaOpenAI()`       —— Anthropic→OpenAI 翻译路径（provider 声明了 openai-chat）
+ * 实测踩到：只在 `forward()` 里加，于是 `opencode-go`（声明了 openai-chat、走翻译路径）
+ * 的 29 个模型全部 400 `MissingSessionID`，而 `opencode-go-claude`（走直通）正常 —— 一样是上游，
+ * 一半能跑一半不能，日志里只看得到"上游 400"。
+ *
+ * 幂等：会话 id 由内容确定，重复调用结果相同；已存在时不覆盖，避免把已发出的请求 id 换掉。
+ * @returns {boolean} 本次是否真的写入了头
+ */
+function applyOpencodeLaneHeaders(headers, body, providerId) {
+  if (!headers || !headers['x-opencode-client']) return false;
+  if (headers['x-opencode-session']) return false;   // 两条路径都经过时只加一次
+  headers['x-opencode-session'] = opencodeSessionId(body, providerId);
+  headers['x-opencode-request'] = opencodeRequestId();
+  return true;
 }
 
 /**
@@ -2272,16 +2316,26 @@ function opencodeRequestId() {
  * 网关是纯转发方，**无从知道客户端有什么工具**，因此只做"缺哪个补哪个"的占位声明，
  * 并把补进去的名字记进日志，让用户能看出哪些调用可能不是自己声明的工具。
  *
+ * ⚠⚠ `style` 必须传对：**三种协议的 tools 形状完全不同**，补错形状比不补更糟 ——
+ * Anthropic 要 `{name, description, input_schema}`，OpenAI/Responses 要
+ * `{type:'function', function:{name, description, parameters}}`。
+ * 实测踩到：不分形状地往 Anthropic 的 tools 里推 OpenAI 形状，上游直接 400
+ *（`out/_fpbug.cjs` 复现：tools 里 5 条，4 条是 OpenAI 形状）。
+ *
+ * @param {object} body 请求体（**不改原对象**）
+ * @param {'chat'|'messages'|'responses'} style 该请求当前所处的线协议形状
  * @returns {{body:object, added:string[]}|null} 无需补齐时返回 null。
  */
 const OPENCODE_FINGERPRINT_TOOLS = ['bash', 'glob', 'grep', 'read'];
 
-function ensureFingerprintTools(body) {
+function ensureFingerprintTools(body, style) {
   if (!body || typeof body !== 'object') return null;
+  const anthropicShape = style === 'messages';
   const list = Array.isArray(body.tools) ? body.tools.slice() : [];
   const have = new Set();
   for (const t of list) {
     if (!t || typeof t !== 'object') continue;
+    // 两种形状都要能读出名字：Anthropic 是 t.name，OpenAI 是 t.function.name
     const n = typeof t.name === 'string' ? t.name
       : (t.function && typeof t.function.name === 'string' ? t.function.name : '');
     if (n) have.add(n.trim().toLowerCase());
@@ -2290,15 +2344,11 @@ function ensureFingerprintTools(body) {
   const added = [];
   for (const name of OPENCODE_FINGERPRINT_TOOLS) {
     if (have.has(name)) continue;
-    list.push({
-      type: 'function',
-      function: {
-        name,
-        description: 'Declared for client fingerprint compatibility. '
-          + name + ' is not provided by this gateway.',
-        parameters: { type: 'object', properties: {}, additionalProperties: true },
-      },
-    });
+    const desc = 'Declared for client fingerprint compatibility. '
+      + name + ' is not provided by this gateway.';
+    list.push(anthropicShape
+      ? { name, description: desc, input_schema: { type: 'object', properties: {} } }
+      : { type: 'function', function: { name, description: desc, parameters: { type: 'object', properties: {}, additionalProperties: true } } });
     added.push(name);
   }
   if (added.length === 0) return null;
@@ -3515,18 +3565,11 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       if (upstreamHeaders && upstreamHeaders['x-opencode-client']) {
         // ① 会话/请求 id 必须由**对话内容**派生（静态头做不到），且同一对话跨轮稳定 ——
         //    上游按会话计费，每请求新铸一个会直接把额度打光并 429。
-        const sid = opencodeSessionId(outBody);
-        if (sid) upstreamHeaders['x-opencode-session'] = sid;
-        // 静默不发会让用户莫名其妙被上游 429（按会话计费），所以这里如实记一条。
-        // ⚠ 这里读的是 **outBody（已过 R9 打码）**：若对话前缀恰好整段是"疑似密钥样式长串"，
-        // 打码后前缀会变得很短，于是派生不出会话键（实测踩到：用 'X'.repeat(4000) 造测试数据，
-        // 4000 个 X 被压成十来个字符 → rough=7 → 低于门槛）。这是有意为之：
-        // 拿打码后的内容做键，才不会把用户原文留在表里。
-        else log('OpenCode 车道：本次没有可派生的稳定会话 id（对话前缀太短或缺稳定标识）→ 不发会话头，'
-          + '上游可能按"新会话"重新计费');
-        upstreamHeaders['x-opencode-request'] = opencodeRequestId();
-        // ② 免费档的工具指纹门：缺 bash/glob/grep/read 直接 403 FreeTierError
-        const fp = ensureFingerprintTools(outBody);
+        //    ⚠ 抽成辅助函数：翻译路径（forwardAnthropicViaOpenAI）也必须调 —— 见该函数的注释。
+        applyOpencodeLaneHeaders(upstreamHeaders, outBody, provider.id);
+        // ② 免费档的工具指纹门：缺 bash/glob/grep/read 直接 403 FreeTierError。
+        //    ⚠ 必须按当前线协议给对形状（Anthropic / OpenAI 的 tools 结构完全不同）
+        const fp = ensureFingerprintTools(outBody, proto);
         if (fp) {
           outBody = fp.body;
           log(`OpenCode 免费档工具指纹：补声明 ${fp.added.join('/')}`
@@ -4513,7 +4556,18 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       openaiBody.messages.unshift({ role: 'system', content: 'You are a helpful assistant.' });
     }
     // 复用 OpenAI 路径的角色/推理档位归一（developer→system、reasoning_effort 按家映射）
-    const finalBody = translateBody(openaiBody, provider);
+    let finalBody = translateBody(openaiBody, provider);
+    // OpenCode 车道的工具指纹门：这条路径上 body 已经是 OpenAI 形状，style 用 'chat'。
+    // ⚠ 工具配对修复 / 指纹门都写在 forward() 里，而**这条路径不经过 forward()** ——
+    // 少了这一处，"声明了 openai-chat 的家"就缺了免费档要求的工具声明。
+    //（会话头不在这里补：它由调用方 applyOpencodeLaneHeaders 统一处理，两条路径共用一份 headers。）
+    if (headers && headers['x-opencode-client']) {
+      const fp = ensureFingerprintTools(finalBody, 'chat');
+      if (fp) {
+        finalBody = fp.body;
+        log(`OpenCode 免费档工具指纹（翻译路径）：补声明 ${fp.added.join('/')}`);
+      }
+    }
 
     let upstream = null;
     const upstreamUrl = `${upstreamBase(provider.baseURL)}${upstreamPath}`;
@@ -5245,6 +5299,9 @@ async function handleMessages(cfg, req, res, body) {
     const toOpenAI = providerProtocol(p) === 'openai-chat';
     log(`try ${p.id} for ${model} (${toOpenAI ? 'anthropic→openai' : 'anthropic'})${upModel !== model ? ' → ' + upModel : ''}`);
     const baseHeaders = upstreamRequestHeaders(req.headers, p.apiKey, cfg.clientUA, !toOpenAI, effectiveClientProfile(cfg, p), cfg);
+    // OpenCode 车道的动态会话头：**两条路径共用这一份 headers，就必须在这里补**
+    //（只在 forward() 里补会让声明了 openai-chat 的那批模型全部 400 MissingSessionID）。
+    applyOpencodeLaneHeaders(baseHeaders, attemptBody, p.id);
     const out = toOpenAI
       ? await forwardAnthropicViaOpenAI(p, baseHeaders, attemptBody, res, undefined)
       : await forwardWithAccounts(p, '/messages', baseHeaders, attemptBody, res);
