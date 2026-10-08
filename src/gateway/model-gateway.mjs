@@ -142,6 +142,34 @@ function describeFetchError(e) {
 }
 
 /**
+ * 判断本次 fetch 失败是不是**我们自己的超时**中止的，并给出可直接落盘的一句话。
+ *
+ * 为什么值得单独一个函数：undici 在 abort 时抛的 message 恒为
+ * `This operation was aborted`，与"上游/代理真的把连接掐了"**完全同形**。
+ * 旧实现只记这一句，于是日志里 17 条一模一样的行既看不出是我们主动放弃的、
+ * 也看不出超时阈值是多少、更看不出等了多少毫秒 —— 而这三件事恰好是判断
+ * "上游慢" / "请求根本没发出去" / "阈值配太小" 的全部依据。
+ *
+ * 判据用 `signal.aborted`（我们自己的 controller）而不是 message：
+ * 只有我们这条 timer 触发过，controller 才会是 aborted。返回 null 表示不是超时。
+ */
+function describeAbortIfOurs(e, opts) {
+  const o = opts || {};
+  const aborted = !!(o.signal && o.signal.aborted);
+  const msg = String((e && e.message) || '');
+  if (!aborted && !/aborted|AbortError/i.test(msg)) return null;
+  const parts = ['超时'];
+  if (o.timeoutMs) parts.push(`阈值 ${o.timeoutMs}ms`);
+  parts.push(`已等 ${o.elapsedMs == null ? '?' : o.elapsedMs}ms`);
+  // 等到的时长明显小于阈值 → 不是"慢"，是别的东西把它掐了（代理/上游主动断开），
+  // 这两种情况的处置完全不同（调大阈值 vs 换线路），必须在日志里分开。
+  if (o.timeoutMs && o.elapsedMs != null && o.elapsedMs < o.timeoutMs * 0.9) {
+    parts.push('（**未到阈值就被中止**：多为代理/上游主动断开，调大阈值无用）');
+  }
+  return { text: parts.join('，'), isOurs: aborted, early: !!(o.timeoutMs && o.elapsedMs != null && o.elapsedMs < o.timeoutMs * 0.9) };
+}
+
+/**
  * 是否"瞬时网络层错误"（值得原地重试一次）。
  * 排除我们自己的超时中止（AbortError）：那类失败重试只会把等待翻倍。
  */
@@ -4007,7 +4035,13 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       // R3 防封：失败冷却而非立即删缓存（防每个请求都重试上游形成风暴）
       catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
       breakerRecordFail(provider.id, 0);   // V2：网络错误 → 短熔断
-      log(`upstream ${provider.id} request error: ${e.message}${causeText ? ' (' + causeText + ')' : ''}${proxyHintFor(upstreamUrl, causeText)}`);
+      // 区分"我们超时放弃"与"上游/代理把连接掐了" —— 两者的 message 同形
+      //（都是 This operation was aborted），处置却完全相反：前者要调阈值，后者不用。
+      const abortInfo = describeAbortIfOurs(e, { signal: controller.signal, timeoutMs, elapsedMs: Date.now() - startedAt });
+      const why = abortInfo
+        ? `上游无响应，${abortInfo.text}`
+        : `${e.message}${causeText ? ' (' + causeText + ')' : ''}${proxyHintFor(upstreamUrl, causeText)}`;
+      log(`upstream ${provider.id} request error: ${why}`);
       return rawMode ? { retryable: 0 } : false;
     }
   }
@@ -6087,7 +6121,14 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         } finally { clearTimeout(t2); }
       }
       if (!upstream) {
-        log(`upstream ${provider.id} request error: ${e.message}${causeText ? ' (' + causeText + ')' : ''}${proxyHintFor(upstreamUrl, causeText)}`);
+        // 与直通路径同一条判据：把"我们超时放弃"和"上游/代理掐了连接"分开。
+        // 这条路径（Anthropic 客户端 → OpenAI 上游）是 DSH 走得最多的一条，
+        // 少了它，日志里同样是 17 条无法区分的一模一样的行。
+        const abortInfo = describeAbortIfOurs(e, { signal: controller.signal, timeoutMs: providerTimeoutMs(provider, scopeModel), elapsedMs: Date.now() - startedAt });
+        const why = abortInfo
+          ? `上游无响应，${abortInfo.text}`
+          : `${e.message}${causeText ? ' (' + causeText + ')' : ''}${proxyHintFor(upstreamUrl, causeText)}`;
+        log(`upstream ${provider.id} request error: ${why}`);
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
         breakerRecordFail(provider.id, 0);
         return false;

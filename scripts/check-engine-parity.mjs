@@ -198,6 +198,8 @@ const DECLARED = [
   { name: 'openWorkBuddyField', why: '新增：用 AES-256-GCM 解一个信封；GCM 校验失败即返回 null（不重试、不猜别的 framing）' },
   { name: 'openWorkBuddyAuthText', why: '新增：把加密文档解成**明文 JSON 文本**再交给 parseWorkBuddyAuth —— 下游解析逻辑完全不用改；非加密文档零开销直通' },
   { name: 'parseWorkBuddyAuth', why: '无改动（重新格式化导致块指纹变化）—— 解密在 openWorkBuddyAuthText 里完成，本函数仍只读明文' },
+  { name: 'describeAbortIfOurs', why: '新增：区分「我们自己的超时中止」与「上游/代理主动断开」。undici 在 abort 时 message 恒为 This operation was aborted，两者完全同形；旧实现只记这一句，17 条一模一样的日志既看不出是主动放弃、也看不出阈值与实际等待时长 —— 而这三件事正是判断「上游慢」/「请求没发出去」/「阈值配太小」的全部依据。现在记为「上游无响应，超时，阈值 Nms，已等 Mms」，并在 M 明显小于 N 时点明「未到阈值就被中止，调大阈值无用」' },
+  { name: 'describeFetchError', why: '无改动（附近插入了新函数导致块指纹变化）' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

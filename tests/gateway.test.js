@@ -2564,6 +2564,32 @@ let upstreamPort = 0;
     } finally { killGw(gw); try { server.close(); } catch { /* 忽略 */ } }
   });
 
+  t('日志可诊断性：自己的超时中止必须写明"阈值 + 实际等了多久"，不能只说 aborted', async () => {
+    // 依据（2026-10-08，真实日志）：一天里 17 条
+    //   `upstream h-e.top request error: This operation was aborted`
+    // 完全同形 —— undici 在 abort 时 message 恒为这一句，于是"我们主动放弃"和
+    // "上游/代理把连接掐了"在日志里**分不出来**；阈值多少、等了多久也都没记。
+    // 而这三件事正是判断「上游慢」/「请求根本没发出去」/「阈值配太小」的全部依据，
+    // 缺了它们只能靠猜。这条测试把新文案钉死。
+    const server = http.createServer((req, res) => { req.resume(); /* 永不回应 */ });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const up = { port: server.address().port, st: { calls: 0 }, server };
+    const gw = await startGatewayWith([
+      openaiProvider('slowp2', up, { timeoutMs: 2000, models: ['m1'] }),
+    ], 'timeoutlog');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/chat/completions', body: { model: 'm1', messages: [{ role: 'user', content: 'hi' }] } });
+      assert.ok(r.status >= 400, '上游不回应时应失败，实际 ' + r.status);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      const line = (logText.split('\n').find((l) => /request error/.test(l)) || '');
+      assert.ok(line, '应记录上游请求错误：' + logText.slice(-300));
+      assert.ok(/上游无响应/.test(line), '应点明是"上游无响应"而不是裸的 aborted：' + line);
+      assert.ok(/阈值\s*2000ms/.test(line), '必须写明超时阈值（否则无法判断该不该调大）：' + line);
+      assert.ok(/已等\s*\d+ms/.test(line), '必须写明实际等待时长：' + line);
+    } finally { killGw(gw); try { server.close(); } catch { /* 忽略 */ } }
+  });
+
   t('逐模型超时：逻辑名与上游 ID 两种写法都能命中', async () => {
     // 请求入口传的是**逻辑名**，failover 改写后传的是**上游 ID** —— 两种都得能匹配到，
     // 否则用户按逻辑名配的超时会在 failover 之后失效。
