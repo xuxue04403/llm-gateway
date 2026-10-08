@@ -254,13 +254,17 @@ function renderTopbar() {
   const st = LG.state;
   if (!st) return;
   const running = st.gateway.running;
+  // `ready` = 端口真的在监听。只有 running 时界面说"运行中"会在"子进程活着但没 listen"
+  // 的那段时间骗人（每个客户端请求都会失败）。三态：运行中 / 启动中 / 已停止。
+  const ready = running && !!st.gateway.ready;
   const pill = $('#statusPill');
-  pill.querySelector('.dot').className = 'dot ' + (running ? 'on' : 'off');
-  $('#statusText').textContent = running ? ('运行中 · 端口 ' + st.gateway.port) : '已停止';
+  pill.querySelector('.dot').className = 'dot ' + (ready ? 'on' : (running ? 'warn' : 'off'));
+  $('#statusText').textContent = ready ? ('运行中 · 端口 ' + st.gateway.port)
+    : (running ? '启动中…（端口尚未就绪）' : '已停止');
   $('#endpointText').textContent = running
     ? ('OpenAI ' + baseUrlOf(st.gateway.port, true) + '   ·   Anthropic ' + baseUrlOf(st.gateway.port, false))
     : (st.gateway.configPath || '');
-  $('#btnStart').disabled = running;
+  $('#btnStart').disabled = ready;   // 启动中仍允许再点（幂等），但已就绪就不必了
   $('#btnStop').disabled = !running;
   $('#btnRestart').disabled = !running;
   $('#brandVer').textContent = 'v' + st.app.version;

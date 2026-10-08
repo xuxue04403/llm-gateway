@@ -933,7 +933,11 @@ class GatewayManager extends EventEmitter {
     const port = this.running ? this.port : this.configPort();
     return {
       running: this.running,
-    ready: !!this.ready,
+    // ⚠ `ready` 只在 running 时才有意义。子进程崩溃退出时 exit 处理器只把 running 置 false，
+    // 而 ready 会留在 true —— 自愈 5 次耗尽后（不再有下一次 _doStart 来复位）这个矛盾态**永久**保留，
+    // 中间还有约 3 秒的 `running=false / ready=true` 窗口。
+    // 在这里收口比在 exit/error 里各补一行可靠：任何"子进程没了"的路径都覆盖得到。
+    ready: this.running && !!this.ready,
       port,
       configPath: this.configPath,
       baseUrl: 'http://127.0.0.1:' + port + '/v1',

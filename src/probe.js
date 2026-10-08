@@ -205,7 +205,10 @@ function getJson(urlStr, opts) {
     // 这里补一个不看数据流的截止时间。+500ms 是留给"刚好卡在边界上的正常慢响应"。
     hardTimer = setTimeout(() => {
       try { req.destroy(); } catch (_) { /* 忽略 */ }
-      finish({ ok: false, error: '超时 ' + timeoutMs + 'ms（整体墙钟：对端持续有数据流入但始终读不完）' });
+      // 报**实际经过时间**：写 timeoutMs 会和界面「测试连通性」里显示的耗时对不上
+      //（实测：文案说 2500ms，用户看到 3008ms），排查时会以为是两回事。
+      const elapsed = Date.now() - t0;
+      finish({ ok: false, error: '超时（整体墙钟 ' + elapsed + 'ms：对端持续有数据流入但始终读不完）' });
     }, timeoutMs + 500);
     if (hardTimer && typeof hardTimer.unref === 'function') hardTimer.unref();
 

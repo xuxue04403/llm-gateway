@@ -53,7 +53,10 @@ function wireTopbar() {
   $('#btnStart').addEventListener('click', async () => {
     toast('正在启动网关…', '', 2000);
     const r = await window.lgw.gwAction('start');
-    if (!r.ok) toast('启动失败：' + r.error, 'err');
+    // `starting: true` = 进程起来了、端口还没就绪（引擎慢于探测窗口）。这是**中间态**不是失败，
+    // 弹红色"启动失败"会和状态点的"启动中…"自相矛盾（旧的 running 口径就是这么骗人的）。
+    if (r && r.starting) toast('网关正在启动…（端口尚未就绪，稍后自动刷新）', 'warn');
+    else if (!r.ok) toast('启动失败：' + r.error, 'err');
     else { toast('网关已启动', 'ok'); refreshHealth(); }
   });
   $('#btnStop').addEventListener('click', async () => {
@@ -64,7 +67,8 @@ function wireTopbar() {
   $('#btnRestart').addEventListener('click', async () => {
     toast('正在重启网关…', '', 2000);
     const r = await window.lgw.gwAction('restart');
-    if (!r.ok) toast('重启失败：' + r.error, 'err');
+    if (r && r.starting) toast('网关正在重启…（端口尚未就绪，稍后自动刷新）', 'warn');
+    else if (!r.ok) toast('重启失败：' + r.error, 'err');
     else { toast('网关已重启', 'ok'); refreshHealth(); }
   });
 }

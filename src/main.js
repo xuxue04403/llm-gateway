@@ -246,7 +246,8 @@ function showWindow() {
 }
 
 function trayIcon() {
-  const color = gateway && gateway.running ? icon.COLORS.ready : icon.COLORS.stopped;
+  const color = gateway && gateway.running && gateway.ready ? icon.COLORS.ready
+    : (gateway && gateway.running ? icon.COLORS.stopped : icon.COLORS.stopped);
   try { return nativeImage.createFromDataURL(icon.iconDataURL(16, color)); } catch (_) { return appIcon(16); }
 }
 
@@ -447,9 +448,12 @@ function registerIpc() {
         // 子进程活着却没 listen（首启被杀软拖慢、启动慢于 8 次探测）时会回 ok:true，
         // 界面弹「网关已启动」+ 状态点变绿，而每个客户端请求都失败。
         // 改为要求 `running && ready`（ready = _doStart 里那次就绪探测的结果）。
+        // `ready` 只在 _doStart 末尾算一次（8 次探测、上界约 21.6s）。引擎慢于这个窗口时
+        // 它是 false，但网关随后其实可用 —— 所以这里**不能**直接报失败，
+        // 而要如实回一个『启动中』（界面据此显示『启动中…』而不是红色失败 toast）。
         if (gateway.running && gateway.ready) return { ok: true };
         if (gateway.running) {
-          return { ok: false, error: `网关进程起来了，但端口 ${gateway.configPort()} 未通过就绪探测 —— 常见原因：启动慢于预期、端口被占用、配置有误。详见「日志」页。` };
+          return { ok: true, starting: true, error: `网关进程已启动，端口 ${gateway.configPort()} 尚未就绪 —— 通常是启动慢于预期（引擎一般 1-3 秒就绪）。若持续如此请查看「日志」页。` };
         }
         return { ok: false, error: `网关未能启动（端口 ${gateway.configPort()}）——常见原因：端口被其他程序占用、配置有误、运行时缺失。详见「日志」页。` };
       }
@@ -460,7 +464,8 @@ function registerIpc() {
       if (a === 'restart') {
         await gateway.restart();
         if (gateway.running && gateway.ready) return { ok: true };
-        return { ok: false, error: `网关重启后未就绪（端口 ${gateway.configPort()}）。详见「日志」页。` };
+        if (gateway.running) return { ok: true, starting: true, error: `网关进程已重启，端口 ${gateway.configPort()} 尚未就绪（正在启动中）。` };
+        return { ok: false, error: `网关重启后未处于运行状态（端口 ${gateway.configPort()}）。详见「日志」页。` };
       }
       if (a === 'get-config') return { ok: true, text: gateway.configText() };
       if (a === 'load-example') return { ok: true, text: gateway.exampleText() };
@@ -490,7 +495,13 @@ function registerIpc() {
 
   handle('gw:health', async () => {
     if (!gateway.running) return { ok: false, error: '网关未运行' };
-    return await gateway.healthSnapshot(4000);
+    const health = await gateway.healthSnapshot(4000);
+    // ⚠ `ready` 原先只在 _doStart 末尾算一次（8 次探测、上界约 21.6s）。引擎慢于那个窗口时它是
+    // false，而且**再没有任何机制能把它置回 true** —— 网关其实可用，界面却一直显示"启动中…"、
+    // 托盘图标一直是灰的，直到用户手动停止/重启。界面每 5 秒就会调一次这里，正好拿来补。
+    // （判据一致：`_doStart` 用的也是同一个 /health 探测。）
+    if (health && health.ok && !gateway.ready) gateway.ready = true;
+    return health;
   });
 
   // 供应商连通性探测：走与网关同规则的 baseURL 归一 + 代理/直连判定

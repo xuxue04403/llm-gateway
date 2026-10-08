@@ -5,11 +5,12 @@ LG.renders.dashboard = function renderDashboard() {
   const st = LG.state;
   if (!st) return;
   const running = st.gateway.running;
+  const ready = running && !!st.gateway.ready;   // 端口真的在监听才算"运行中"
   const port = st.gateway.port;
 
   /* --- 状态卡 --- */
-  $('#dashDot').className = 'dot lg ' + (running ? 'on' : 'off');
-  $('#dashStatus').textContent = running ? '运行中' : '已停止';
+  $('#dashDot').className = 'dot lg ' + (ready ? 'on' : (running ? 'warn' : 'off'));
+  $('#dashStatus').textContent = ready ? '运行中' : (running ? '启动中…' : '已停止');
   $('#dashHint').textContent = running
     ? ('端口 ' + port + ' · 配置 ' + st.gateway.configPath)
     : '点右上角「启动」拉起网关';
