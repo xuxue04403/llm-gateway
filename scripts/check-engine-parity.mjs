@@ -135,6 +135,38 @@ const DECLARED = [
   // —— 2026-10-08 审计轮：三个实测出来的 bug 修复（详见 docs/AUDIT.md 的 O 节）——
   { name: 'deriveSessionKey', why: '新增：把"派生会话键"与"是否值得用"拆开。原来 sessionKeyOf 既派生又带 512 token 门槛，被 opencode 车道复用后，**四种短对话全部拿不到会话头** → 上游 400 MissingSessionID' },
   { name: 'applyOpencodeLaneHeaders', why: '新增：把 OpenCode 车道的动态会话头抽成辅助函数，**两条转发路径都要调** —— 只在 forward() 里加会让声明了 openai-chat 的那 29 个模型全部 400（翻译路径不经过 forward）' },
+
+  // —— 2026-10-08 协议矩阵：任意客户端协议 × 任意上游协议 ——
+  // 用户要求："不论上游模型是什么协议，对外需要同时提供 openai 和 Anthropic，openai 还得支持 responses"。
+  // 实测（out/_matrix.cjs / _smatrix.cjs）：改之前 9 格里 5 格坏，而且是**200 + 错的响应体形状**。
+  { name: 'wireOfName', why: '新增：线协议名归一化（含别名），矩阵的地基' },
+  { name: 'wireOfClientPath', why: '新增：客户端请求路径 → 线协议' },
+  { name: 'resolveUpstreamWire', why: '新增：逐模型 api → 供应商 protocol → 跟随客户端。**逐模型这一层是矩阵的前提**（实测 opencode-go 37 个模型分属三种协议）' },
+  { name: 'upstreamEntryFor', why: '新增：返回整个模型条目（调用方要读 api）；upstreamIdFor 改为走它 —— 选择规则只留一份，避免"两处各写一遍然后漂移"' },
+  { name: 'upstreamIdFor', why: '改为委托 upstreamEntryFor（行为不变）' },
+  { name: 'modelEntries', why: '新增：解析逐模型 `api` 字段（也接受 protocol / wire 别名）；只在写得出来时才附带，保持条目 JSON 形状稳定' },
+  { name: 'providerProtocol', why: '新增一行：认识 openai-responses。旧实现只认前两种 → `protocol: "openai-responses"` 落到 return null → 调用方以为"跟随客户端" → **矩阵翻译根本不触发**（实测：chat 客户端收到 Responses 体）' },
+  { name: 'logicalModelSupportsVision', why: '仅前导注释块位置变化（函数体一字未改）' },
+  { name: 'estimateTokens', why: '仅前导注释块位置变化（函数体一字未改）' },
+  { name: 'responsesInputToChatMessages', why: '新增：Responses input（字符串/数组/function_call/function_call_output）→ chat messages' },
+  { name: 'responsesToChatRequest', why: '新增：Responses 请求 → canonical(chat)。含 tools 扁平↔嵌套的转换（实测不做会 400）' },
+  { name: 'chatToAnthropicRequest', why: '新增：canonical(chat) → Anthropic 请求。含 role:tool→tool_result、max_tokens 必填兜底' },
+  { name: 'chatToResponsesRequest', why: '新增：canonical(chat) → Responses 请求。含 tools 嵌套→扁平' },
+  { name: 'translateMatrixRequest', why: '新增：请求侧矩阵（client→chat→upstream）。末尾统一对齐 stream 字段 —— 实测 anthropicToOpenAIRequest 不复制它，漏了会让上游回非流式而客户端在等 SSE' },
+  { name: 'finishFromStopReason', why: '新增：Anthropic stop_reason → chat finish_reason（既有 stopReasonFromFinish 的逆）' },
+  { name: 'anthropicMessageToChatCompletion', why: '新增：Anthropic message → canonical(chat)' },
+  { name: 'responsesToChatCompletion', why: '新增：Responses 响应 → canonical(chat)。含 status/incomplete_details → finish_reason 的映射（Responses 没有 finish_reason 字段）' },
+  { name: 'chatToResponsesResponse', why: '新增：canonical(chat) → Responses 响应' },
+  { name: 'translateMatrixResponse', why: '新增：响应侧矩阵（upstream→chat→client），非流式' },
+  { name: 'upstreamPathOfWire', why: '新增：线协议 → 上游请求路径' },
+  { name: 'makeStreamDecoder', why: '新增：上游 SSE 帧 → canonical 事件（三种协议各一个分支）。缺 index 的上游按 id 兜底落槽，否则工具参数会串到别的调用上' },
+  { name: 'makeStreamEncoder', why: '新增：canonical 事件 → 客户端 SSE 帧（三种协议各一个分支）+ 幂等 finish()' },
+  { name: 'pumpMatrixStream', why: '新增：流式泵。⚠ flush 必须可重复调用 —— forward 的"首事件偷看"会把开头那段（对流式短响应来说往往就是全部）先读走，只在循环体里解析会让那些字节**永远不被解析**，客户端收到 200 + 空 body' },
+  { name: 'canonicalToChatCompletion', why: '新增：canonical 事件 → chat 完整响应（上游流式而客户端要非流式时用）' },
+  { name: 'makeCanonicalCollector', why: '新增：canonical 事件累积器' },
+  { name: 'drainCanonicalStream', why: '新增：把上游流读成 canonical（聚合用）' },
+  { name: 'chatCompletionToCanonicalEvents', why: '新增：完整 chat completion → canonical 事件（上游非流式而客户端要流式时，合成一条 SSE 流回给客户端）' },
+  { name: 'forwardMatrixResponse', why: '新增：矩阵响应分支的总入口。位置刻意在"首事件偷看之后、任何 writeHead 之前"' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

@@ -942,6 +942,12 @@ function modelEntries(provider) {
         || (Array.isArray(m.input) && m.input.map((x) => String(x).toLowerCase()).includes('image'));
       const entry = { up, as: as || up };
       if (vision) entry.vision = true;
+      // 逐模型的**上游线协议**（可选）：`api: 'openai-chat' | 'anthropic-messages' | 'openai-responses'`。
+      // 协议矩阵靠它工作 —— 同一个供应商里不同模型可能分属不同协议（实测 opencode-go：
+      // 29 个 chat + 2 个 anthropic + 4 个 responses），只有供应商级 protocol 时只能挑一种。
+      // 只在实际写得出来时才附带，保持条目 JSON 形状稳定（既有调用方/测试按 {up, as} 比对）。
+      const api = wireOfName(m.api ?? m.protocol ?? m.wire);
+      if (api) entry.api = api;
       // 上下文/输出上限（可选）：write-dsh 用它给 dsh 写准确的 contextWindow/maxTokens，
       // 避免"全部按 1M 虚报"导致长对话在上游上下文超限。
       const ctxWin = Number(m.contextWindow ?? m.context ?? m.ctx);
@@ -961,10 +967,22 @@ function modelEntries(provider) {
  * 若按声明顺序取第一条，图片会被发到不支持图片的普通变体上（上游报错或忽略图片）。
  */
 function upstreamIdFor(provider, logical, hasImage) {
+  const hit = upstreamEntryFor(provider, logical, hasImage);
+  return hit ? hit.up : null;
+}
+
+/**
+ * 与 `upstreamIdFor` 同一套选择规则，但返回**整个条目** —— 调用方要读的字段不止 `up`：
+ * 逐模型的线协议 `api`（协议矩阵要用）、`vision`、以及将来可能加的其它按模型声明。
+ *
+ * ⚠ 选择规则必须**只有这一份**。这个项目的审计里出过好几次"同一件事在两处各写一遍、
+ * 然后漂移"（clientProfile 三份清单、打包命令两条路径…），所以让 `upstreamIdFor`
+ * 直接走这里，而不是各挑各的。
+ */
+function upstreamEntryFor(provider, logical, hasImage) {
   const list = modelEntries(provider).filter((e) => e.as === logical);
   if (!list.length) return null;
-  const hit = (hasImage && list.find((e) => e.vision === true)) || list[0];
-  return hit.up;
+  return (hasImage && list.find((e) => e.vision === true)) || list[0];
 }
 
 /** 该 provider 声明的逻辑模型名（去重，保序） */
@@ -1119,11 +1137,15 @@ function logicalModelSupportsVision(cfg, logical) {
  *   "quirks":   ["force-stream", "stringify-tool-choice", "prepend-system"]
  */
 
-/** 上游线协议：'openai-chat' | 'anthropic-messages' | null（null = 跟随客户端请求路径） */
+/** 上游线协议：'openai-chat' | 'anthropic-messages' | 'openai-responses' | null（null = 跟随客户端请求路径） */
 function providerProtocol(provider) {
   const v = String((provider && provider.protocol) || '').trim().toLowerCase();
   if (v === 'openai-chat' || v === 'openai-completions' || v === 'openai') return 'openai-chat';
   if (v === 'anthropic' || v === 'anthropic-messages') return 'anthropic-messages';
+  // ⚠ 这一行是协议矩阵的前提：旧实现只认前两种，`protocol: 'openai-responses'` 落到
+  // `return null` → 调用方以为"跟随客户端" → **矩阵翻译根本不触发**，
+  // 客户端拿到 200 但响应体是上游的原形状（实测：chat 客户端收到 Responses 体）。
+  if (v === 'openai-responses' || v === 'responses') return 'openai-responses';
   return null;
 }
 
@@ -2331,11 +2353,15 @@ const OPENCODE_FINGERPRINT_TOOLS = ['bash', 'glob', 'grep', 'read'];
 function ensureFingerprintTools(body, style) {
   if (!body || typeof body !== 'object') return null;
   const anthropicShape = style === 'messages';
+  // ⚠ Responses 的 tools 是**扁平**的 `{type, name, description, parameters}`，
+  // 与 chat 的嵌套 `{type, function:{…}}` 不同。实测踩到：按 chat 形状往 Responses 体里推，
+  // 上游直接 422/400（同一个形状错误在本项目里已经犯过三次：Anthropic 一次、Responses 一次）。
+  const flatShape = style === 'responses';
   const list = Array.isArray(body.tools) ? body.tools.slice() : [];
   const have = new Set();
   for (const t of list) {
     if (!t || typeof t !== 'object') continue;
-    // 两种形状都要能读出名字：Anthropic 是 t.name，OpenAI 是 t.function.name
+    // 三种形状都要能读出名字：Anthropic 是 t.name；chat 是 t.function.name；Responses 也是 t.name
     const n = typeof t.name === 'string' ? t.name
       : (t.function && typeof t.function.name === 'string' ? t.function.name : '');
     if (n) have.add(n.trim().toLowerCase());
@@ -2346,9 +2372,13 @@ function ensureFingerprintTools(body, style) {
     if (have.has(name)) continue;
     const desc = 'Declared for client fingerprint compatibility. '
       + name + ' is not provided by this gateway.';
-    list.push(anthropicShape
-      ? { name, description: desc, input_schema: { type: 'object', properties: {} } }
-      : { type: 'function', function: { name, description: desc, parameters: { type: 'object', properties: {}, additionalProperties: true } } });
+    if (anthropicShape) {
+      list.push({ name, description: desc, input_schema: { type: 'object', properties: {} } });
+    } else if (flatShape) {
+      list.push({ type: 'function', name, description: desc, parameters: { type: 'object', properties: {} } });
+    } else {
+      list.push({ type: 'function', function: { name, description: desc, parameters: { type: 'object', properties: {}, additionalProperties: true } } });
+    }
     added.push(name);
   }
   if (added.length === 0) return null;
@@ -3568,8 +3598,14 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         //    ⚠ 抽成辅助函数：翻译路径（forwardAnthropicViaOpenAI）也必须调 —— 见该函数的注释。
         applyOpencodeLaneHeaders(upstreamHeaders, outBody, provider.id);
         // ② 免费档的工具指纹门：缺 bash/glob/grep/read 直接 403 FreeTierError。
-        //    ⚠ 必须按当前线协议给对形状（Anthropic / OpenAI 的 tools 结构完全不同）
-        const fp = ensureFingerprintTools(outBody, proto);
+        //    ⚠ 形状必须按**上游实际收到的协议**给，而不是按客户端路径 ——
+        //    矩阵翻译之后 body 已经是上游的形状了（实测踩到：Anthropic 客户端 → Responses 上游时
+        //    按 chat 形状推 tools，上游 422）。
+        const fpStyle = (opts && opts.matrix && opts.matrix.upstreamWire)
+          ? (opts.matrix.upstreamWire === 'openai-responses' ? 'responses'
+            : (opts.matrix.upstreamWire === 'anthropic-messages' ? 'messages' : 'chat'))
+          : proto;
+        const fp = ensureFingerprintTools(outBody, fpStyle);
         if (fp) {
           outBody = fp.body;
           log(`OpenCode 免费档工具指纹：补声明 ${fp.added.join('/')}`
@@ -3929,6 +3965,18 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
   // D2（审计修复）：到这里才确认"上游确实给出了正常事件"（用了流式则已通过首事件偷看），
   // 此时清零熔断计数才是诚实的；提前到 2xx 处会让"200 + 错误 SSE"永远无法熔断。
   breakerRecordSuccess(provider.id);
+  // ── 协议矩阵：上游线协议 ≠ 客户端协议 → 翻译后再写给客户端 ──
+  // 位置是刻意的：**晚于**首事件偷看（那时才确认上游给的是正常流，否则会把"上游 200 +
+  // 错误 SSE"翻译成一条客户端看不懂的成功响应），**早于**任何 res.writeHead
+  //（响应头一写，形状就改不了了）。
+  // 同协议时 mx 为空或两值相等 → 完全走原来的透传路径，一个字节都不多绕。
+  {
+    const mx = opts && opts.matrix;
+    if (mx && mx.upstreamWire && mx.upstreamWire !== mx.clientWire) {
+      log(`[matrix] ${mx.model}: 客户端 ${mx.clientWire} ← 上游 ${mx.upstreamWire}（翻译${mx.clientStream ? '流式' : '非流式'}）`);
+      return await forwardMatrixResponse({ res, upstream, bodyStream, ctype, pendingHead, mx });
+    }
+  }
   // 上游被强制流式、而客户端要非流式 → 聚合后回单条 JSON（2026-09-16：直通路径补齐 quirk 语义）
   if (needAggregate && bodyStream && /event-stream/i.test(ctype)) {
     const completion = await aggregateOpenAIStream(upstream, pendingHead);
@@ -4269,6 +4317,1032 @@ function stopReasonFromFinish(finish) {
 
 /** 粗略 token 估算（上游不给 usage 时兜底：约 4 字符/token）——好过报 0 让客户端以为上下文为空 */
 const estimateTokens = (s) => Math.max(1, Math.ceil(String(s || '').length / 4));
+
+/* ==================================================================================
+ * 协议矩阵：**任意客户端协议 × 任意上游协议**
+ *
+ * 用户要求（2026-10-08）：*"不论上游模型是什么协议，llm-gateway 对外需要同时提供
+ * openai 和 Anthropic 协议，同时 openai 还得支持 responses"*。
+ *
+ * 现状实测（`out/_matrix.cjs` 用假上游逐格探过）—— 9 格里 5 格是坏的，
+ * 而且**不是报错，是返回 200 带着错的响应体形状**：
+ *
+ *     上游 \ 客户端      chat            anthropic        responses
+ *     openai-chat       ✅              ✅               ❌ 返回 chat 形状
+ *     anthropic-msgs    ❌ 返回 message  ✅               ❌
+ *     openai-responses  ❌              ❌               ✅
+ *
+ * 静默错形状比报错更难查：客户端拿到 200，解析时才炸。
+ *
+ * ## 架构：以 **OpenAI chat** 为轴做双向归一
+ *
+ * 不写 6 对互相翻译（那是 12 个函数且组合爆炸），而是：
+ *   请求：  client 体 --decode--> **canonical(chat)** --encode--> 上游体
+ *   响应：  上游体 --decode--> **canonical(chat)** --encode--> 客户端体
+ *   流式：  上游帧 --decode--> **canonical 事件** --encode--> 客户端帧
+ *
+ * 这样只需要：请求 3 个 encode + 3 个 decode（chat 侧是恒等，实际 4 个函数）、
+ * 响应同理、流式 3 个解码器 + 3 个编码器 —— **共 ~14 个函数覆盖全部 9 格**，
+ * 而且"两次翻译"的格子（如 responses 客户端 → anthropic 上游）自动由串联得到。
+ *
+ * 为什么轴选 chat 而不是 Anthropic：chat 的形状最通用（tools 自带 JSON Schema、
+ * 工具调用与结果都在 messages 里），Anthropic 与 Responses 都能无损落到它上面。
+ * 现有的 `anthropicToOpenAIRequest` / `openaiToAnthropicMessage` 正好就是轴的两侧，
+ * 直接复用，一点不浪费。
+ * ================================================================================== */
+
+/** 线协议名的归一化（配置里可能写别名）。 */
+function wireOfName(v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  if (!s) return null;
+  if (s === 'openai-chat' || s === 'openai-completions' || s === 'openai' || s === 'chat') return 'openai-chat';
+  if (s === 'anthropic' || s === 'anthropic-messages' || s === 'messages') return 'anthropic-messages';
+  if (s === 'openai-responses' || s === 'responses') return 'openai-responses';
+  return null;
+}
+
+/** 客户端请求路径 → 线协议。 */
+function wireOfClientPath(pathname) {
+  const p = String(pathname || '');
+  if (p === '/v1/messages') return 'anthropic-messages';
+  if (p === '/v1/responses') return 'openai-responses';
+  if (p === '/v1/chat/completions') return 'openai-chat';
+  return null;
+}
+
+/**
+ * 该模型这次该用哪条上游线协议。
+ * 优先级：**模型条目的 `api`** → `provider.protocol` → null（null = 跟随客户端，纯透传）。
+ *
+ * 为什么必须支持**逐模型**：同一个供应商的模型可能分属不同协议 —— 实测 opencode-go
+ * 的 37 个模型里 29 个走 chat、2 个走 anthropic、4 个走 responses。只有供应商级
+ * `protocol` 时，37 个只能挑一种，另外两种必然 400。
+ */
+function resolveUpstreamWire(provider, logical, hasImage) {
+  const e = upstreamEntryFor(provider, logical, hasImage);
+  const fromModel = e ? wireOfName(e.api) : null;
+  if (fromModel) return fromModel;
+  return wireOfName(providerProtocol(provider));
+}
+
+/* ---------------- 请求侧：canonical(=OpenAI chat) ↔ 另外两种协议 ---------------- */
+
+/** Responses `input` 项 → chat messages。 */
+function responsesInputToChatMessages(input) {
+  const out = [];
+  const items = typeof input === 'string' ? [{ type: 'message', role: 'user', content: input }] : (Array.isArray(input) ? input : []);
+  for (const it of items) {
+    if (!it || typeof it !== 'object') continue;
+    if (it.type === 'function_call') {
+      out.push({
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: String(it.call_id || it.id || 'call_' + Math.random().toString(36).slice(2, 10)),
+          type: 'function',
+          function: { name: String(it.name || ''), arguments: String(it.arguments == null ? '{}' : it.arguments) },
+        }],
+      });
+      continue;
+    }
+    if (it.type === 'function_call_output') {
+      out.push({
+        role: 'tool',
+        tool_call_id: String(it.call_id || ''),
+        content: typeof it.output === 'string' ? it.output : JSON.stringify(it.output == null ? '' : it.output),
+      });
+      continue;
+    }
+    if (it.type === 'reasoning') continue;   // 推理项不回灌给上游（各家自己会重算）
+    // message / 其它：把 content 块拍平成文本
+    const role = it.role === 'assistant' ? 'assistant' : (it.role === 'system' || it.role === 'developer' ? 'system' : 'user');
+    const text = typeof it.content === 'string' ? it.content
+      : (Array.isArray(it.content)
+        ? it.content.map((b) => {
+          if (!b || typeof b !== 'object') return '';
+          if (typeof b.text === 'string') return b.text;
+          if (b.type === 'input_image' || b.type === 'image_url') return '[image]';
+          return '';
+        }).join('')
+        : '');
+    out.push({ role, content: text });
+  }
+  return out;
+}
+
+/** Responses 请求体 → canonical(chat) 请求体。 */
+function responsesToChatRequest(body) {
+  const b = body && typeof body === 'object' ? body : {};
+  const messages = responsesInputToChatMessages(b.input);
+  if (typeof b.instructions === 'string' && b.instructions.trim()) {
+    messages.unshift({ role: 'system', content: b.instructions });
+  }
+  const out = { model: b.model, messages, stream: !!b.stream };
+  // ⚠ 两者的 tools 形状不同：Responses 是**扁平**的 {type,name,description,parameters}，
+  //   chat 是嵌套的 {type,function:{name,description,parameters}}。实测踩过：直接把
+  //   Responses 的 tools 塞进 chat 请求，上游把 function 当成 undefined → 400。
+  if (Array.isArray(b.tools) && b.tools.length) {
+    out.tools = b.tools.map((t) => {
+      if (!t || typeof t !== 'object') return null;
+      if (t.function && typeof t.function === 'object') return t;   // 已经是 chat 形状
+      return {
+        type: 'function',
+        function: {
+          name: String(t.name || ''),
+          description: String(t.description || ''),
+          parameters: t.parameters && typeof t.parameters === 'object' ? t.parameters : { type: 'object', properties: {} },
+        },
+      };
+    }).filter(Boolean);
+  }
+  if (b.tool_choice !== undefined) {
+    // Responses 的 tool_choice 是字符串或 {type:'function',name}；chat 要 {type,function:{name}}
+    const tc = b.tool_choice;
+    out.tool_choice = (tc && typeof tc === 'object' && tc.type === 'function' && tc.name)
+      ? { type: 'function', function: { name: String(tc.name) } }
+      : tc;
+  }
+  if (b.max_output_tokens !== undefined) out.max_tokens = b.max_output_tokens;
+  if (b.temperature !== undefined) out.temperature = b.temperature;
+  if (b.top_p !== undefined) out.top_p = b.top_p;
+  if (b.metadata !== undefined) out.metadata = b.metadata;
+  if (b.reasoning && typeof b.reasoning === 'object' && b.reasoning.effort) out.reasoning_effort = b.reasoning.effort;
+  return out;
+}
+
+/** canonical(chat) 请求体 → Anthropic 请求体。 */
+function chatToAnthropicRequest(body) {
+  const b = body && typeof body === 'object' ? body : {};
+  const msgs = Array.isArray(b.messages) ? b.messages : [];
+  const systemParts = [];
+  const out = [];
+  for (const m of msgs) {
+    if (!m || typeof m !== 'object') continue;
+    if (m.role === 'system' || m.role === 'developer') {
+      if (typeof m.content === 'string' && m.content) systemParts.push(m.content);
+      continue;
+    }
+    if (m.role === 'tool') {
+      // chat 的 role:tool → Anthropic 的 user + tool_result 块
+      out.push({
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: String(m.tool_call_id || ''),
+          content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content == null ? '' : m.content),
+        }],
+      });
+      continue;
+    }
+    const blocks = [];
+    if (typeof m.content === 'string') {
+      if (m.content) blocks.push({ type: 'text', text: m.content });
+    } else if (Array.isArray(m.content)) {
+      for (const part of m.content) {
+        if (!part || typeof part !== 'object') continue;
+        if (part.type === 'text' && typeof part.text === 'string') blocks.push({ type: 'text', text: part.text });
+        else if (part.type === 'image_url' && part.image_url && part.image_url.url) {
+          const url = String(part.image_url.url);
+          const mm = /^data:([^;]+);base64,(.*)$/.exec(url);
+          blocks.push(mm
+            ? { type: 'image', source: { type: 'base64', media_type: mm[1], data: mm[2] } }
+            : { type: 'image', source: { type: 'url', url } });
+        }
+      }
+    }
+    if (Array.isArray(m.tool_calls)) {
+      for (const c of m.tool_calls) {
+        let input = {};
+        try { input = JSON.parse((c.function && c.function.arguments) || '{}'); } catch { input = {}; }
+        blocks.push({ type: 'tool_use', id: String(c.id || 'toolu_' + Math.random().toString(36).slice(2, 10)), name: String((c.function && c.function.name) || ''), input });
+      }
+    }
+    // Anthropic 不接受 assistant 轮的空 content 数组
+    if (!blocks.length) continue;
+    out.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: blocks });
+  }
+  const req = {
+    model: b.model,
+    // ⚠ max_tokens 在 Anthropic 是**必填**；chat 里可缺省 → 给一个保守值而不是让上游 400
+    max_tokens: Number(b.max_tokens) > 0 ? Number(b.max_tokens) : 4096,
+    messages: out,
+    stream: !!b.stream,
+  };
+  if (systemParts.length) req.system = systemParts.join('\n\n');
+  if (Array.isArray(b.tools) && b.tools.length) {
+    req.tools = b.tools.map((t) => {
+      const fn = (t && t.function) || {};
+      return {
+        name: String(fn.name || ''),
+        description: String(fn.description || ''),
+        input_schema: fn.parameters && typeof fn.parameters === 'object' ? fn.parameters : { type: 'object', properties: {} },
+      };
+    }).filter((t) => t.name);
+  }
+  if (b.tool_choice !== undefined) {
+    const tc = b.tool_choice;
+    if (tc === 'auto') req.tool_choice = { type: 'auto' };
+    else if (tc === 'required') req.tool_choice = { type: 'any' };
+    else if (tc === 'none') req.tool_choice = { type: 'none' };
+    else if (tc && typeof tc === 'object' && tc.function && tc.function.name) req.tool_choice = { type: 'tool', name: String(tc.function.name) };
+    else if (tc && typeof tc === 'object' && tc.name) req.tool_choice = { type: 'tool', name: String(tc.name) };
+  }
+  if (b.temperature !== undefined) req.temperature = b.temperature;
+  if (b.top_p !== undefined) req.top_p = b.top_p;
+  if (Array.isArray(b.stop) && b.stop.length) req.stop_sequences = b.stop.map(String);
+  else if (typeof b.stop === 'string' && b.stop) req.stop_sequences = [b.stop];
+  return req;
+}
+
+/** canonical(chat) 请求体 → Responses 请求体。 */
+function chatToResponsesRequest(body) {
+  const b = body && typeof body === 'object' ? body : {};
+  const input = [];
+  let instructions = '';
+  for (const m of (Array.isArray(b.messages) ? b.messages : [])) {
+    if (!m || typeof m !== 'object') continue;
+    if (m.role === 'system' || m.role === 'developer') {
+      if (typeof m.content === 'string' && m.content) instructions = instructions ? instructions + '\n\n' + m.content : m.content;
+      continue;
+    }
+    if (m.role === 'tool') {
+      input.push({ type: 'function_call_output', call_id: String(m.tool_call_id || ''), output: typeof m.content === 'string' ? m.content : JSON.stringify(m.content == null ? '' : m.content) });
+      continue;
+    }
+    if (Array.isArray(m.tool_calls)) {
+      if (typeof m.content === 'string' && m.content) {
+        input.push({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: m.content }] });
+      }
+      for (const c of m.tool_calls) {
+        input.push({
+          type: 'function_call',
+          call_id: String(c.id || ''),
+          name: String((c.function && c.function.name) || ''),
+          arguments: String((c.function && c.function.arguments) || '{}'),
+        });
+      }
+      continue;
+    }
+    const text = typeof m.content === 'string' ? m.content
+      : (Array.isArray(m.content) ? m.content.map((p) => (p && typeof p.text === 'string' ? p.text : '')).join('') : '');
+    input.push({
+      type: 'message',
+      role: m.role === 'assistant' ? 'assistant' : 'user',
+      content: [{ type: m.role === 'assistant' ? 'output_text' : 'input_text', text }],
+    });
+  }
+  const out = { model: b.model, input, stream: !!b.stream };
+  if (instructions) out.instructions = instructions;
+  if (Array.isArray(b.tools) && b.tools.length) {
+    // chat 的嵌套形状 → Responses 的**扁平**形状（实测：不拍平上游认不出工具）
+    out.tools = b.tools.map((t) => {
+      if (t && t.type === 'function' && t.name) return t;   // 已是扁平
+      const fn = (t && t.function) || {};
+      return {
+        type: 'function',
+        name: String(fn.name || ''),
+        description: String(fn.description || ''),
+        parameters: fn.parameters && typeof fn.parameters === 'object' ? fn.parameters : { type: 'object', properties: {} },
+      };
+    }).filter((t) => t.name);
+  }
+  if (b.tool_choice !== undefined) {
+    const tc = b.tool_choice;
+    out.tool_choice = (tc && typeof tc === 'object' && tc.function && tc.function.name)
+      ? { type: 'function', name: String(tc.function.name) }
+      : tc;
+  }
+  if (b.max_tokens !== undefined) out.max_output_tokens = b.max_tokens;
+  if (b.temperature !== undefined) out.temperature = b.temperature;
+  if (b.top_p !== undefined) out.top_p = b.top_p;
+  if (b.reasoning_effort) out.reasoning = { effort: b.reasoning_effort };
+  return out;
+}
+
+/**
+ * 把客户端请求体翻译成上游要的形状（**矩阵的请求侧**）。
+ * @param {object} body 客户端请求体
+ * @param {string} clientWire 客户端协议
+ * @param {string} upstreamWire 上游协议
+ * @param {object} provider 供应商（多数转换器用不到，留给将来按家微调）
+ * @returns {object} 上游请求体（同协议时原样返回）
+ */
+function translateMatrixRequest(body, clientWire, upstreamWire, provider) {
+  if (!upstreamWire || upstreamWire === clientWire) return body;
+  // ① 解码：client → canonical(chat)
+  let canon;
+  if (clientWire === 'openai-chat') canon = body;
+  else if (clientWire === 'anthropic-messages') canon = anthropicToOpenAIRequest(body, provider);
+  else if (clientWire === 'openai-responses') canon = responsesToChatRequest(body);
+  else return body;   // 未知客户端协议：不动
+  // ② 编码：canonical(chat) → upstream
+  let out;
+  if (upstreamWire === 'openai-chat') out = canon;
+  else if (upstreamWire === 'anthropic-messages') out = chatToAnthropicRequest(canon);
+  else if (upstreamWire === 'openai-responses') out = chatToResponsesRequest(canon);
+  else out = canon;
+  // ③ ⚠ `stream` 必须按**客户端原始请求**对齐，不能被中间翻译弄丢。
+  // 实测踩到：`anthropicToOpenAIRequest` 不复制 stream 字段，于是
+  // 「Anthropic 客户端要流式 → Responses 上游」这条路上游收到 stream:false 回了 JSON，
+  // 而客户端在等 SSE —— 表现为 **HTTP 200 + 空事件流**（最难看的一种失败：
+  // 状态码是好的人却什么都没收到）。各家的翻译函数对 stream 的处理本来就该由这一层统一兜住。
+  if (out && typeof out === 'object' && !Array.isArray(out)) {
+    out = Object.assign({}, out, { stream: !!body.stream });
+  }
+  return out;
+}
+
+/* ---------------- 响应侧（非流式）：canonical(=OpenAI chat) ↔ 另外两种 ---------------- */
+
+/** chat 的 finish_reason → Anthropic stop_reason（已有 stopReasonFromFinish 的逆） */
+function finishFromStopReason(sr) {
+  switch (String(sr || '').toLowerCase()) {
+    case 'tool_use': return 'tool_calls';
+    case 'max_tokens': return 'length';
+    case 'refusal': return 'content_filter';
+    default: return 'stop';
+  }
+}
+
+/** Anthropic message → canonical(chat) completion。 */
+function anthropicMessageToChatCompletion(json, model) {
+  const j = json && typeof json === 'object' ? json : {};
+  const blocks = Array.isArray(j.content) ? j.content : [];
+  const msg = { role: 'assistant', content: '' };
+  let text = '';
+  let thinking = '';
+  const calls = [];
+  for (const b of blocks) {
+    if (!b || typeof b !== 'object') continue;
+    if (b.type === 'text' && typeof b.text === 'string') text += b.text;
+    else if (b.type === 'thinking' && typeof b.thinking === 'string') thinking += b.thinking;
+    else if (b.type === 'tool_use') {
+      calls.push({
+        id: String(b.id || 'call_' + Math.random().toString(36).slice(2, 10)),
+        type: 'function',
+        function: { name: String(b.name || ''), arguments: JSON.stringify(b.input === undefined ? {} : b.input) },
+      });
+    }
+  }
+  msg.content = text;
+  if (thinking) msg.reasoning_content = thinking;
+  if (calls.length) msg.tool_calls = calls;
+  const u = j.usage || {};
+  return {
+    id: String(j.id || 'chatcmpl-' + Math.random().toString(36).slice(2, 12)),
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message: msg, finish_reason: finishFromStopReason(j.stop_reason) }],
+    usage: {
+      prompt_tokens: Number(u.input_tokens) || 0,
+      completion_tokens: Number(u.output_tokens) || 0,
+      total_tokens: (Number(u.input_tokens) || 0) + (Number(u.output_tokens) || 0),
+    },
+  };
+}
+
+/** Responses 响应 → canonical(chat) completion。 */
+function responsesToChatCompletion(json, model) {
+  const j = json && typeof json === 'object' ? json : {};
+  const out = Array.isArray(j.output) ? j.output : [];
+  let text = '';
+  let thinking = '';
+  const calls = [];
+  for (const item of out) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.type === 'reasoning') {
+      const t = (Array.isArray(item.summary) ? item.summary : []).map((s) => (s && s.text) || '').join('');
+      if (t) thinking += t;
+      continue;
+    }
+    if (item.type === 'function_call') {
+      calls.push({
+        id: String(item.call_id || item.id || 'call_' + Math.random().toString(36).slice(2, 10)),
+        type: 'function',
+        function: { name: String(item.name || ''), arguments: String(item.arguments == null ? '{}' : item.arguments) },
+      });
+      continue;
+    }
+    if (Array.isArray(item.content)) {
+      for (const c of item.content) {
+        if (c && typeof c.text === 'string' && (c.type === 'output_text' || c.type === 'text')) text += c.text;
+        else if (c && typeof c.refusal === 'string') text += c.refusal;
+      }
+    }
+  }
+  const msg = { role: 'assistant', content: text };
+  if (thinking) msg.reasoning_content = thinking;
+  if (calls.length) msg.tool_calls = calls;
+  const u = j.usage || {};
+  const inTok = Number(u.input_tokens) || 0;
+  const outTok = Number(u.output_tokens) || 0;
+  // Responses 的终态是 status + incomplete_details，不是 finish_reason
+  let finish = 'stop';
+  if (calls.length) finish = 'tool_calls';
+  else if (j.status === 'incomplete') {
+    const reason = (j.incomplete_details && j.incomplete_details.reason) || '';
+    finish = /max/i.test(String(reason)) ? 'length' : 'stop';
+  }
+  return {
+    id: String(j.id || 'chatcmpl-' + Math.random().toString(36).slice(2, 12)),
+    object: 'chat.completion',
+    created: Math.floor((Number(j.created_at) || (Date.now() / 1000))),
+    model,
+    choices: [{ index: 0, message: msg, finish_reason: finish }],
+    usage: { prompt_tokens: inTok, completion_tokens: outTok, total_tokens: Number(u.total_tokens) || (inTok + outTok) },
+  };
+}
+
+/** canonical(chat) completion → Responses 响应。 */
+function chatToResponsesResponse(json, model) {
+  const j = json && typeof json === 'object' ? json : {};
+  const choice = (Array.isArray(j.choices) ? j.choices[0] : null) || {};
+  const msg = choice.message || {};
+  const output = [];
+  const reasoning = reasoningTextOf(msg);
+  if (reasoning) output.push({ id: 'rs_' + Math.random().toString(36).slice(2, 12), type: 'reasoning', summary: [{ type: 'summary_text', text: reasoning }] });
+  if (typeof msg.content === 'string' && msg.content) {
+    output.push({
+      id: 'msg_' + Math.random().toString(36).slice(2, 12),
+      type: 'message',
+      role: 'assistant',
+      status: 'completed',
+      content: [{ type: 'output_text', text: msg.content, annotations: [] }],
+    });
+  }
+  for (const c of (Array.isArray(msg.tool_calls) ? msg.tool_calls : [])) {
+    output.push({
+      id: 'fc_' + Math.random().toString(36).slice(2, 12),
+      type: 'function_call',
+      status: 'completed',
+      call_id: String(c.id || ''),
+      name: String((c.function && c.function.name) || ''),
+      arguments: String((c.function && c.function.arguments) || '{}'),
+    });
+  }
+  const u = j.usage || {};
+  const inTok = Number(u.prompt_tokens) || 0;
+  const outTok = Number(u.completion_tokens) || 0;
+  const incomplete = choice.finish_reason === 'length';
+  return {
+    id: String(j.id && /^resp/.test(j.id) ? j.id : 'resp_' + Math.random().toString(36).slice(2, 14)),
+    object: 'response',
+    created_at: Number(j.created) || Math.floor(Date.now() / 1000),
+    status: incomplete ? 'incomplete' : 'completed',
+    model,
+    output,
+    ...(incomplete ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
+    usage: { input_tokens: inTok, output_tokens: outTok, total_tokens: Number(u.total_tokens) || (inTok + outTok) },
+  };
+}
+
+/**
+ * 把上游响应翻译成客户端要的形状（**矩阵的响应侧，非流式**）。
+ * 与 `translateMatrixRequest` 对称：上游 → canonical(chat) → 客户端。
+ */
+function translateMatrixResponse(json, upstreamWire, clientWire, model, inputTokens) {
+  if (!upstreamWire || upstreamWire === clientWire) return json;
+  let canon;
+  if (upstreamWire === 'openai-chat') canon = json;
+  else if (upstreamWire === 'anthropic-messages') canon = anthropicMessageToChatCompletion(json, model);
+  else if (upstreamWire === 'openai-responses') canon = responsesToChatCompletion(json, model);
+  else return json;
+
+  if (clientWire === 'openai-chat') return canon;
+  if (clientWire === 'anthropic-messages') {
+    return openaiToAnthropicMessage(canon, model, inputTokens);
+  }
+  if (clientWire === 'openai-responses') return chatToResponsesResponse(canon, model);
+  return canon;
+}
+
+/* ==================================================================================
+ * 流式矩阵：canonical 事件管线
+ *
+ * 三种协议的 SSE 帧形状完全不同，但**语义**是同一套：开始 → 文本增量 / 思考增量 /
+ * 工具调用（开始+参数增量）→ 结束原因 → 用量 → 结束。
+ *
+ * 所以不写"每对协议一个翻译器"（那是 6 个单体函数、组合爆炸），而是：
+ *     上游帧 --decode--> **canonical 事件** --encode--> 客户端帧
+ * 三个解码器 + 三个编码器覆盖全部 9 格；"跨两次"的格子（responses 客户端 → anthropic 上游）
+ * 自动由同一根管子得到，不需要另写代码。
+ *
+ * canonical 事件（就这几个，多了没用）：
+ *   {t:'start'}                              流开始
+ *   {t:'think', d}                           思考/推理增量
+ *   {t:'text',  d}                           正文增量
+ *   {t:'tool',  i, id?, name?}               工具调用开始（i = 槽位）
+ *   {t:'args',  i, d}                        工具参数增量
+ *   {t:'stop',  r}                           结束原因（canonical 用 chat 的措辞）
+ *   {t:'usage', in, out}                     用量
+ *   {t:'end'}                                流结束
+ * ================================================================================== */
+
+/** 上游线协议 → 上游请求路径（相对 /v1）。 */
+function upstreamPathOfWire(wire) {
+  if (wire === 'anthropic-messages') return '/messages';
+  if (wire === 'openai-responses') return '/responses';
+  return '/chat/completions';
+}
+
+/** 建一个上游 SSE 解码器：帧 → canonical 事件。 */
+function makeStreamDecoder(wire) {
+  const st = { tools: new Map(), nextSlot: 0 };
+
+  const toolSlot = (key, id, name) => {
+    // 有些上游不给 index，只给 id；两种都要能落槽，否则参数会串到别的调用上
+    const k = key !== undefined && key !== null && key !== '' ? String(key) : (id ? 'id:' + id : 'n:' + st.nextSlot);
+    if (!st.tools.has(k)) st.tools.set(k, st.nextSlot++);
+    return st.tools.get(k);
+  };
+
+  return {
+    feed(evtName, json) {
+      const ev = [];
+      const j = json && typeof json === 'object' ? json : {};
+
+      if (wire === 'openai-chat') {
+        if (j.usage && (j.usage.prompt_tokens || j.usage.completion_tokens)) {
+          ev.push({ t: 'usage', in: Number(j.usage.prompt_tokens) || 0, out: Number(j.usage.completion_tokens) || 0 });
+        }
+        const choice = (Array.isArray(j.choices) ? j.choices[0] : null) || {};
+        const d = choice.delta || {};
+        const think = reasoningTextOf(d);
+        if (think) ev.push({ t: 'think', d: think });
+        if (typeof d.content === 'string' && d.content) ev.push({ t: 'text', d: d.content });
+        for (const c of (Array.isArray(d.tool_calls) ? d.tool_calls : [])) {
+          const slot = toolSlot(c.index, c.id);
+          const name = (c.function && c.function.name) || '';
+          if (name) ev.push({ t: 'tool', i: slot, id: String(c.id || ''), name: String(name) });
+          const args = (c.function && c.function.arguments) || '';
+          if (args) ev.push({ t: 'args', i: slot, d: String(args) });
+        }
+        if (choice.finish_reason) ev.push({ t: 'stop', r: finishFromStopReason(choice.finish_reason) === 'tool_calls' ? 'tool_calls' : String(choice.finish_reason) });
+        return ev;
+      }
+
+      if (wire === 'anthropic-messages') {
+        const type = String(evtName || j.type || '');
+        if (type === 'message_start') {
+          const u = (j.message && j.message.usage) || {};
+          if (u.input_tokens) ev.push({ t: 'usage', in: Number(u.input_tokens) || 0, out: 0 });
+          return ev;
+        }
+        if (type === 'content_block_start') {
+          const b = j.content_block || {};
+          if (b.type === 'tool_use') ev.push({ t: 'tool', i: Number(j.index) || 0, id: String(b.id || ''), name: String(b.name || '') });
+          return ev;
+        }
+        if (type === 'content_block_delta') {
+          const d = j.delta || {};
+          if (d.type === 'text_delta' && d.text) ev.push({ t: 'text', d: String(d.text) });
+          else if (d.type === 'thinking_delta' && d.thinking) ev.push({ t: 'think', d: String(d.thinking) });
+          else if (d.type === 'input_json_delta' && d.partial_json) ev.push({ t: 'args', i: Number(j.index) || 0, d: String(d.partial_json) });
+          return ev;
+        }
+        if (type === 'message_delta') {
+          const d = j.delta || {};
+          if (d.stop_reason) ev.push({ t: 'stop', r: finishFromStopReason(d.stop_reason) });
+          const u = j.usage || {};
+          if (u.output_tokens !== undefined) ev.push({ t: 'usage', in: 0, out: Number(u.output_tokens) || 0 });
+          return ev;
+        }
+        return ev;
+      }
+
+      if (wire === 'openai-responses') {
+        const type = String(evtName || j.type || '');
+        if (type === 'response.output_text.delta' && typeof j.delta === 'string') { ev.push({ t: 'text', d: j.delta }); return ev; }
+        if (type === 'response.reasoning_summary_text.delta' && typeof j.delta === 'string') { ev.push({ t: 'think', d: j.delta }); return ev; }
+        if (type === 'response.output_item.added') {
+          const it = j.item || {};
+          if (it.type === 'function_call') ev.push({ t: 'tool', i: Number(j.output_index) || 0, id: String(it.call_id || it.id || ''), name: String(it.name || '') });
+          return ev;
+        }
+        if (type === 'response.function_call_arguments.delta' && typeof j.delta === 'string') { ev.push({ t: 'args', i: Number(j.output_index) || 0, d: j.delta }); return ev; }
+        if (type === 'response.completed' || type === 'response.incomplete') {
+          const r = j.response || {};
+          const u = r.usage || {};
+          if (u.input_tokens !== undefined || u.output_tokens !== undefined) {
+            ev.push({ t: 'usage', in: Number(u.input_tokens) || 0, out: Number(u.output_tokens) || 0 });
+          }
+          const hasCall = (Array.isArray(r.output) ? r.output : []).some((x) => x && x.type === 'function_call');
+          ev.push({ t: 'stop', r: hasCall ? 'tool_calls' : (/incomplete/.test(type) ? 'length' : 'stop') });
+          ev.push({ t: 'end' });
+          return ev;
+        }
+        return ev;
+      }
+      return ev;
+    },
+  };
+}
+
+/**
+ * 建一个客户端 SSE 编码器：canonical 事件 → 客户端帧。
+ * @param {object} ctx { res, model, inputTokens } —— inputTokens 用于 Anthropic 的 message_start
+ */
+function makeStreamEncoder(wire, ctx) {
+  const res = ctx.res;
+  let started = false;
+  let blockIndex = -1;
+  let openKind = null;         // 'text' | 'think' | 'tool'
+  let stopReason = 'end_turn';
+  const toolSlots = new Map(); // canonical slot → { blockIndex, id }
+  let usageIn = ctx.inputTokens || 0;
+  let usageOut = 0;
+  let ended = false;
+
+  const start = () => {
+    if (started) return;
+    started = true;
+    if (wire === 'anthropic-messages') {
+      sseWrite(res, 'message_start', {
+        type: 'message_start',
+        message: {
+          id: 'msg_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24),
+          type: 'message', role: 'assistant', model: ctx.model,
+          content: [], stop_reason: null, stop_sequence: null,
+          usage: { input_tokens: usageIn, output_tokens: 0 },
+        },
+      });
+      return;
+    }
+    if (wire === 'openai-responses') {
+      sseWrite(res, 'response.created', {
+        type: 'response.created',
+        response: { id: 'resp_' + crypto.randomUUID().replace(/-/g, '').slice(0, 20), object: 'response', status: 'in_progress', model: ctx.model, output: [] },
+      });
+      return;
+    }
+    // openai-chat
+    sseWrite(res, 'message', {
+      id: 'chatcmpl-' + crypto.randomUUID().replace(/-/g, '').slice(0, 20),
+      object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: ctx.model,
+      choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
+    });
+  };
+
+  const closeAnthropicBlock = () => {
+    if (wire !== 'anthropic-messages' || openKind === null) return;
+    sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: blockIndex });
+    openKind = null;
+  };
+
+  return {
+    /** 收尾：写出结束帧。**幂等** —— 上游给了结束帧、pump 收尾又调一次也不会重复写。 */
+    finish() {
+      if (ended) return;
+      ended = true;
+      start();
+      if (wire === 'anthropic-messages') {
+        closeAnthropicBlock();
+        sseWrite(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: usageOut } });
+        sseWrite(res, 'message_stop', { type: 'message_stop' });
+        return;
+      }
+      if (wire === 'openai-responses') {
+        sseWrite(res, 'response.completed', {
+          type: 'response.completed',
+          response: {
+            id: 'resp_' + crypto.randomUUID().replace(/-/g, '').slice(0, 20),
+            object: 'response', status: 'completed', model: ctx.model, output: [],
+            usage: { input_tokens: usageIn, output_tokens: usageOut, total_tokens: usageIn + usageOut },
+          },
+        });
+        return;
+      }
+      sseWrite(res, 'message', {
+        id: 'chatcmpl', object: 'chat.completion.chunk', created: 0, model: ctx.model,
+        choices: [{ index: 0, delta: {}, finish_reason: stopReason || 'stop' }],
+        usage: { prompt_tokens: usageIn, completion_tokens: usageOut, total_tokens: usageIn + usageOut },
+      });
+      try { res.write('data: [DONE]\n\n'); } catch { /* 客户端已断开 */ }
+    },
+    emit(events) {
+      for (const e of events) {
+        if (!e) continue;
+        start();
+        if (wire === 'anthropic-messages') {
+          if (e.t === 'text' || e.t === 'think') {
+            const kind = e.t === 'text' ? 'text' : 'think';
+            if (openKind !== kind) {
+              closeAnthropicBlock();
+              blockIndex++;
+              openKind = kind;
+              sseWrite(res, 'content_block_start', {
+                type: 'content_block_start', index: blockIndex,
+                content_block: kind === 'text' ? { type: 'text', text: '' } : { type: 'thinking', thinking: '' },
+              });
+            }
+            sseWrite(res, 'content_block_delta', {
+              type: 'content_block_delta', index: blockIndex,
+              delta: kind === 'text' ? { type: 'text_delta', text: e.d } : { type: 'thinking_delta', thinking: e.d },
+            });
+          } else if (e.t === 'tool') {
+            closeAnthropicBlock();
+            blockIndex++;
+            openKind = 'tool';
+            toolSlots.set(e.i, { blockIndex, id: e.id });
+            sseWrite(res, 'content_block_start', {
+              type: 'content_block_start', index: blockIndex,
+              content_block: { type: 'tool_use', id: e.id || ('toolu_' + Math.random().toString(36).slice(2, 10)), name: e.name || '' },
+            });
+          } else if (e.t === 'args') {
+            const slot = toolSlots.get(e.i);
+            if (slot) sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: slot.blockIndex, delta: { type: 'input_json_delta', partial_json: e.d } });
+          } else if (e.t === 'stop') {
+            stopReason = e.r === 'tool_calls' ? 'tool_use' : stopReasonFromFinish(e.r);
+            if (e.r === 'tool_calls') stopReason = 'tool_use';
+            else if (e.r === 'length') stopReason = 'max_tokens';
+            else stopReason = 'end_turn';
+          } else if (e.t === 'usage') {
+            if (e.in) usageIn = e.in;
+            if (e.out) usageOut = e.out;
+          } else if (e.t === 'end') {
+            this.finish();
+          }
+          continue;
+        }
+        if (wire === 'openai-responses') {
+          if (e.t === 'text') sseWrite(res, 'response.output_text.delta', { type: 'response.output_text.delta', item_id: 'msg_out', output_index: 0, delta: e.d });
+          else if (e.t === 'think') sseWrite(res, 'response.reasoning_summary_text.delta', { type: 'response.reasoning_summary_text.delta', item_id: 'rs_out', output_index: -1, delta: e.d });
+          else if (e.t === 'tool') sseWrite(res, 'response.output_item.added', { type: 'response.output_item.added', output_index: e.i, item: { id: e.id || 'fc_out', type: 'function_call', status: 'in_progress', call_id: e.id || '', name: e.name || '', arguments: '' } });
+          else if (e.t === 'args') sseWrite(res, 'response.function_call_arguments.delta', { type: 'response.function_call_arguments.delta', item_id: 'fc_out', output_index: e.i, delta: e.d });
+          else if (e.t === 'usage') { if (e.in) usageIn = e.in; if (e.out) usageOut = e.out; }
+          else if (e.t === 'stop') stopReason = e.r;
+          else if (e.t === 'end') this.finish();
+          continue;
+        }
+        // openai-chat
+        if (e.t === 'text' || e.t === 'think') {
+          const delta = e.t === 'text' ? { content: e.d } : { reasoning_content: e.d };
+          sseWrite(res, 'message', { id: 'chatcmpl', object: 'chat.completion.chunk', created: 0, model: ctx.model, choices: [{ index: 0, delta, finish_reason: null }] });
+        } else if (e.t === 'tool') {
+          sseWrite(res, 'message', {
+            id: 'chatcmpl', object: 'chat.completion.chunk', created: 0, model: ctx.model,
+            choices: [{ index: 0, delta: { tool_calls: [{ index: e.i, id: e.id || '', type: 'function', function: { name: e.name || '', arguments: '' } }] }, finish_reason: null }],
+          });
+        } else if (e.t === 'args') {
+          sseWrite(res, 'message', {
+            id: 'chatcmpl', object: 'chat.completion.chunk', created: 0, model: ctx.model,
+            choices: [{ index: 0, delta: { tool_calls: [{ index: e.i, function: { arguments: e.d } }] }, finish_reason: null }],
+          });
+        } else if (e.t === 'usage') {
+          if (e.in) usageIn = e.in;
+          if (e.out) usageOut = e.out;
+        } else if (e.t === 'stop') {
+          stopReason = e.r;
+        } else if (e.t === 'end') {
+          this.finish();
+        }
+      }
+    },
+  };
+}
+
+/** 把上游 SSE 逐帧喂给解码器，再编码给客户端。 */
+async function pumpMatrixStream({ res, upstream, upstreamWire, clientWire, model, inputTokens, headBytes }) {
+  const decoder = makeStreamDecoder(upstreamWire);
+  const encoder = makeStreamEncoder(clientWire, { res, model, inputTokens });
+  const reader = upstream.body.getReader();
+  const td = new TextDecoder();
+  let buf = headBytes ? Buffer.from(headBytes).toString('utf8') : '';
+  let curEvent = '';
+  let sawEnd = false;
+
+  // ⚠ 必须做成**可重复调用**的：forward 里的"首事件偷看"会把开头那段（对流式短响应来说
+  // 往往就是**全部**）先读进 headBytes，于是下面的 read 循环第一次就拿到 done:true ——
+  // 如果只在循环体里解析缓冲区，那些已读字节**永远不会被解析**，客户端收到 200 + 空 body。
+  // 实测就是这个现象：5 个跨协议格子全部 200/0 字节。
+  const flush = () => {
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).replace(/\r$/, '');
+      buf = buf.slice(nl + 1);
+      if (line.startsWith('event:')) { curEvent = line.slice(6).trim(); continue; }
+      if (!line.startsWith('data:')) { if (line === '') curEvent = ''; continue; }
+      const payload = line.slice(5).trim();
+      if (!payload) continue;
+      if (payload === '[DONE]') { sawEnd = true; encoder.finish(); continue; }
+      let json = null;
+      try { json = JSON.parse(payload); } catch { continue; }
+      encoder.emit(decoder.feed(curEvent, json));
+    }
+  };
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += td.decode(value, { stream: true });
+      flush();
+    }
+    flush();   // 收尾：偷看过的字节可能整条都在 buf 里（见上面的说明）
+  } finally {
+    try { reader.releaseLock(); } catch { /* 忽略 */ }
+  }
+  // 上游没有明确的结束帧时（如 Anthropic 的 message_stop 不映射成事件）也要收尾，
+  // 否则客户端会一直等 message_stop / response.completed / [DONE]。
+  if (!sawEnd) encoder.finish();
+}
+
+/** canonical 事件 → chat 的完整响应（用于"上游流式、客户端要非流式"）。 */
+function canonicalToChatCompletion(acc, model) {
+  const msg = { role: 'assistant', content: acc.text || '' };
+  if (acc.thinking) msg.reasoning_content = acc.thinking;
+  if (acc.tools.length) {
+    msg.tool_calls = acc.tools.map((t) => ({
+      id: t.id || ('call_' + Math.random().toString(36).slice(2, 10)),
+      type: 'function',
+      function: { name: t.name || '', arguments: t.args || '{}' },
+    }));
+  }
+  let finish = 'stop';
+  if (acc.tools.length) finish = 'tool_calls';
+  else if (acc.stop === 'length' || acc.stop === 'max_tokens') finish = 'length';
+  else if (acc.stop === 'content_filter') finish = 'content_filter';
+  const inTok = acc.usageIn || 0;
+  const outTok = acc.usageOut || 0;
+  return {
+    id: 'chatcmpl-' + Math.random().toString(36).slice(2, 14),
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message: msg, finish_reason: finish }],
+    usage: { prompt_tokens: inTok, completion_tokens: outTok, total_tokens: inTok + outTok },
+  };
+}
+
+/** 把 canonical 事件累积成完整响应（不写任何东西到 res）。 */
+function makeCanonicalCollector() {
+  const acc = { text: '', thinking: '', tools: [], stop: 'stop', usageIn: 0, usageOut: 0 };
+  const bySlot = new Map();
+  return {
+    acc,
+    feed(events) {
+      for (const e of events) {
+        if (!e) continue;
+        if (e.t === 'text') acc.text += e.d;
+        else if (e.t === 'think') acc.thinking += e.d;
+        else if (e.t === 'tool') {
+          const t = { id: e.id, name: e.name, args: '' };
+          bySlot.set(e.i, t);
+          acc.tools.push(t);
+        } else if (e.t === 'args') {
+          const t = bySlot.get(e.i);
+          if (t) t.args += e.d;
+        } else if (e.t === 'stop') acc.stop = e.r;
+        else if (e.t === 'usage') { if (e.in) acc.usageIn = e.in; if (e.out) acc.usageOut = e.out; }
+      }
+    },
+  };
+}
+
+/** 从上游流里按 canonical 管线读干净（用于聚合）。 */
+async function drainCanonicalStream({ upstream, upstreamWire, collector, headBytes }) {
+  const decoder = makeStreamDecoder(upstreamWire);
+  const reader = upstream.body.getReader();
+  const td = new TextDecoder();
+  let buf = headBytes ? Buffer.from(headBytes).toString('utf8') : '';
+  let curEvent = '';
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += td.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).replace(/\r$/, '');
+        buf = buf.slice(nl + 1);
+        if (line.startsWith('event:')) { curEvent = line.slice(6).trim(); continue; }
+        if (!line.startsWith('data:')) { if (line === '') curEvent = ''; continue; }
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        let json = null;
+        try { json = JSON.parse(payload); } catch { continue; }
+        collector.feed(decoder.feed(curEvent, json));
+      }
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* 忽略 */ }
+  }
+}
+
+/**
+ * 矩阵响应分支：上游协议 ≠ 客户端协议时，翻译后再写给客户端。
+ *
+ * 调用位置很关键（在 forward 里）：**必须晚于"首事件偷看"**（那时才确认上游给的是正常流），
+ * 又**必须早于任何 res.writeHead** —— 一旦写了响应头，形状就改不了了。
+ */
+async function forwardMatrixResponse({ res, upstream, bodyStream, ctype, pendingHead, mx }) {
+  const isSse = !!bodyStream && /event-stream/i.test(ctype);
+  log(`[matrix] 进入响应翻译：upstream=${mx.upstreamWire} client=${mx.clientWire} `
+    + `isSse=${isSse} clientStream=${mx.clientStream} ctype=${ctype} head=${pendingHead ? pendingHead.length : 0}B`);
+  const headers = {
+    'content-type': mx.clientStream ? 'text/event-stream' : 'application/json',
+    'cache-control': 'no-cache',
+    'access-control-allow-origin': '*',
+  };
+
+  // ① 客户端要流式 + 上游是流式 → 真正的逐帧翻译
+  if (isSse && mx.clientStream) {
+    try { res.writeHead(200, headers); } catch (e) { log(`client disconnected before headers: ${e.message}`); return false; }
+    await pumpMatrixStream({
+      res, upstream, upstreamWire: mx.upstreamWire, clientWire: mx.clientWire,
+      model: mx.model, inputTokens: mx.inputTokens, headBytes: pendingHead,
+    });
+    if (!res.destroyed && !res.writableEnded) { try { res.end(); } catch { /* 忽略 */ } }
+    return true;
+  }
+
+  // ② 其余情况：先把上游读成 canonical，再整体编成客户端要的形状
+  //    （上游流式而客户端要非流式时，这一步顺便完成了聚合）
+  let canon;
+  if (isSse) {
+    const col = makeCanonicalCollector();
+    // 客户端要非流式，但上游已经在流了：把偷看过的首块也喂回去
+    await drainCanonicalStream({ upstream, upstreamWire: mx.upstreamWire, collector: col, headBytes: pendingHead });
+    canon = canonicalToChatCompletion(col.acc, mx.model);
+  } else {
+    let text = '';
+    try {
+      text = pendingHead && pendingHead.length ? Buffer.from(pendingHead).toString('utf8') : '';
+      if (upstream.body) {
+        const rd = upstream.body.getReader();
+        const td = new TextDecoder();
+        for (;;) {
+          const { done, value } = await rd.read();
+          if (done) break;
+          text += td.decode(value, { stream: true });
+        }
+        try { rd.releaseLock(); } catch { /* 忽略 */ }
+      }
+    } catch (e) {
+      log(`matrix: 读上游响应失败：${e && e.message}`);
+      return false;
+    }
+    let json = null;
+    try { json = JSON.parse(text); } catch (e) {
+      log(`matrix: 上游响应不是合法 JSON（${mx.upstreamWire} → ${mx.clientWire}）：${String(text).slice(0, 120)}`);
+      return false;
+    }
+    // 已经是 canonical(chat) 就不用再过一遍 collector
+    if (mx.upstreamWire === 'openai-chat') canon = json;
+    else canon = mx.upstreamWire === 'anthropic-messages'
+      ? anthropicMessageToChatCompletion(json, mx.model)
+      : responsesToChatCompletion(json, mx.model);
+  }
+
+  if (res.destroyed || res.writableEnded) return false;
+  // ⚠ 客户端要流式、而上游给了完整 JSON（上游不支持流式 / 我们翻译时没带上 stream）：
+  // **仍然要按客户端协议合成一条 SSE 流**，不能回非流式 JSON ——
+  // 流式客户端拿到 application/json 会解析失败或一直等 message_stop。
+  if (mx.clientStream) {
+    try { res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', 'access-control-allow-origin': '*' }); }
+    catch (e) { log(`client disconnected before headers: ${e.message}`); return false; }
+    const enc = makeStreamEncoder(mx.clientWire, { res, model: mx.model, inputTokens: mx.inputTokens });
+    enc.emit(chatCompletionToCanonicalEvents(canon));
+    enc.finish();
+    if (!res.destroyed && !res.writableEnded) { try { res.end(); } catch { /* 忽略 */ } }
+    return true;
+  }
+  const payload = mx.clientWire === 'openai-chat'
+    ? canon
+    : (mx.clientWire === 'anthropic-messages'
+      ? openaiToAnthropicMessage(canon, mx.model, mx.inputTokens)
+      : chatToResponsesResponse(canon, mx.model));
+  // ⚠ 不要在这里先 res.writeHead()：json() 内部自己会 writeHead，
+  // 重复写头会抛 ERR_HTTP_HEADERS_SENT，而这句抛错被 json 自己的 try/catch 吞掉 →
+  // **响应永远不 end，客户端一路挂到超时**（实测：网关日志记 status=ok，客户端却 TIMEOUT）。
+  json(res, 200, payload);
+  return true;
+}
+
+/** 把一条完整的 chat completion 拆成 canonical 事件（用于"上游非流式、客户端要流式"）。 */
+function chatCompletionToCanonicalEvents(json) {
+  const ev = [];
+  const j = json && typeof json === 'object' ? json : {};
+  const choice = (Array.isArray(j.choices) ? j.choices[0] : null) || {};
+  const msg = choice.message || {};
+  const think = reasoningTextOf(msg);
+  if (think) ev.push({ t: 'think', d: think });
+  if (typeof msg.content === 'string' && msg.content) ev.push({ t: 'text', d: msg.content });
+  const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+  calls.forEach((c, i) => {
+    ev.push({ t: 'tool', i, id: String(c.id || ''), name: String((c.function && c.function.name) || '') });
+    const args = (c.function && c.function.arguments) || '';
+    if (args) ev.push({ t: 'args', i, d: String(args) });
+  });
+  const u = j.usage || {};
+  if (u.prompt_tokens !== undefined || u.completion_tokens !== undefined) {
+    ev.push({ t: 'usage', in: Number(u.prompt_tokens) || 0, out: Number(u.completion_tokens) || 0 });
+  }
+  ev.push({ t: 'stop', r: calls.length ? 'tool_calls' : (choice.finish_reason === 'length' ? 'length' : 'stop') });
+  ev.push({ t: 'end' });
+  return ev;
+}
 
 /** OpenAI 非流式响应 → Anthropic message */
 function openaiToAnthropicMessage(json, model, fallbackInTokens) {
@@ -5012,19 +6086,43 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
     // 透传 dsh 原始请求标识（K1 防屏蔽）/ 仿真模式（V2: clientProfile）：clientHeaders = req.headers
     // Responses：记录 response.id → provider 亲和（后续 GET/DELETE/cancel/input_items 与多轮都靠它）
     let sniffed = false;
-    const fwdOpts = responsesMode ? {
-      responses: true,
-      onSniff: (text) => {
-        if (sniffed) return true;
-        const id = sniffResponseId(text);
-        if (!id) return false;
-        sniffed = true;
-        affinitySet(id, p.id);
-        log(`responses affinity: ${id} → ${p.id}`);
-        return true;
-      },
-    } : undefined;
-    const out = await forwardWithAccounts(p, upstreamPath.replace(/^\/v1/, '') + search, passthroughHeaders(req.headers, p.apiKey, cfg.clientUA, effectiveClientProfile(cfg, p), cfg), attemptBody, res, fwdOpts);
+    // ── 协议矩阵：这家上游对这个模型说的是哪条线协议？──
+    // 逐模型优先（`models: [{id, as, api}]`），其次供应商级 `protocol`，都没有就跟随客户端。
+    // 同协议 → 完全走原来的透传路径（一个字节都不多绕）；不同协议 → 翻译请求体 + 换上游路径，
+    // 并把 matrix 传给 forward，由它把响应翻回客户端的形状。
+    const clientWire = responsesMode ? 'openai-responses' : 'openai-chat';
+    const upWire = resolveUpstreamWire(p, model, bodyHasImage(body)) || clientWire;
+    const translating = upWire !== clientWire;
+    let sendBody = attemptBody;
+    let sendPath = upstreamPath.replace(/^\/v1/, '');
+    if (translating) {
+      sendBody = translateMatrixRequest(attemptBody, clientWire, upWire, p);
+      sendPath = upstreamPathOfWire(upWire);
+      log(`try ${p.id} for ${model} [matrix ${clientWire} → ${upWire}]`);
+    }
+    const fwdOpts = translating
+      // ⚠ 翻译后**不能**再传 responses:true —— 那会让 forward 按 Responses 形状去处理
+      // 一个已经变成别的协议的请求体（实测会在 translateResponsesBody 里把 input 拍平）。
+      ? { matrix: {
+        clientWire,
+        upstreamWire: upWire,
+        model,
+        inputTokens: estimateTokens(JSON.stringify((attemptBody && (attemptBody.messages || attemptBody.input)) || '')),
+        clientStream: stream,
+      } }
+      : (responsesMode ? {
+        responses: true,
+        onSniff: (text) => {
+          if (sniffed) return true;
+          const id = sniffResponseId(text);
+          if (!id) return false;
+          sniffed = true;
+          affinitySet(id, p.id);
+          log(`responses affinity: ${id} → ${p.id}`);
+          return true;
+        },
+      } : undefined);
+    const out = await forwardWithAccounts(p, sendPath + search, passthroughHeaders(req.headers, p.apiKey, cfg.clientUA, effectiveClientProfile(cfg, p), cfg), sendBody, res, fwdOpts);
     if (out === true) {
       log(`served ${model} via ${viaTag(p.id)}`);
       // 会话亲和记档：记的是**实际成功的那家**（可能是 failover 之后的一家），
@@ -5295,16 +6393,42 @@ async function handleMessages(cfg, req, res, body) {
     // 带图片时优先选声明了 vision 的那条上游 ID（见 upstreamIdFor）
     const attemptBody = bodyForProvider(outBody, p, model, bodyHasImage(body));
     const upModel = attemptBody.model;
-    // 上游线协议：声明 openai-chat 的家走协议翻译（客户端说 Anthropic，上游只会 OpenAI）
-    const toOpenAI = providerProtocol(p) === 'openai-chat';
-    log(`try ${p.id} for ${model} (${toOpenAI ? 'anthropic→openai' : 'anthropic'})${upModel !== model ? ' → ' + upModel : ''}`);
-    const baseHeaders = upstreamRequestHeaders(req.headers, p.apiKey, cfg.clientUA, !toOpenAI, effectiveClientProfile(cfg, p), cfg);
+    // 上游线协议：**逐模型 `api`** → 供应商 `protocol` → 跟随客户端（即 Anthropic 直通）。
+    // 逐模型这一层是协议矩阵的前提：同一个供应商里不同模型可能分属不同协议
+    //（实测 opencode-go：29 个 chat + 2 个 anthropic + 4 个 responses）。
+    const upWire = resolveUpstreamWire(p, model, bodyHasImage(body)) || 'anthropic-messages';
+    const toOpenAI = upWire === 'openai-chat';
+    const toResponses = upWire === 'openai-responses';
+    // 日志措辞刻意保持原样：直通时仍是 `(anthropic)`，只有真的跨协议才加 `→xxx`。
+    // 已有用例与用户的排查习惯都建立在这行日志上，措辞churn 没有收益。
+    const wireLabel = toOpenAI ? 'anthropic→openai' : (toResponses ? 'anthropic→responses' : 'anthropic');
+    log(`try ${p.id} for ${model} (${wireLabel})${upModel !== model ? ' → ' + upModel : ''}`);
+    // 认证头按**上游协议**选：Anthropic 路径发 x-api-key，chat/responses 发 Bearer
+    const baseHeaders = upstreamRequestHeaders(req.headers, p.apiKey, cfg.clientUA, !toOpenAI && !toResponses, effectiveClientProfile(cfg, p), cfg);
     // OpenCode 车道的动态会话头：**两条路径共用这一份 headers，就必须在这里补**
     //（只在 forward() 里补会让声明了 openai-chat 的那批模型全部 400 MissingSessionID）。
     applyOpencodeLaneHeaders(baseHeaders, attemptBody, p.id);
-    const out = toOpenAI
-      ? await forwardAnthropicViaOpenAI(p, baseHeaders, attemptBody, res, undefined)
-      : await forwardWithAccounts(p, '/messages', baseHeaders, attemptBody, res);
+    let out;
+    if (toResponses) {
+      // 协议矩阵：Anthropic 客户端 ← Responses 上游。
+      // 请求体 Anthropic→chat→Responses 在这里翻；响应由 forward 里的矩阵分支翻回 Anthropic
+      //（客户端仍收到标准的 message_start / content_block_delta 事件序列）。
+      out = await forwardWithAccounts(p, '/responses',
+        baseHeaders,
+        translateMatrixRequest(attemptBody, 'anthropic-messages', 'openai-responses', p),
+        res,
+        { matrix: {
+          clientWire: 'anthropic-messages',
+          upstreamWire: 'openai-responses',
+          model,
+          inputTokens: estimateTokens(JSON.stringify(attemptBody.messages || '')),
+          clientStream: !!body.stream,
+        } });
+    } else if (toOpenAI) {
+      out = await forwardAnthropicViaOpenAI(p, baseHeaders, attemptBody, res, undefined);
+    } else {
+      out = await forwardWithAccounts(p, '/messages', baseHeaders, attemptBody, res);
+    }
     if (out === true) {
       log(`served ${model} via ${viaTag(p.id)} (anthropic)`);
       logCall(`via=${viaTag(p.id)}`, 'ok');

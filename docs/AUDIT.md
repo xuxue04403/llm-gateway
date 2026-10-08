@@ -1073,6 +1073,85 @@ opencode-go（openai-chat → 走翻译路径）→ 29 个模型全部 400 Missi
 这解释了为什么本轮要**逐模型、逐路径**地端到端实测：8 个用例里特意覆盖了
 「chat 类 / Anthropic 类 / 带工具 / 流式 / 另一个端点」，就是为了让每条路径都被真的走过一次。
 
+---
+
+## P. 协议矩阵：任意客户端协议 × 任意上游协议（2026-10-08）
+
+用户要求：*"不论上游模型是什么协议，llm-gateway 对外需要同时提供 openai 和 Anthropic 协议，
+同时 openai 还得支持 responses"*。
+
+### P.1 先量现状：9 格里 5 格是坏的，而且**不报错**
+
+写了探针（`out/_matrix.cjs` / `_smatrix.cjs`）用假上游逐格实测。结果比从代码推断的更糟 ——
+坏掉的格子**返回 HTTP 200 带着错的响应体形状**：
+
+```
+改之前：
+  上游 \ 客户端      chat            anthropic        responses
+  openai-chat       ✅              ✅               ❌ 返回 chat 形状
+  anthropic-msgs    ❌ 返回 message  ✅               ❌
+  openai-responses  ❌              ❌               ✅
+```
+
+**静默错形状比报错难查一个量级**：客户端拿到 200，解析时才炸，而网关日志上一片 `status=ok`。
+
+### P.2 架构：以 **OpenAI chat** 为轴做双向归一
+
+不写 6 对互相翻译（12 个函数 + 组合爆炸），而是：
+
+```
+请求：  client 体 --decode--> canonical(chat) --encode--> 上游体
+响应：  上游体   --decode--> canonical(chat) --encode--> 客户端体
+流式：  上游帧   --decode--> canonical 事件 --encode--> 客户端帧
+```
+
+**14 个函数覆盖全部 9 格**，而且"跨两次"的格子（responses 客户端 → anthropic 上游）
+自动由串联得到，不用另写代码。
+
+轴选 chat 而不是 Anthropic：chat 的形状最通用（tools 自带 JSON Schema、工具调用与结果都在
+messages 里），Anthropic 与 Responses 都能无损落到它上面。既有的
+`anthropicToOpenAIRequest` / `openaiToAnthropicMessage` 正好就是轴的两侧，直接复用。
+
+**支撑矩阵的前提是逐模型 `api`**：`models: [{id, as, api}]`。
+实测 opencode-go 的 37 个模型里 29 个 chat + 2 个 anthropic + 4 个 responses ——
+只有供应商级 `protocol` 时只能挑一种，另外两种必然被上游拒。
+现在**一个供应商就能装下三种协议**，配置从 3 家收敛回 1 家。
+
+### P.3 实现中撞到的五个坑（全是实测抓到的）
+
+| # | 现象 | 根因 |
+|---|---|---|
+| 1 | chat 客户端收到 **Responses 形状** | `providerProtocol()` 不认 `openai-responses` → 落到 `return null` → 调用方以为"跟随客户端" → **矩阵根本不触发** |
+| 2 | 客户端 **TIMEOUT**（日志却记 `status=ok`） | 非流式分支里 `res.writeHead()` 之后又调 `json()` → 重复写头抛 `ERR_HTTP_HEADERS_SENT` → 被 `json` 自己的 try/catch 吞掉 → **响应永远不 end** |
+| 3 | 5 个跨协议格子 **200 + 空 body** | `pumpMatrixStream` 只在 read 循环体里解析缓冲区；而 forward 的"首事件偷看"会把开头那段（对流式短响应来说**往往就是全部**）先读走 → 循环第一次就 `done:true` → **那些字节永远不被解析**。修法：flush 做成可重复调用，循环后再 flush 一次 |
+| 4 | Anthropic 客户端 → Responses 上游 → 上游 **422** | 工具指纹按 `chat` 形状推，而 body 已经是 Responses 形状（tools 要**扁平**的 `{type,name,description,parameters}`）。**同一个"形状错"已经是第三次**（Anthropic 一次、Responses 一次）。修法：指纹按**上游线协议**给形状 |
+| 5 | 真实 grok 流式 **200 + 0 个事件** | `anthropicToOpenAIRequest` 不复制 `stream` 字段 → 上游收到 `stream:false` 回了 JSON，而客户端在等 SSE。同时在非流式分支补上"客户端要流式就**合成**一条 SSE"的分支（否则流式客户端会拿到 `application/json`） |
+
+坑 2、3、5 有个共同特征：**HTTP 200**。这也是本轮反复强调"探针要逐格实测"的原因 ——
+只看状态码会以为一切正常。
+
+### P.4 验收
+
+```
+假上游矩阵（9 格 × 流式/非流式，全部由回归测试固化）：
+  非流式 9/9 ✅      流式 9/9 ✅
+
+真实 opencode-go 端点（一个供应商 35 个模型、三种协议）：
+  /v1/messages        glm-5.3[chat] / deepseek-v4-flash[chat] / claude-haiku-5-5[anthropic]
+                      / minimax-m2.7[anthropic] / grok-4.7[responses] / gpt-6-luna[responses] → 全 200
+  /v1/chat/completions claude-haiku-5-5[anthropic] / grok-4.7[responses] → 全 200
+  /v1/responses        glm-5.3[chat] / grok-4.7[responses] → 全 200
+  流式 /v1/messages ← grok-4.7（Responses 上游）→ 15 个事件，message_start/message_stop 齐全
+
+测试：302 项全绿（299 → +3 矩阵用例）
+  协议矩阵（非流式）9 格 / 协议矩阵（流式）9 格 / 逐模型 api 覆盖供应商 protocol
+引擎差异校验：109 处声明改动，0 处未声明
+```
+
+**grok-4.6/4.7、gpt-5.6/6-luna 这 4 个模型从"用不了"变成"能用"** ——
+它们正是 O.2 里因为缺协议支持而被排除的那 4 个。
+
+
 ### O.6 第六轮全面审计：两路独立子代理 + 自查
 
 派了两路子代理（引擎请求路径 / writers+主进程），**两路都在写报告前失败了** ——

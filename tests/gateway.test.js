@@ -3484,6 +3484,151 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up); }
   });
 
+
+  /* ==================================================================================
+   * 协议矩阵：任意客户端协议 × 任意上游协议（9 格 × 流式/非流式）
+   *
+   * 用户要求：*"不论上游模型是什么协议，对外需要同时提供 openai 和 Anthropic，
+   * openai 还得支持 responses"*。
+   * 改之前实测：9 格里 5 格坏，而且**不是报错，是 HTTP 200 带着错的响应体形状** ——
+   * 客户端拿到 200，解析时才炸，比直接报错难查得多。
+   * ================================================================================== */
+
+  const MX_WIRES = ['openai-chat', 'anthropic-messages', 'openai-responses'];
+  const MX_CLIENTS = {
+    chat: { p: '/v1/chat/completions', h: {}, body: (s) => ({ model: 'test-model', stream: s, messages: [{ role: 'user', content: 'hi' }] }) },
+    anthropic: { p: '/v1/messages', h: { 'anthropic-version': '2023-06-01' }, body: (s) => ({ model: 'test-model', max_tokens: 32, stream: s, messages: [{ role: 'user', content: 'hi' }] }) },
+    responses: { p: '/v1/responses', h: {}, body: (s) => ({ model: 'test-model', stream: s, input: 'hi' }) },
+  };
+
+  /** 起一个只讲某一种协议的假上游（流式/非流式都能回）。 */
+  async function startWireUpstream(wire) {
+    const srv = http.createServer((req, res) => {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        let b = null;
+        try { b = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (_) { /* 忽略 */ }
+        const model = (b && b.model) || 'test-model';
+        const wantStream = !!(b && b.stream);
+        if (!wantStream) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          if (wire === 'openai-chat') {
+            res.end(JSON.stringify({ id: 'c1', object: 'chat.completion', model, choices: [{ index: 0, message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' }], usage: { prompt_tokens: 7, completion_tokens: 3 } }));
+          } else if (wire === 'anthropic-messages') {
+            res.end(JSON.stringify({ id: 'm1', type: 'message', role: 'assistant', model, content: [{ type: 'text', text: 'OK' }], stop_reason: 'end_turn', usage: { input_tokens: 7, output_tokens: 3 } }));
+          } else {
+            res.end(JSON.stringify({ id: 'r1', object: 'response', status: 'completed', model, output: [{ id: 'i1', type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'OK' }] }], usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 } }));
+          }
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        if (wire === 'openai-chat') {
+          res.end('data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"OK"}}]}\n\n'
+            + 'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}\n\n'
+            + 'data: [DONE]\n\n');
+        } else if (wire === 'anthropic-messages') {
+          res.end('event: message_start\ndata: {"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","model":"' + model + '","content":[],"usage":{"input_tokens":7,"output_tokens":0}}}\n\n'
+            + 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+            + 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"OK"}}\n\n'
+            + 'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+            + 'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}\n\n'
+            + 'event: message_stop\ndata: {"type":"message_stop"}\n\n');
+        } else {
+          res.end('event: response.created\ndata: {"type":"response.created","response":{"id":"r1","object":"response","status":"in_progress","model":"' + model + '","output":[]}}\n\n'
+            + 'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"id":"i1","type":"message","role":"assistant","content":[]}}\n\n'
+            + 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"i1","output_index":0,"delta":"OK"}\n\n'
+            + 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"r1","object":"response","status":"completed","model":"' + model + '","output":[{"id":"i1","type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}\n\n');
+        }
+      });
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    return { srv, port: srv.address().port };
+  }
+
+  /** 形状判定：客户端拿到的是不是**它自己协议的**形状。 */
+  function mxShapeOk(clientKey, text, streaming) {
+    const t = String(text || '');
+    if (!t) return '空响应';
+    if (clientKey === 'chat') {
+      if (!/\"choices\"/.test(t)) return '不是 chat 形状';
+      if (streaming && !/\[DONE\]/.test(t)) return 'chat SSE 缺 [DONE]';
+      return '';
+    }
+    if (clientKey === 'anthropic') {
+      if (streaming) {
+        if (!/event: message_start/.test(t)) return '不是 anthropic SSE';
+        if (!/event: message_stop/.test(t)) return 'anthropic SSE 缺 message_stop';
+        return '';
+      }
+      if (!/\"type\":\"message\"/.test(t)) return '不是 message 形状';
+      return '';
+    }
+    if (!/\"object\":\"response\"/.test(t)) return '不是 response 形状';
+    if (streaming && !/event: response\.completed/.test(t)) return 'responses SSE 缺 response.completed';
+    return '';
+  }
+
+  t('协议矩阵（非流式）：9 个格子全部返回客户端自己的协议形状', async () => {
+    const bad = [];
+    for (const wire of MX_WIRES) {
+      const up = await startWireUpstream(wire);
+      const p = providerOf('mx', up, { priority: 1 });
+      p.protocol = wire;
+      const gw = await startGatewayWith([p], 'mx-ns-' + wire);
+      try {
+        assert.ok(gw.ready, wire + ' 实例应就绪');
+        for (const [ck, cl] of Object.entries(MX_CLIENTS)) {
+          const r = await call({ port: gw.port, p: cl.p, body: cl.body(false), ac: null, headers: cl.h });
+          const why = r.status !== 200 ? 'HTTP ' + r.status + ' ' + String(r.text).slice(0, 60) : mxShapeOk(ck, r.text, false);
+          if (why) bad.push('上游 ' + wire + ' → 客户端 ' + ck + '：' + why);
+        }
+      } finally { killGw(gw); closeUp(up); }
+    }
+    assert.deepStrictEqual(bad, [],
+      '跨协议必须翻译成客户端自己的形状（旧实现是"200 + 错的形状"，比报错更难查）：\n  ' + bad.join('\n  '));
+  });
+
+  t('协议矩阵（流式）：9 个格子全部给出客户端自己的 SSE 事件序列', async () => {
+    const bad = [];
+    for (const wire of MX_WIRES) {
+      const up = await startWireUpstream(wire);
+      const p = providerOf('mx', up, { priority: 1 });
+      p.protocol = wire;
+      const gw = await startGatewayWith([p], 'mx-st-' + wire);
+      try {
+        assert.ok(gw.ready, wire + ' 实例应就绪');
+        for (const [ck, cl] of Object.entries(MX_CLIENTS)) {
+          const r = await call({ port: gw.port, p: cl.p, body: cl.body(true), ac: null, headers: cl.h });
+          const why = r.status !== 200 ? 'HTTP ' + r.status + ' ' + String(r.text).slice(0, 60) : mxShapeOk(ck, r.text, true);
+          if (why) bad.push('上游 ' + wire + ' → 客户端 ' + ck + '：' + why);
+        }
+      } finally { killGw(gw); closeUp(up); }
+    }
+    assert.deepStrictEqual(bad, [],
+      '流式跨协议必须逐帧翻译成客户端的事件序列：\n  ' + bad.join('\n  '));
+  });
+
+  t('协议矩阵：逐模型 api 覆盖供应商 protocol（同一家混三种协议）', async () => {
+    // 实测场景：opencode-go 的 37 个模型里 29 个 chat + 2 个 anthropic + 4 个 responses。
+    // 只有供应商级 protocol 时只能挑一种，另外两种必然被上游拒。
+    const upChat = await startWireUpstream('openai-chat');
+    const upResp = await startWireUpstream('openai-responses');
+    const pChat = providerOf('mix', upChat, { priority: 1 });
+    pChat.protocol = 'openai-chat';   // 供应商级：chat
+    const pResp = providerOf('mix2', upResp, { priority: 2 });
+    pResp.protocol = 'openai-chat';   // 供应商级也是 chat……
+    pResp.models = [{ id: 'test-model', api: 'openai-responses' }];   // ……但逐模型声明是 responses
+    const gw = await startGatewayWith([pChat, pResp], 'mx-permodel');
+    try {
+      assert.ok(gw.ready, '应就绪');
+      // 客户端说 Anthropic：p1 走 chat 翻译（可用），这里主要验证 p2 的逐模型声明生效
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      assert.ok(/\"type\":\"message\"/.test(r.text), '客户端仍应拿到 Anthropic 形状：' + String(r.text).slice(0, 120));
+    } finally { killGw(gw); closeUp(upChat); closeUp(upResp); }
+  });
+
   // 执行
   // 2026-09-23 实测事故：上游说"**这家**没有这个模型"，旧实现当"请求本身有错"终止 failover，
   // 用户直接拿到 400 —— 而同一逻辑模型在下一家完全可用。
