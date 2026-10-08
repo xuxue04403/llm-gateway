@@ -186,6 +186,7 @@ const DECLARED = [
   { name: 'forward', why: '修：直通路径新增"上游 200 但 content-type 既不是 JSON 也不是 SSE"检测 → 502。真实高频形态是反代插的 HTML 错误页，旧实现把它原样配 200 透传，客户端拿到"成功"却解析失败而网关日志一片干净（四条路径里只有这条不一致）' },
   { name: 'UPSTREAM_BROKEN_4XX_RE', why: '新增：识别「上游自己坏了却包成 4xx」。bad_response_status_code 是 new-api/one-api 系的错误码，语义就是「我转发出去的那个上游返回了坏状态码」，属供应商侧故障；旧的「确定性 4xx 一律终止 failover」把它当成请求侧问题，于是优先级更高但坏掉的那家直接把请求打死。实测：h-e.top 优先级 1 对 glm-5.3-flash 回这个 400，而 opencode-go 优先级 3 明明能服务该模型却根本没被尝试。三处判据都已加。' },
   { name: 'DETERMINISTIC_4XX_STATUS', why: '仅前导注释块位置变化（常量本身一字未改）' },
+  { name: 'resolveWorkBuddyCredential', why: '修：分辨「没登录」与「格式变了」。WorkBuddy 桌面版新版把 accessToken/refreshToken 改成 AES-GCM 加密存储（{ $wbEncrypted: 1, envelope }），而本程序读的是明文字段 → 必然 null。旧实现一律报「未登录或已失效」，把用户引向反复重新登录（徒劳）。现在检测到加密形态就明说：密钥不在本机、重新登录没用、可选处置有哪三条。' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

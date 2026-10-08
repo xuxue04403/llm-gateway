@@ -1615,14 +1615,37 @@ async function resolveWorkBuddyCredential(provider, acct) {
     let desktop = null;
     // authFile 留空 → 按平台默认位置自动发现（配置里不必写死机器相关路径）
     const authFile = acct.authFile || findWorkbuddyAuthFile();
+    let authText = '';
     try {
-      if (authFile) desktop = parseWorkBuddyAuth(fs.readFileSync(authFile, 'utf8'));
+      if (authFile) { authText = fs.readFileSync(authFile, 'utf8'); desktop = parseWorkBuddyAuth(authText); }
     } catch (e) {
       if (!own) throw new Error(`读凭据文件失败：${authFile}（${e && e.message}）`);
     }
     // 身份优先：桌面文件是"当前登录的是谁"的权威；自留副本可能是旧账号
     let cred = desktop || own;
     if (!cred) {
+      // ⚠ 先分辨"没登录"和"**格式变了**"——这两种情况的处置完全不同，而旧实现一律报
+      // "未登录或已失效"，把用户引向反复重新登录（徒劳）。
+      //
+      // 实测（2026-10-08）：WorkBuddy 桌面版新版把 token 改成了**加密存储** ——
+      //   auth.accessToken 不再是字符串，而是 { $wbEncrypted: 1, envelope: "<base64>" }，
+      //   envelope 解出来是 { suite:1, keyId, nonce, authTag, ciphertext }（AES-GCM）。
+      // 本程序读的是明文字段（`typeof auth.accessToken === 'string'`），于是必然为 null。
+      // 解密密钥**不在本机可读位置**（CodeBuddyExtension 目录下只有这一个 .info 文件），
+      // 所以这不是"再登录一次"能好的 —— 必须等 WorkBuddy 侧提供可读凭据，
+      // 或者在配置里直接给该账户写 `apiKey`。
+      const encryptedForm = /"\$wbEncrypted"\s*:\s*1/.test(authText);
+      if (encryptedForm) {
+        throw new Error(
+          `账户 ${acct.id} 的凭据文件是**加密格式**，本程序读不了：${authFile}`
+          + '｜WorkBuddy 桌面版新版把 accessToken/refreshToken 用 AES-GCM 加密存储'
+          + '（字段形如 {"$wbEncrypted":1,"envelope":"…"}），而本程序只能读明文 token。'
+          + '解密密钥不在 CodeBuddyExtension 目录里，**重新登录也没用**。'
+          + '可选处置：① 在该账户的配置里直接写 apiKey；'
+          + '② 用旧版 WorkBuddy 桌面端登录一次以生成明文凭据；'
+          + '③ 等本程序支持该加密格式。',
+        );
+      }
       throw new Error(authFile
         ? `账户 ${acct.id} 无可用凭据：${authFile} 未登录或已失效`
         : `账户 ${acct.id} 未找到 WorkBuddy 登录凭据——请先安装并登录 WorkBuddy 桌面 App`
