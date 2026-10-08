@@ -6818,8 +6818,11 @@ async function routeRequest(cfg, req, res) {
         'access-control-allow-headers': req.headers['access-control-request-headers']
           || 'authorization, x-api-key, anthropic-version, anthropic-beta, content-type, accept',
         'access-control-max-age': '86400',
-        'content-length': '0',
       });
+      // ⚠ **必须 end**。只 writeHead 不 end 的话响应永不结束 —— 客户端一路挂到超时
+      //（实测：OPTIONS 拿到 st=0 / TIMEOUT，而 POST 正常 401，很容易误判成"预检被拒"）。
+      // 204 本身不能带 body，所以 end() 不带参数，也不要手写 content-length。
+      res.end();
       return;
     }
 
