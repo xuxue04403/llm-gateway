@@ -204,6 +204,17 @@ const DECLARED = [
   { name: 'workbuddyAtRestLastError', why: '新增：上次探测失败的原因，冷却期内直接抛它（不再 spawn）' },
   { name: 'WORKBUDDY_AT_REST_FAIL_COOLDOWN_MS', why: '新增：失败冷却时长，默认 5 分钟（DSH_GATEWAY_WB_KEY_COOLDOWN_MS 可覆盖，设 0 关闭）' },
   { name: 'WORKBUDDY_AT_REST_TIMEOUT_MS', why: '修：单候选超时 60s → 15s。实测本机取 payload 只要 146–537ms，60s 是三个数量级的余量，而它乘上候选数就是最坏等待（一个卡住的候选挡住后面全部）。15s 仍是实测值的 30 倍以上，最坏路径从 3 分钟降到 45 秒。DSH_GATEWAY_WB_KEY_TIMEOUT_MS 可覆盖' },
+  { name: 'LOOPBACK_HOSTS', why: '新增：回环主机名白名单。网关监听 127.0.0.1 且 /health 必须免鉴权（watchdog 自检，加鉴权会自杀重启），故只剩"校验 Host/Origin"这一条 DNS rebinding 防线。依据 corrinehu/dsh-workbuddy-connect 的 src/loopback.ts' },
+  { name: 'hostnameOfHost', why: '新增：从 Host 头剥端口（IPv6 方括号感知）。不能用 split(":")[0] —— [::1]:3091 会被切坏、裸 ::1 的冒号不是端口分隔符，切错会拒绝合法的 IPv6 回环' },
+  { name: 'hostIsLoopback', why: '新增：Host 是否指向回环。缺失/为空 → false（fail-closed）' },
+  { name: 'originIsLoopback', why: '新增：浏览器发的 Origin（存在该头时）是否回环。非浏览器客户端不发 Origin → 放行（否则正常流量全被挡）' },
+  { name: 'MAX_BODY_BYTES', why: '无改动（附近插入了新函数导致块指纹变化）' },
+  { name: 'SESSION_AFFINITY_MAX_MSGS', why: '新增：会话亲和的对话长度上限（默认 300，DSH_GATEWAY_AFFINITY_MAX_MSGS 可覆盖，0 关闭）。亲和的动机是别让长前缀缓存作废，但上下文单调增长 → 被钉住的那家反复接收越来越大的请求体 → 越容易断连、断连触发重试、请求被拖长。即**亲和本身会喂养它想避免的问题**。参照实现实测 333 个请求：<150 条断连率 0%、150-300 3.4%、300-400 7.8%、400-500 10.0%（它们取 400，我们代理 15 家形态各异的上游故取更保守的 300）。A/B 已验：上限=300 时长对话不再"提到首位"，上限=0 时恢复' },
+  { name: 'conversationItemCount', why: '新增：请求里对话条目数（兼容 chat 的 messages[] 与 Responses 的 input[]），供亲和上限判定' },
+  { name: 'providerHasCredential', why: '新增：该家是否至少有一份凭据来源。用作 /v1/models 的门槛。依据 corrinehu/dsh-workbuddy-connect 的 catalog.ts:104-110（"没凭据就该暴露**零**个模型，给一份只能失败的兜底列表比什么都不显示更糟"）。实测：apiKey 为空/占位值的家，模型照样被列出，选中必然 503。只判**结构性**缺失，不因账户暂时冷却就隐藏（那会让列表闪烁）' },
+  { name: 'upstreamKeyMissing', why: '新增：上游 Key 是否"没填/还是模板值"。占位清单与 src/writers/util.js 的 PLACEHOLDER_KEYS 保持一致（引擎是独立 .mjs 不能 require，故复制一份，改一处要改两处）' },
+  { name: 'PLACEHOLDER_UPSTREAM_KEYS', why: '新增：占位 Key 清单（同 writers/util.js）' },
+  { name: 'apiKeysOf', why: '无改动（附近插入了新函数导致块指纹变化）' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

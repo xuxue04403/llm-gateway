@@ -397,6 +397,53 @@ function affinityGet(id) {
 const SESSION_AFFINITY_MAX = 512;
 /** 兜底键（前缀哈希）的最低门槛：低于它没有值得保护的缓存，见 sessionKeyOf 的说明。 */
 const SESSION_AFFINITY_MIN_TOKENS = 512;
+
+/**
+ * 会话亲和的**对话长度上限**（消息条数）；超过就主动放弃亲和。
+ *
+ * ## 为什么亲和需要上限（这条反直觉）
+ *
+ * 亲和的动机是"别让长前缀的缓存作废"，但上下文是**单调增长**的 ——
+ * 于是被钉住的那一家要**反复接收越来越大的请求体**。请求体越大，上游越容易中途断连；
+ * 断连触发重试，把一次本可正常完成的请求拖长，首字延迟随之翻倍。
+ * 也就是说：**亲和本身会喂养它想避免的那个问题**。
+ *
+ * 实测数据（参照实现 workbuddy2api-hub 的 `wb_proxy.py:2292`，333 个请求）：
+ * ```
+ *   msgs <150    82 个请求   断连率  0.0%
+ *   msgs 150-300 59 个请求   断连率  3.4%
+ *   msgs 300-400 64 个请求   断连率  7.8%
+ *   msgs 400-500 50 个请求   断连率 10.0%
+ * ```
+ * 它们取 400 为上限。我们取 **300**（7.8% 那一档之前）——
+ * 因为我们代理的是 15 家形态各异的上游，取更保守的值更稳；
+ * 且超过之后放弃亲和只是"少省一点缓存"，而继续钉住的代价是"请求可能被拖慢甚至失败"，
+ * 两者不对称。
+ *
+ * ⚠ 这是**启发式**，不是精确阈值：不同上游的拐点不同。可用
+ * `DSH_GATEWAY_AFFINITY_MAX_MSGS` 覆盖（设 0 关闭上限，恢复旧行为）。
+ *
+ * ⚠ 只作用于**会话亲和**。OpenCode 车道的 `x-opencode-session` 是上游**无条件要求**的头
+ *（少了直接 400），绝不能受这里影响 —— 见 opencodeSessionId 的注释。
+ */
+const SESSION_AFFINITY_MAX_MSGS = (() => {
+  const n = Number(process.env.DSH_GATEWAY_AFFINITY_MAX_MSGS);
+  return Number.isFinite(n) && n >= 0 ? n : 300;
+})();
+
+/**
+ * 请求里"对话条目"的条数（用于亲和上限）。
+ * 兼容两种协议：chat 的 `messages[]` 与 Responses 的 `input[]`（可能是数组或字符串）。
+ */
+function conversationItemCount(body) {
+  if (!body || typeof body !== 'object') return 0;
+  const arr = Array.isArray(body.messages) ? body.messages
+    : (Array.isArray(body.input) ? body.input : null);
+  if (arr) return arr.length;
+  // input 是字符串 → 单轮
+  return typeof body.input === 'string' ? 1 : 0;
+}
+
 const sessionAffinity = new Map();   // sessionKey -> { pid, ts }
 
 /** 取前 16 位十六进制（够用且不占内存；碰撞概率对本用途可忽略）。 */
@@ -476,6 +523,16 @@ function sessionKeyOf(body, req) {
   const d = deriveSessionKey(body, req);
   if (!d) return null;
   if (d.prefixTokens < SESSION_AFFINITY_MIN_TOKENS) return null;
+  // 对话太长 → 主动**放弃**亲和（见 SESSION_AFFINITY_MAX_MSGS 的注释）。
+  // 对显式会话键（u:/h:）同样生效：问题出在"请求体被反复压给同一家"，
+  // 与键是从哪来的无关。
+  if (SESSION_AFFINITY_MAX_MSGS > 0) {
+    const n = conversationItemCount(body);
+    if (n > SESSION_AFFINITY_MAX_MSGS) {
+      log(`会话亲和跳过：对话 ${n} 条 > 上限 ${SESSION_AFFINITY_MAX_MSGS}（长对话不再钉在同一家，见注释）`);
+      return null;
+    }
+  }
   return d.key;
 }
 
@@ -888,6 +945,72 @@ function json(res, status, obj) {
 /* ---------------- routing ---------------- */
 const MAX_BODY_BYTES = 16 * 1024 * 1024; // 16MB 请求体上限防御
 
+/**
+ * 回环主机名白名单。Host 与 Origin 校验共用。
+ *
+ * ## 为什么需要这道门（DNS rebinding）
+ *
+ * 网关监听 127.0.0.1，**没有任何鉴权的 `/health`** 会暴露账户池诊断信息
+ *（哪些 Key 在冷却、为什么、剩余多久）。
+ * 而 `/health` **必须保持免鉴权**（见 accountPool 附近的注释：进程内 watchdog 用它自检，
+ * 加鉴权会让网关把自己判死并自杀重启）。
+ *
+ * 于是只剩一条防线：**校验 Host / Origin 是不是回环**。
+ * 攻击手法是 DNS rebinding —— 恶意页面把自己的域名解析到 127.0.0.1，
+ * 浏览器就会带着**攻击者的域名**去请求本机网关。此时：
+ *   · `Host` 头是攻击者的域名（不是 127.0.0.1）→ 本函数拦下
+ *   · `Origin` 头是攻击者的域名 → 本函数拦下
+ * 正常客户端（DSH、Claude Code、Codex、curl）要么直连 127.0.0.1（Host 合格），
+ * 要么**根本不发 Origin**（非浏览器）→ 不受影响。
+ *
+ * 依据：参照实现 corrinehu/dsh-workbuddy-connect 的 `src/loopback.ts`，
+ * 它的注释把这条写得最清楚："A DNS-rebinding page (attacker domain re-resolved to
+ * 127.0.0.1) sends its own domain in Host, so this check drops those before any
+ * routing happens."
+ */
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+
+/**
+ * 从 Host 头里剥掉可选端口（IPv6 方括号感知）。
+ *
+ * ⚠ 不能简单地 `split(':')[0]`：`[::1]:3091` 会被切坏成 `[`，
+ * 而裸 `::1`（无方括号）里的冒号也不是端口分隔符 —— 切错会让**合法的 IPv6 回环被拒**。
+ */
+function hostnameOfHost(host) {
+  let h = String(host || '').trim().toLowerCase();
+  if (!h) return '';
+  if (h.startsWith('[')) {
+    const end = h.indexOf(']');
+    return end === -1 ? h : h.slice(0, end + 1);   // 带方括号，原样（含 ]）
+  }
+  const colon = h.lastIndexOf(':');
+  // 只有"恰好一个冒号且后面全是数字"才是端口；多冒号 = 裸 IPv6 字面量，不能截断
+  if (colon !== -1 && !h.slice(0, colon).includes(':') && /^\d+$/.test(h.slice(colon + 1))) {
+    h = h.slice(0, colon);
+  }
+  return h;
+}
+
+/** 请求的 Host 头是否指向回环。缺失/为空 → false（fail-closed）。 */
+function hostIsLoopback(host) {
+  const h = hostnameOfHost(host);
+  return h !== '' && LOOPBACK_HOSTS.has(h);
+}
+
+/**
+ * 浏览器发的 Origin（**存在该头时**）是否指向回环。
+ * 非浏览器客户端（DSH / SDK / curl）不发 Origin → 放行，否则会把正常流量全挡掉。
+ */
+function originIsLoopback(origin) {
+  const o = String(origin || '').trim();
+  if (!o) return true;                    // 没有 Origin = 不是浏览器发的
+  try {
+    return LOOPBACK_HOSTS.has(new URL(o).hostname.toLowerCase());
+  } catch (_) {
+    return false;                         // 有 Origin 但解析不了 → 不可信，拒
+  }
+}
+
 async function bodyOf(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -1240,6 +1363,60 @@ function apiKeysOf(provider) {
     if (k && !out.includes(k)) out.push(k);
   }
   return out;
+}
+
+/**
+ * 示例/模板里的占位 Key。**与 `src/writers/util.js` 的 `PLACEHOLDER_KEYS` 保持一致** ——
+ * 引擎是独立的零依赖 .mjs，不能 require 那边，所以这里复制一份；改一处要改两处。
+ */
+const PLACEHOLDER_UPSTREAM_KEYS = new Set([
+  'dsh-gateway-change-me',
+  'dsh-gateway-xxxxxxxx',
+  'sk-xxxxxxxx',
+  'changeme',
+  'placeholder',
+]);
+
+/** 上游 Key 看起来是不是"没填"/"还是模板值"。 */
+function upstreamKeyMissing(key) {
+  const k = String(key == null ? '' : key).trim();
+  if (!k) return true;
+  if (PLACEHOLDER_UPSTREAM_KEYS.has(k.toLowerCase())) return true;
+  if (/^(sk|lgw|dsh-gateway)-?x{6,}$/i.test(k)) return true;
+  return false;
+}
+
+/**
+ * 该供应商**是否至少有一份凭据来源**（不判"现在好不好用"）。
+ *
+ * 用途：`/v1/models` 的门槛 —— 没有凭据的家不该把模型列出来。
+ *
+ * 依据：参照实现 corrinehu/dsh-workbuddy-connect 的 `catalog.ts:104-110`：
+ *   > "A variant whose app has no credentials must expose **no** models rather than
+ *   >  a fallback roster … Serving the fallback to a signed-out user instead offers
+ *   >  models that can only fail, which is **worse than showing nothing**."
+ *
+ * 实测（2026-10-08）：配了 `apiKey: ""` 的家，它的模型照样出现在 `/v1/models` 里，
+ * 选中后必然 503 —— 用户看到"可选"、选了却失败，比列表里干脆没有更糟。
+ *
+ * ⚠ 只判**结构性**缺失（压根没填 Key），**不**因为账户正在冷却/限流就隐藏模型：
+ * 那是几分钟到一小时的暂时状态，据此隐藏会让模型列表闪烁，
+ * 而用户此时最需要的恰恰是"模型还在、等一会儿能用"。
+ */
+function providerHasCredential(provider) {
+  if (!provider) return false;
+  // ① 账户池：显式 accounts、apiKeys 多把、以及 workbuddy 的自动发现都会展开成条目
+  if (providerAccounts(provider).length) {
+    // workbuddy 的自动发现条目（id='auto'、无 key、无 authFile）不代表"有凭据"，
+    // 但它**有可能**在本机登录着 —— 无法在不碰桌面 App 的前提下判定，故放行。
+    // 其余情况：只要账户池非空就算有来源（apiKey 为空的账户由上层按失败处理）。
+    return true;
+  }
+  // ② 顶层单 Key
+  if (!upstreamKeyMissing(provider.apiKey)) return true;
+  // ③ workbuddy 走桌面 App 凭据，本机登录状态不在配置里 → 不能据此判死
+  if (String(provider.auth || '').toLowerCase() === 'workbuddy') return true;
+  return false;
 }
 
 /**
@@ -7054,7 +7231,13 @@ async function handleModels(cfg, req, res) {
     // Anthropic 客户端可读；OpenAI 客户端忽略多余字段，互不影响
     rows.push({ id: name, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: owner, type: 'model', display_name: name, created_at: new Date().toISOString() });
   };
-  const providers = providersForModel(cfg);
+  const providers = providersForModel(cfg).filter((p) => {
+    // 门槛：没有凭据来源的家**不列模型**（见 providerHasCredential 的注释与实测依据）。
+    // 列出去只会让用户选中一个必然 503 的模型 —— 比不显示更糟。
+    if (providerHasCredential(p)) return true;
+    log(`/v1/models 跳过 ${p.id}：没有任何凭据来源（未填 apiKey / apiKeys / accounts）`);
+    return false;
+  });
   // 1) 先列**配置里声明的逻辑模型名**（模型映射后，dsh 请求的是逻辑名，目录里可能根本没有它）
   for (const p of providers) for (const as of logicalModelNames(p)) push(as, p.id);
   // 2) 只对**一个模型都没配**的服务商补目录（配置列表是权威：配了就不看目录，
@@ -7178,6 +7361,19 @@ function startServer(cfg) {
 
 /** 请求路由（独立函数：由 createServer 的 handler 兜底 catch，见 startServer） */
 async function routeRequest(cfg, req, res) {
+    // ⚠ DNS rebinding 防护 —— 必须在**任何路由/鉴权之前**（见 LOOPBACK_HOSTS 的注释）。
+    // 放在这里而不是各 handler 里：这是一条"整个面"的性质，漏掉任何一个 handler
+    //（尤其免鉴权的 /health）就等于没有。
+    if (!hostIsLoopback(req.headers.host)) {
+      log(`rejected non-loopback Host: ${JSON.stringify(String(req.headers.host || ''))}（DNS rebinding 防护）`);
+      json(res, 403, { error: { message: 'gateway only accepts requests addressed to loopback (Host must be 127.0.0.1 / localhost / ::1)' } });
+      return;
+    }
+    if (!originIsLoopback(req.headers.origin)) {
+      log(`rejected non-loopback Origin: ${JSON.stringify(String(req.headers.origin || ''))}（DNS rebinding 防护）`);
+      json(res, 403, { error: { message: 'gateway only accepts browser requests from loopback origins' } });
+      return;
+    }
     let url;
     try {
       url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);

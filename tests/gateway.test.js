@@ -130,14 +130,16 @@ function waitHealth(port, deadlineMs) {
   });
 }
 
-function call({ method = 'POST', p = '/v1/chat/completions', key = GATEWAY_KEY, body = { model: 'test-model', messages: [{ role: 'user', content: 'hi' }] }, ac = null, port = 0 } = {}) {
+function call({ method = 'POST', p = '/v1/chat/completions', key = GATEWAY_KEY, body = { model: 'test-model', messages: [{ role: 'user', content: 'hi' }] }, ac = null, port = 0, headers = null } = {}) {
   const targetPort = port || gwPort;
   return new Promise((resolve) => {
     const payload = JSON.stringify(body);
     const req = http.request({
       host: '127.0.0.1', port: targetPort, path: p, method,
       headers: Object.assign({ 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) },
-        key ? { authorization: 'Bearer ' + key } : {}),
+        key ? { authorization: 'Bearer ' + key } : {},
+        // 额外头（例如会话亲和的 x-session-id）—— 用于需要控制路由身份的用例
+        headers || {}),
       signal: ac ? ac.signal : undefined,
     }, (res) => {
       let text = '';
@@ -224,7 +226,10 @@ let upstreamPort = 0;
   });
 
   // ---- 5) 畸形 Host → 400 不悬挂（P2-1）----
-  t('网关：畸形 Host 头 → 400（旧版 new URL 抛错 → 请求永久挂起）', async () => {
+  t('网关：畸形 Host 头 → 403（Host 守卫拦在最前；旧版 new URL 抛错 → 请求永久挂起）', async () => {
+    // 本意是"畸形 Host 不能把请求悬挂"。状态码从 400 变成 403 是 2026-10-08 加 Host 回环
+    // 守卫的**预期后果**：守卫在 `new URL()` 之前就把非回环 Host 挡掉，
+    // 而 `[` 显然不是回环 —— 403 比 400 更准确（"不允许"而非"格式错"）。
     const raw = await new Promise((resolve) => {
       const sock = net.connect(gwPort, '127.0.0.1', () => {
         sock.write('GET /health HTTP/1.1\r\nHost: [\r\nConnection: close\r\n\r\n');
@@ -235,7 +240,33 @@ let upstreamPort = 0;
       sock.on('close', () => resolve(buf));
       sock.on('error', () => resolve(buf));
     });
-    assert.ok(/^HTTP\/1\.1 400/.test(raw), '应回 400（不能悬挂），实际首行：' + String(raw).split('\r\n')[0]);
+    assert.ok(/^HTTP\/1\.1 403/.test(raw), '应回 403（不能悬挂），实际首行：' + String(raw).split('\r\n')[0]);
+  });
+
+  t('网关：DNS rebinding 防护 —— 非回环 Host / Origin 一律 403，正常客户端不受影响', async () => {
+    // 依据（2026-10-08，参照 corrinehu/dsh-workbuddy-connect 的 src/loopback.ts）：
+    // 网关监听 127.0.0.1，而 **/health 必须免鉴权**（进程内 watchdog 用它自检，
+    // 加鉴权会让网关把自己判死并自杀重启）—— 于是只剩"校验 Host/Origin 是不是回环"这一条防线。
+    // 攻击手法：恶意页面把自己的域名解析到 127.0.0.1，浏览器就会带着**攻击者的域名**请求本机网关。
+    const req = (headers) => new Promise((resolve) => {
+      const q = http.request({ host: '127.0.0.1', port: gwPort, path: '/health', method: 'GET', timeout: 8000, headers },
+      (x) => { let b = ''; x.on('data', (c) => { b += c; }); x.on('end', () => resolve({ st: x.statusCode, b })); });
+      q.on('error', (e) => resolve({ st: 0, b: e.message })); q.end();
+    });
+    // ① 正常：回环 Host
+    for (const h of ['127.0.0.1:' + gwPort, 'localhost:' + gwPort]) {
+      const r = await req({ host: h });
+      assert.strictEqual(r.st, 200, `Host=${h} 应放行，实际 ${r.st}`);
+    }
+    // ② 攻击者的域名
+    for (const h of ['evil.example.com', '127.0.0.1.evil.com', 'localhost.evil.com']) {
+      const r = await req({ host: h });
+      assert.strictEqual(r.st, 403, `Host=${h} 必须拒绝（DNS rebinding），实际 ${r.st}`);
+    }
+    // ③ Origin：非浏览器不发 Origin → 放行；浏览器发的必须是回环
+    assert.strictEqual((await req({ host: '127.0.0.1:' + gwPort })).st, 200, '无 Origin 应放行（非浏览器客户端）');
+    assert.strictEqual((await req({ host: '127.0.0.1:' + gwPort, origin: 'http://127.0.0.1:1234' })).st, 200, '回环 Origin 应放行');
+    assert.strictEqual((await req({ host: '127.0.0.1:' + gwPort, origin: 'http://evil.example.com' })).st, 403, '非回环 Origin 必须拒绝');
   });
 
   // ---- 6) 上游错误响应体挂起 → 网关不永久挂起（P2-3）----
@@ -1999,6 +2030,69 @@ let upstreamPort = 0;
         '日志必须告诉用户该改哪个文件/环境变量：' + logText.slice(-400));
       assert.strictEqual(up.st.calls, 0, '根本不该向上游发出请求（否则就是跨区泄漏），实际 ' + up.st.calls);
     } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关：/v1/models 不列"没有凭据来源"的家（列出去只会让用户选中必然失败的模型）', async () => {
+    // 依据（2026-10-08，参照 corrinehu/dsh-workbuddy-connect 的 catalog.ts:104-110）：
+    //   "A variant whose app has no credentials must expose **no** models rather than a
+    //    fallback roster ... offers models that can only fail, which is **worse than
+    //    showing nothing**."
+    // 实测：配了 apiKey: "" 的家，模型照样出现在列表里，选中后必然 503 ——
+    // 用户看到"可选"、选了却失败，比列表里干脆没有更糟。
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const gw = await startGatewayWith([
+      openaiProvider('withkey', up, { apiKey: 'sk-real-looking-key-123456', models: ['model-with-key'] }),
+      openaiProvider('nokey', up, { apiKey: '', models: ['model-no-key'] }),
+      openaiProvider('placeholder', up, { apiKey: 'sk-xxxxxxxx', models: ['model-placeholder'] }),
+      openaiProvider('multikey', up, { apiKey: '', apiKeys: ['sk-a-real-1234567890'], models: ['model-multi-key'] }),
+    ], 'credgate');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/models', method: 'GET' });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      const ids = (JSON.parse(r.text).data || []).map((x) => x.id);
+      assert.ok(ids.includes('model-with-key'), '有真 Key 的家应列出：' + JSON.stringify(ids));
+      assert.ok(ids.includes('model-multi-key'), 'apiKeys 多把 Key 也应列出：' + JSON.stringify(ids));
+      assert.ok(!ids.includes('model-no-key'), 'Key 为空的家**不该**列模型（选中必然失败）：' + JSON.stringify(ids));
+      assert.ok(!ids.includes('model-placeholder'), '仍是模板占位 Key 的家也不该列：' + JSON.stringify(ids));
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/\/v1\/models 跳过 nokey/.test(logText), '应记录跳过原因：' + logText.slice(-300));
+      assert.ok(/\/v1\/models 跳过 placeholder/.test(logText), '应记录跳过原因：' + logText.slice(-300));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关：会话亲和的对话长度上限 —— 短对话钉住、超长对话主动放弃', async () => {
+    // 依据（2026-10-08，参照 workbuddy2api-hub 的 wb_proxy.py:2292 实测）：
+    // 亲和的动机是别让长前缀缓存作废，但上下文**单调增长** → 被钉住的那家反复接收
+    // 越来越大的请求体 → 越容易断连，断连触发重试把请求拖长。
+    // 实测 333 个请求：<150 条断连率 0%、150-300 3.4%、300-400 7.8%、400-500 10.0%。
+    // 也就是说**亲和本身会喂养它想避免的问题**，所以必须有上限。
+    const up1 = await startFakeUpstream({ status: 500, errorBody: { error: { message: 'boom' } } });
+    const up2 = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      providerOf('pbad', up1, { priority: 1 }),      // 恒失败 → 逼出 failover
+      providerOf('pgood', up2, { priority: 2 }),
+    ], 'affmax', { DSH_GATEWAY_AFFINITY_MAX_MSGS: '8' });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const sess = { 'x-session-id': 'sess-abcdef-1234' };
+      const sys = [{ role: 'system', content: 'z'.repeat(3000) }, { role: 'user', content: 'hi' }];
+      const many = sys.concat(Array.from({ length: 20 }, (_, i) => ({ role: i % 2 ? 'user' : 'assistant', content: 'm' + i })));
+      // ① 短对话：第 1 次学到 pgood，第 2 次应"提到首位"
+      await call({ port: gw.port, p: '/v1/chat/completions', body: { model: 'test-model', messages: sys }, headers: sess });
+      await call({ port: gw.port, p: '/v1/chat/completions', body: { model: 'test-model', messages: sys }, headers: sess });
+      const log1 = fs.readFileSync(gw.logPath, 'utf8');
+      const promotedShort = (log1.match(/会话亲和 → pgood 提到首位/g) || []).length;
+      assert.ok(promotedShort >= 1, `短对话应参与亲和（应出现"提到首位"），实际 ${promotedShort} 次：` + log1.slice(-600));
+      // ② 长对话（20 条 > 上限 8）：两次都不该"提到首位"，且应记"跳过"
+      const before = promotedShort;
+      await call({ port: gw.port, p: '/v1/chat/completions', body: { model: 'test-model', messages: many }, headers: sess });
+      await call({ port: gw.port, p: '/v1/chat/completions', body: { model: 'test-model', messages: many }, headers: sess });
+      const log2 = fs.readFileSync(gw.logPath, 'utf8');
+      const promotedLong = (log2.match(/会话亲和 → pgood 提到首位/g) || []).length - before;
+      assert.strictEqual(promotedLong, 0, `超长对话不该参与亲和，实际提到首位 ${promotedLong} 次`);
+      assert.ok(/会话亲和跳过：对话 \d+ 条 > 上限 8/.test(log2), '应记录跳过原因：' + log2.slice(-400));
+    } finally { killGw(gw); closeUp(up1); closeUp(up2); }
   });
 
   t('WorkBuddy 凭据取舍：身份不同 → 桌面文件；身份相同 → 谁新用谁（两段式）', async () => {
