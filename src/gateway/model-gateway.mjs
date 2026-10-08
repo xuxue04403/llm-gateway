@@ -346,6 +346,103 @@ function affinityGet(id) {
   return pid;
 }
 
+/* ---------------- 会话亲和（缓存友好，2026-10-08） ----------------
+ * 动机：Anthropic 的 prompt cache 绑定在**上游账号**上。dsh-factory-provider 实测同一段前缀，
+ * 不打 0% 命中、打好 99.79%；而缓存读 ×0.1、未缓存输入 ×1 —— 反复换家等于把缓存全部作废。
+ * 本网关原本的 failover 是"这家失败换下一家"，但**下一轮请求仍按 priority 回到第一家**，
+ * 于是一个发生过故障的会话会在两家之间来回跳，缓存永远热不起来（而且每次都要重付全量输入）。
+ *
+ * 与上面 Responses 亲和的分工（语义不同，所以用**独立的表**，混在一起早晚出错）：
+ *   · Responses 亲和是"**必须**回去" —— response 对象只存在于创建它的那家，发错必然 404；
+ *   · 会话亲和只是"**优先**回去" —— 纯粹为了缓存热度，任何一家都能服务，因此仍可 failover。
+ *
+ * 会话键怎么来（按可信度取，取不到就返回 null = 不做亲和，**绝不猜**）：
+ *   ① Anthropic `metadata.user_id`（Claude Code 会发）/ OpenAI `user`
+ *   ② 客户端显式给的信头 x-session-id / x-session-affinity / x-opencode-session
+ *   ③ 兜底：哈希「模型 + system + 首条用户消息」—— 同一段对话的稳定前缀不变，跨轮稳定；
+ *      客户端主动截断历史时会失效（退化成"本轮无亲和"，只影响命中率，不影响正确性）
+ * 表里只存哈希不存原文：这张表会被客户端可控的内容填充，不该在里面留用户内容。
+ */
+const SESSION_AFFINITY_MAX = 512;
+/** 兜底键（前缀哈希）的最低门槛：低于它没有值得保护的缓存，见 sessionKeyOf 的说明。 */
+const SESSION_AFFINITY_MIN_TOKENS = 512;
+const sessionAffinity = new Map();   // sessionKey -> { pid, ts }
+
+/** 取前 16 位十六进制（够用且不占内存；碰撞概率对本用途可忽略）。 */
+function sha16(s) {
+  return crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 16);
+}
+
+function sessionAffinitySet(key, providerId) {
+  if (!key || !providerId) return;
+  // 审计口径同 rrCounters：key 客户端可控 → 必须容量有界（LRU 淘汰）
+  if (sessionAffinity.has(key)) sessionAffinity.delete(key);
+  sessionAffinity.set(key, { pid: providerId, ts: Date.now() });
+  while (sessionAffinity.size > SESSION_AFFINITY_MAX) {
+    const oldest = sessionAffinity.keys().next();
+    if (oldest.done) break;
+    sessionAffinity.delete(oldest.value);
+  }
+}
+
+function sessionAffinityGet(key) {
+  if (!key) return null;
+  const e = sessionAffinity.get(key);
+  if (!e) return null;
+  sessionAffinity.delete(key);   // LRU 触碰
+  sessionAffinity.set(key, e);
+  return e.pid;
+}
+
+/** 会话键派生。取不到稳定标识时返回 null。 */
+function sessionKeyOf(body, req) {
+  if (!body || typeof body !== 'object') return null;
+  const meta = body.metadata && typeof body.metadata === 'object' ? body.metadata.user_id : null;
+  if (typeof meta === 'string' && meta.trim()) return 'u:' + sha16(meta.trim());
+  if (typeof body.user === 'string' && body.user.trim()) return 'u:' + sha16(body.user.trim());
+  const hdr = req && req.headers
+    ? (req.headers['x-session-id'] || req.headers['x-session-affinity'] || req.headers['x-opencode-session'])
+    : null;
+  if (typeof hdr === 'string' && hdr.trim()) return 'h:' + sha16(hdr.trim());
+  // 兜底：稳定前缀（system + 首条用户消息）。两者都取不到就不做亲和。
+  const sys = typeof body.system === 'string' ? body.system
+    : (Array.isArray(body.system)
+      ? body.system.map((b) => (b && typeof b.text === 'string' ? b.text : '')).join('')
+      : '');
+  let firstUser = '';
+  const msgs = Array.isArray(body.messages) ? body.messages : (Array.isArray(body.input) ? body.input : []);
+  for (const m of msgs) {
+    if (!m || typeof m !== 'object') continue;
+    if (m.role !== 'user' && m.role !== 'human') continue;
+    firstUser = typeof m.content === 'string' ? m.content
+      : (Array.isArray(m.content)
+        ? m.content.map((b) => (b && typeof b.text === 'string' ? b.text : '')).join('')
+        : '');
+    break;
+  }
+  if (!sys && !firstUser) return null;
+  // 兜底键只在"确实有值得保护的缓存"时才用。
+  // 理由：亲和的**唯一动机**是别让长前缀的缓存作废；前缀本身就很短的会话没有可缓存的内容，
+  // 用它做键只会带来副作用 —— 不相干的会话因为开头恰好相同而被绑到同一家，
+  // 而且被钉住的那家再也不被尝试，其它家的熔断计数永远攒不够（实测踩到：
+  // "半开探测用短超时"用例因此不再触发 HALF-OPEN）。
+  // 512 token 与 Anthropic 的最小可缓存长度同量级。
+  if (roughTokens(sys) + roughTokens(firstUser) < SESSION_AFFINITY_MIN_TOKENS) return null;
+  return 'p:' + sha16(`${body.model || ''}\u0000${sys}\u0000${firstUser}`);
+}
+
+/**
+ * 会话亲和是否启用。
+ * 'auto'（默认）：failover 模式下开（正是缓存会来回失效的场景），round-robin 模式下关
+ *（用户显式要分摊流量，亲和会跟它对着干）。
+ */
+function sessionAffinityEnabled(cfg) {
+  const m = cfg && cfg.sessionAffinity;
+  if (m === false || m === 'off') return false;
+  if (m === true || m === 'on') return true;
+  return !(cfg && cfg.routing === 'round-robin');
+}
+
 /** 从响应字节（JSON 或 SSE）里嗅探 Responses 的 response.id。
  * 三种形态，按可信度取：
  *   ① `"id":"resp_…"`（官方/new-api 惯例前缀，最可靠）
@@ -2114,6 +2211,100 @@ function claudeClientHeaders(cfg) {
   return h;
 }
 
+/* ---------------- OpenCode 免费车道：客户端身份仿真（2026-10-08） ----------------
+ * 依据：dsh-our-free-model 的 src/upstream.js —— 它把每条都对着活网关直接请求核对过
+ *（2026-09-24）：公共池凭据、指纹头、按模型的端点分流、免费档的工具指纹门（缺了 403
+ * FreeTierError）、**按会话计费**（每请求新铸一个 session 就直接 429 FreeUsageLimitError）、
+ * 以及地区门（403 RegionError）。
+ *
+ * 三条硬性要求：
+ *   ① `authorization: Bearer public` —— 公共池凭据，不是用户自己的 key；
+ *   ② UA 版本 ≥ 1.17，否则被网关的版本门拒掉；
+ *   ③ `x-opencode-session` **同一对话必须稳定**，`x-opencode-request` 每轮一个。
+ *
+ * ⚠ 这说明白了一件事：这条车道的本质是**让上游把本网关的流量认成官方客户端**，
+ *    用的是它给自家用户的公共额度。所以它只作为**用户手动添加的预设**存在，
+ *    默认不添加、界面上带风险说明（见 renderer/js/providers.js 的预设区）。
+ *    该上游在模型卡里声明 prompt 可能被记录 —— 别拿它跑敏感内容。
+ */
+const OPENCODE_DEFAULT_VERSION = '1.18.31';   // 上游要求 ≥ 1.17
+
+/** 版本号可覆盖（走 clientVersions / env，与 cline/codex 同套路，不写死）。 */
+function opencodeVersion(cfg) {
+  const id = clientIdentityOverrides(cfg);
+  const v = String((id && id.opencode) || process.env.DSH_GATEWAY_OPENCODE_VERSION || OPENCODE_DEFAULT_VERSION).trim();
+  return /^\d+\.\d+/.test(v) ? v : OPENCODE_DEFAULT_VERSION;
+}
+
+/** 静态头部分（动态的 session/request id 在 forward 里按对话内容补，见 opencodeSessionId）。 */
+function opencodeClientHeaders(cfg) {
+  return {
+    'user-agent': `opencode/${opencodeVersion(cfg)}`,
+    'x-opencode-client': 'desktop',
+    'x-opencode-project': 'global',
+    accept: 'application/json, text/event-stream',
+  };
+}
+
+/**
+ * 会话 id：**必须由对话内容派生且跨轮稳定** —— 上游按会话计费，每请求换一个会直接 429。
+ * 复用 sessionKeyOf 的派生逻辑（同一段对话的稳定前缀不变），再拼成上游认的 ses_ 形态。
+ * 取不到稳定标识时返回 null（宁可不发这个头，也不每请求乱铸一个）。
+ */
+function opencodeSessionId(body) {
+  const key = sessionKeyOf(body, null);
+  if (!key) return null;
+  const hex = sha16(key);
+  return 'ses_' + hex.slice(0, 12) + hex;   // ses_ + 28 位，形态与上游一致
+}
+
+/** 每轮一个请求 id。 */
+function opencodeRequestId() {
+  return 'msg_' + sha16(Date.now() + '\u0000' + Math.random());
+}
+
+/**
+ * 免费档的**工具指纹门**：body.tools 里必须出现全小写的 bash/glob/grep/read，
+ * 否则上游 403 FreeTierError。
+ *
+ * ⚠ 与 dsh-our-free-model 的做法**有意不同**：它在 DSH 进程内、知道该拿哪个真实工具去顶替，
+ * 所以能把 pwsh"提拔"进 bash 槽位（它实测过 —— 纯占位的假工具会被模型调用 24 次，每次都失败）。
+ * 网关是纯转发方，**无从知道客户端有什么工具**，因此只做"缺哪个补哪个"的占位声明，
+ * 并把补进去的名字记进日志，让用户能看出哪些调用可能不是自己声明的工具。
+ *
+ * @returns {{body:object, added:string[]}|null} 无需补齐时返回 null。
+ */
+const OPENCODE_FINGERPRINT_TOOLS = ['bash', 'glob', 'grep', 'read'];
+
+function ensureFingerprintTools(body) {
+  if (!body || typeof body !== 'object') return null;
+  const list = Array.isArray(body.tools) ? body.tools.slice() : [];
+  const have = new Set();
+  for (const t of list) {
+    if (!t || typeof t !== 'object') continue;
+    const n = typeof t.name === 'string' ? t.name
+      : (t.function && typeof t.function.name === 'string' ? t.function.name : '');
+    if (n) have.add(n.trim().toLowerCase());
+  }
+  // 大小写变体不算数：上游把 Bash + bash 当成重复项直接拒
+  const added = [];
+  for (const name of OPENCODE_FINGERPRINT_TOOLS) {
+    if (have.has(name)) continue;
+    list.push({
+      type: 'function',
+      function: {
+        name,
+        description: 'Declared for client fingerprint compatibility. '
+          + name + ' is not provided by this gateway.',
+        parameters: { type: 'object', properties: {}, additionalProperties: true },
+      },
+    });
+    added.push(name);
+  }
+  if (added.length === 0) return null;
+  return { body: { ...body, tools: list }, added };
+}
+
 /**
  * Cline 完全仿真。
  *
@@ -2226,6 +2417,11 @@ function upstreamRequestHeaders(reqHeaders, apiKey, clientUA, anthropic, clientP
   } else if (clientProfile === 'codex') {
     // Codex 完全仿真：不透传任何 dsh 头
     Object.assign(out, codexClientHeaders(cfg));
+    if (clientUA) out['user-agent'] = clientUA;
+  } else if (clientProfile === 'opencode') {
+    // OpenCode 免费车道：完全仿真官方桌面客户端。
+    // 动态的 session/request id 不在这里给（这里拿不到 body）—— 由 forward 按对话内容补。
+    Object.assign(out, opencodeClientHeaders(cfg));
     if (clientUA) out['user-agent'] = clientUA;
   } else if (clientProfile === 'claude' || (!clientProfile && clientUA)) {
     // Claude Code 完全仿真（兼容旧配置：仅 clientUA 时按 Claude 仿真）
@@ -3312,6 +3508,30 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         if (bp) {
           outBody = bp.body;
           log(`Anthropic 缓存断点：放置 ${bp.placed} 处（缓存读 ×0.1 vs 未缓存输入 ×1）`);
+        }
+      }
+      // ③ OpenCode 免费车道：两件只有网关才知道怎么做的事。
+      // 用**标记头**判断车道，而不是再穿一个 cfg 进来（上游请求头里已经有 x-opencode-client）。
+      if (upstreamHeaders && upstreamHeaders['x-opencode-client']) {
+        // ① 会话/请求 id 必须由**对话内容**派生（静态头做不到），且同一对话跨轮稳定 ——
+        //    上游按会话计费，每请求新铸一个会直接把额度打光并 429。
+        const sid = opencodeSessionId(outBody);
+        if (sid) upstreamHeaders['x-opencode-session'] = sid;
+        // 静默不发会让用户莫名其妙被上游 429（按会话计费），所以这里如实记一条。
+        // ⚠ 这里读的是 **outBody（已过 R9 打码）**：若对话前缀恰好整段是"疑似密钥样式长串"，
+        // 打码后前缀会变得很短，于是派生不出会话键（实测踩到：用 'X'.repeat(4000) 造测试数据，
+        // 4000 个 X 被压成十来个字符 → rough=7 → 低于门槛）。这是有意为之：
+        // 拿打码后的内容做键，才不会把用户原文留在表里。
+        else log('OpenCode 车道：本次没有可派生的稳定会话 id（对话前缀太短或缺稳定标识）→ 不发会话头，'
+          + '上游可能按"新会话"重新计费');
+        upstreamHeaders['x-opencode-request'] = opencodeRequestId();
+        // ② 免费档的工具指纹门：缺 bash/glob/grep/read 直接 403 FreeTierError
+        const fp = ensureFingerprintTools(outBody);
+        if (fp) {
+          outBody = fp.body;
+          log(`OpenCode 免费档工具指纹：补声明 ${fp.added.join('/')}`
+            + '（缺了上游会 403 FreeTierError；它们只是指纹占位，本网关并不提供这些工具，'
+            + '模型若真的调用会失败——这正是网关只能"补声明"、无法像进程内插件那样拿真实工具顶替的局限）');
         }
       }
     }
@@ -4711,6 +4931,24 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
       }
     }
   }
+  // 会话亲和（缓存友好）：同一会话优先回到上次成功的那家。
+  // Anthropic 的 prompt cache 绑定在上游账号上 —— 反复换家 = 缓存永远命中不了 = 成本翻几倍。
+  // 与上面 Responses 亲和的区别：那条是"必须回去"（否则 404），这条只是"优先回去"，
+  // 命中不了就照常按 priority 走，**不改变任何失败语义**。
+  const sessKey = sessionAffinityEnabled(cfg) ? sessionKeyOf(body, req) : null;
+  if (sessKey) {
+    const owner = sessionAffinityGet(sessKey);
+    if (owner) {
+      const i = tryOrder.findIndex((x) => x.id === owner);
+      if (i > 0) {
+        tryOrder = [tryOrder[i], ...tryOrder.slice(0, i), ...tryOrder.slice(i + 1)];
+        log(`[route] ${model}: 会话亲和 → ${owner} 提到首位（缓存热度；失败仍照常 failover）`);
+      } else if (i < 0) {
+        // 上次成功的那家这次不在候选里（被停用 / 不再声明该模型）→ 本轮重新学习即可
+        log(`[route] ${model}: 会话亲和的 ${owner} 已不在候选中 → 本轮重新选路`);
+      }
+    }
+  }
   for (const p of tryOrder) {
     // 模型映射：把逻辑名换成该供应商的上游真实 ID（未声明映射 → 原样透传）；
     // 带图片时优先选声明了 vision 的那条上游 ID（见 upstreamIdFor）
@@ -4735,6 +4973,9 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
     const out = await forwardWithAccounts(p, upstreamPath.replace(/^\/v1/, '') + search, passthroughHeaders(req.headers, p.apiKey, cfg.clientUA, effectiveClientProfile(cfg, p), cfg), attemptBody, res, fwdOpts);
     if (out === true) {
       log(`served ${model} via ${viaTag(p.id)}`);
+      // 会话亲和记档：记的是**实际成功的那家**（可能是 failover 之后的一家），
+      // 下一轮就优先回到它 —— 缓存热度跟着真实服务方走，而不是跟着配置优先级走。
+      if (sessKey) sessionAffinitySet(sessKey, p.id);
       logCall(`via=${viaTag(p.id)}`, 'ok');
       return;
     }

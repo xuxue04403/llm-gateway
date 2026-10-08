@@ -113,6 +113,24 @@ const DECLARED = [
   { name: 'decodeMeterText', why: '新增：速度读数的日志片段（无可测窗口时如实说"—"）' },
   { name: 'loadConfig', why: '新增一行：把 cfg.cacheBreakpoints 存进模块级 CACHE_BREAKPOINT_MODE（在 port 兜底之后，不影响原有解析）' },
   { name: 'THINKING_UNSUPPORTED_RE', why: '仅前导注释块位置变化（正则一字未改）—— 新增的函数插在它前面，脚本按"块"比对会把注释归属算进来' },
+
+  // —— 2026-10-08 第二批：会话亲和 + OpenCode 免费车道仿真 ——
+  { name: 'SESSION_AFFINITY_MAX', why: '新增：会话亲和表容量上限（key 客户端可控，必须 LRU 有界，口径同 rrCounters）' },
+  { name: 'SESSION_AFFINITY_MIN_TOKENS', why: '新增：兜底键（前缀哈希）的最低门槛 —— 低于它没有值得保护的缓存，见 sessionKeyOf 的说明' },
+  { name: 'sessionAffinity', why: '新增：会话亲和表。与既有 responseAffinity **分开**：那条是"必须回去"（否则 404），这条只是"优先回去"（缓存热度），语义不同不能混用一张表' },
+  { name: 'sha16', why: '新增：取 sha256 前 16 位十六进制（会话键/会话 id 都用它）' },
+  { name: 'sessionAffinitySet', why: '新增：记档实际成功的那家（不是配置优先级那家）' },
+  { name: 'sessionAffinityGet', why: '新增：取亲和（LRU 触碰）' },
+  { name: 'sessionKeyOf', why: '新增：会话键派生 —— metadata.user_id / body.user / 信头 / 稳定前缀哈希，取不到就返回 null（绝不猜）。只存哈希不存原文' },
+  { name: 'sessionAffinityEnabled', why: '新增：开关语义（auto 在 failover 下开、round-robin 下关 —— 用户显式要分摊流量时亲和会跟它对着干）' },
+  { name: 'affinityGet', why: '仅前导注释块位置变化（函数体一字未改）—— 新增的会话亲和代码插在它后面，脚本按"块"比对会把注释归属算进来' },
+  { name: 'OPENCODE_DEFAULT_VERSION', why: '新增：OpenCode 车道 UA 版本（上游要求 ≥1.17），走 clientVersions/env 可覆盖，不写死' },
+  { name: 'opencodeVersion', why: '新增：版本号解析（与 cline/codex 同套路）' },
+  { name: 'opencodeClientHeaders', why: '新增：OpenCode 桌面客户端的静态仿真头（动态的 session/request id 在 forward 里按对话内容补）' },
+  { name: 'opencodeSessionId', why: '新增：会话 id —— **必须由对话内容派生且跨轮稳定**，上游按会话计费，每请求新铸一个会直接 429' },
+  { name: 'opencodeRequestId', why: '新增：每轮一个请求 id' },
+  { name: 'OPENCODE_FINGERPRINT_TOOLS', why: '新增：免费档要求的工具四元组 bash/glob/grep/read' },
+  { name: 'ensureFingerprintTools', why: '新增：补齐工具四元组（缺了上游 403 FreeTierError）。只"补声明"不"顶替"——纯转发网关无从知道客户端有什么真实工具，这一点与进程内插件的做法有意不同，日志里如实说明' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

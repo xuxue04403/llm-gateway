@@ -945,6 +945,139 @@ function addProvider() {
   openEditor(pendingNewIndex);
 }
 
+/* ==================== 免费通道预设 ====================
+ * 来源：社区插件 dsh-our-free-model（它把每条都对着活网关直接请求核对过）。
+ * 共同点：**不花你自己的钱，但也不是你的额度** —— 用的是上游给自家用户的免费池。
+ *
+ * 因此三条规矩：
+ *   ① 默认不添加，必须用户手动选、看完说明才加；
+ *   ② 界面上如实写明来源、条款归属、隐私代价与**当前实测状态**；
+ *   ③ 上游随时会改规则 —— 状态字段就是干这个的，别把它写成"配好就一劳永逸"。
+ *
+ * `status` 取值（本机 2026-10-08 实测）：
+ *   verified   本机实测可用
+ *   broken     本机实测已不可用（附证据）
+ *   unreachable 本机网络到不了，无法判定
+ */
+const FREE_CHANNEL_PRESETS = [
+  {
+    key: 'opencode-zen',
+    name: 'OpenCode Zen 免费车道',
+    baseURL: 'https://opencode.ai/zen',
+    apiKey: 'public',
+    status: 'broken',
+    statusNote: '本机实测：模型清单仍公开（/zen/v1/models 无凭据即 200），但对话端点已要求真 key —— '
+      + 'chat/completions 与 messages 用 Bearer public / x-api-key / 不带凭据四种形态都是 '
+      + '401 AuthError "Missing API key"。该免费车道目前不可用。',
+    what: '凭据是公共池的 Bearer public；需要仿真官方桌面客户端的指纹头；上游按会话计费。',
+    risks: [
+      '这条车道的本质是<b>让上游把本网关的流量认成官方客户端</b> —— 用它给自家用户的公共额度。'
+        + '是否允许这样用由<b>该上游的条款</b>决定，与本项目无关。',
+      '上游按<b>会话</b>计费：网关已自动保证同一对话用同一会话 id（否则会直接 429）。',
+      '会被<b>地区策略</b>拦截（403 RegionError）。',
+      '<b>上游随时会关掉它</b> —— 上面那条状态就是实例。',
+    ],
+    apply: (p) => { p.protocol = 'openai-chat'; p.clientProfile = 'opencode'; },
+  },
+  {
+    key: 'kilo',
+    name: 'Kilo AI 公共网关（免密免费池）',
+    baseURL: 'https://api.kilo.ai/api/gateway',
+    apiKey: '',
+    status: 'unreachable',
+    statusNote: '本机实测：直连与经代理（127.0.0.1:7890）都是连接失败（curl HTTP=000），无法判定可用性。'
+      + '另外它的接口路径<b>不带 /v1</b>，而本网关会把 baseURL 规范化成带 /v1 —— '
+      + '真要用需要先在「供应商」里手改地址试出正确路径。',
+    what: '理论上无需任何账号或 Key，取上游 listing 里 isFree: true 的那一截。',
+    risks: [
+      '<b>上游在模型卡里明确声明</b>：免费池的 prompt 可能被记录并用于改进其服务 —— '
+        + '不要用它跑敏感内容或正式工作。',
+      '可用模型由上游随时增删，本网关不做任何保证。',
+    ],
+    apply: (p) => { p.protocol = 'openai-chat'; },
+  },
+];
+
+const PRESET_STATUS_LABEL = {
+  verified: ['✓ 本机实测可用', 'ok'],
+  broken: ['✗ 本机实测已不可用', 'bad'],
+  unreachable: ['? 本机无法连通，未判定', 'warn'],
+};
+
+/** 免费通道选择器。选完先看风险说明，确认后才真正插进配置。 */
+function openFreeChannelPicker() {
+  const rows = FREE_CHANNEL_PRESETS.map((c) => {
+    const [label, cls] = PRESET_STATUS_LABEL[c.status] || PRESET_STATUS_LABEL.unreachable;
+    return `<div class="preset-row">
+      <div class="preset-head">
+        <b>${esc(c.name)}</b>
+        <span class="preset-badge ${cls}">${esc(label)}</span>
+      </div>
+      <div class="hint">${esc(c.baseURL)}${c.apiKey ? ' · apiKey=' + esc(c.apiKey) : ' · 无需凭据'}</div>
+      <div class="hint">${esc(c.what)}</div>
+      <div class="hint preset-status">${c.statusNote}</div>
+      <button class="btn" data-preset="${esc(c.key)}">了解风险并添加</button>
+    </div>`;
+  }).join('');
+  Modal.open({
+    title: '免费通道预设',
+    body: `<p class="hint">这些是<b>第三方公共额度</b>，不是本项目的资源，也不是你的额度。
+      添加前请读完说明 —— 要不要用、合不合规，由你判断。</p>${rows}`,
+    buttons: [{ label: '关闭', cls: 'btn-ghost' }],
+    // ⚠ Modal.open 的 onOpen() **不传参数**，内容填在 #modalBody 里（见 core.js）。
+    // 写成 (root) => root.querySelectorAll(...) 会直接 TypeError。
+    onOpen: () => {
+      document.querySelectorAll('#modalBody [data-preset]').forEach((b) => {
+        b.addEventListener('click', () => {
+          const c = FREE_CHANNEL_PRESETS.find((x) => x.key === b.dataset.preset);
+          if (c) confirmAddPreset(c);
+        });
+      });
+    },
+  });
+}
+
+/** 加之前的最后一道确认：把该通道的风险逐条摆出来，不做默认勾选。 */
+function confirmAddPreset(c) {
+  const [label] = PRESET_STATUS_LABEL[c.status] || PRESET_STATUS_LABEL.unreachable;
+  const items = c.risks.map((r) => `<li>${r}</li>`).join('');
+  Modal.open({
+    title: '添加前请确认：' + c.name,
+    body: `<p><b>${esc(label)}</b></p>
+      <p class="hint">${c.statusNote}</p>
+      <p>这条通道的性质：</p><ul class="preset-risks">${items}</ul>
+      <p class="hint">添加后它只是一条普通供应商配置，可以随时改地址、换 key 或删掉。
+      建议添加后立刻用「测试全部连通性」亲自验一遍。</p>`,
+    buttons: [
+      { label: '取消', cls: 'btn-ghost' },
+      {
+        label: '我已了解，添加',
+        cls: 'btn-primary',
+        onClick: () => {
+          const n = (LG.config.providers || []).length + 1;
+          let i = n;
+          let id = c.key;
+          while (LG.config.providers.some((p) => p.id === id)) { i++; id = c.key + '-' + i; }
+          const p = {
+            id,
+            baseURL: c.baseURL,
+            apiKey: c.apiKey,
+            models: [],
+            priority: 1,
+            enabled: true,
+          };
+          if (typeof c.apply === 'function') c.apply(p);
+          LG.config.providers.push(p);
+          markDirty('添加免费通道 ' + c.name);
+          LG.renders.providers();
+          renderTopbar();
+          openEditor(LG.config.providers.length - 1);
+        },
+      },
+    ],
+  });
+}
+
 /* ==================== 初始化 ==================== */
 
 /** 删除当前编辑中的供应商（含确认框）。被 initProviders 里的一次性监听器调用。 */
@@ -975,6 +1108,7 @@ function deleteEditingProvider() {
 LG.initProviders = function initProviders() {
   $('#pvSearch').addEventListener('input', () => LG.renders.providers());
   $('#btnAddProvider').addEventListener('click', addProvider);
+  $('#btnFreeChannel').addEventListener('click', openFreeChannelPicker);
   $('#btnTestAll').addEventListener('click', testAll);
 
   // 编辑抽屉的**静态**外壳按钮：只在这里挂一次（见 wireEditor 末尾的说明）。

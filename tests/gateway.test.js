@@ -355,6 +355,7 @@ let upstreamPort = 0;
       failFirstN: opts.failFirstN || 0,            // 前 N 次请求直接销毁 socket（模拟网络抖动）
       lastBody: null,
       bodies: [],                                  // 每次请求体（含重试），断言"重试时去掉了某字段"用
+      headers: [],                                 // 每次请求头（断言客户端仿真头用）
       errorBody: opts.errorBody === undefined ? { error: { message: 'upstream error' } } : opts.errorBody,
       delayMs: opts.delayMs || 0,
       // —— OpenAI Responses 协议仿真（见下方 handleResponses）——
@@ -460,6 +461,7 @@ let upstreamPort = 0;
         } catch (_) { /* 忽略 */ }
         st.lastBody = parsedBody;
         st.bodies.push(parsedBody);
+        st.headers.push(req.headers);
         const send = () => {
           // 2026-09-17 实测形态（amd/GLM-5.3-Flash）：带顶层 thinking 参数 → 拒收。
           // 'sse' = HTTP 200 + SSE 首事件 error（实测形态）；'400' = 直接 400 JSON。
@@ -3722,6 +3724,195 @@ let upstreamPort = 0;
       // 分子必须是 60-10=50（reasoning token 在首字之前就已生成完毕，不属于解码窗口）
       assert.ok(/50 tok\//.test(log), '应剔除 10 个未流出的 reasoning token（分子 60→50），日志尾部：' + log.slice(-300));
       assert.ok(/已剔除未流出 reasoning 10/.test(log), '应如实标注剔除了多少');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  /* ==================================================================================
+   * ⑤ 会话亲和（缓存友好）：同一会话优先回到上次成功的那家
+   * 动机：Anthropic 的 prompt cache 绑定在上游账号上，反复换家 = 缓存永远命中不了。
+   * ================================================================================== */
+
+  // 长前缀（超过 SESSION_AFFINITY_MIN_TOKENS=512）才会启用兜底键。
+  // ⚠ 必须是**正常文本**：R9b 会把"≥32 位连续字母数字"当疑似密钥长串打码（而且不保留长度），
+  // 用 'X'.repeat(4000) 这种数据会被压成十来个字符，前缀直接不够门槛 —— 测的东西就不是它了。
+  const LONG_PREFIX = '这是一段用于测试的普通中文文本，讲的是会话亲和与缓存命中的关系。'.repeat(120);   // ≈3600 字符 ≈900 token，稳过 512 门槛
+
+  t('⑤ 会话亲和：长前缀会话在 failover 后钉住成功的那家（不再白打坏家、缓存不用重建）', async () => {
+    const dead = await startFakeUpstream({ status: 500, errorBody: { error: { message: 'boom' } } });
+    const ok = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      providerOf('dead', dead, { priority: 1 }),
+      providerOf('ok', ok, { priority: 2 }),
+    ], 'aff-on');
+    try {
+      const body = { model: 'test-model', messages: [{ role: 'user', content: LONG_PREFIX }] };
+      const r1 = await call({ port: gw.port, body });
+      assert.strictEqual(r1.status, 200, '第一轮应由健康候选服务，实际 ' + r1.status);
+      assert.ok(dead.st.calls >= 1, '第一轮应尝试过 priority=1 的坏家');
+      const deadAfterFirst = dead.st.calls;
+
+      const r2 = await call({ port: gw.port, body });
+      assert.strictEqual(r2.status, 200, '第二轮实际 ' + r2.status);
+      assert.strictEqual(dead.st.calls, deadAfterFirst,
+        '第二轮不该再尝试已失败的那家（每次重试都要重建缓存），实际 ' + dead.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/会话亲和/.test(logText), '日志应说明走了会话亲和：' + logText.slice(-400));
+    } finally { killGw(gw); closeUp(dead); closeUp(ok); }
+  });
+
+  t('⑤ 会话亲和：短前缀不启用（没有值得保护的缓存，不该改变选路）', async () => {
+    const dead = await startFakeUpstream({ status: 500, errorBody: { error: { message: 'boom' } } });
+    const ok = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      providerOf('dead', dead, { priority: 1 }),
+      providerOf('ok', ok, { priority: 2 }),
+    ], 'aff-short');
+    try {
+      // 'hi' 远低于门槛 —— 这种会话没有可缓存的长前缀，亲和只会带来"不相干会话被绑在一起"的副作用
+      const body = { model: 'test-model', messages: [{ role: 'user', content: 'hi' }] };
+      await call({ port: gw.port, body });
+      const deadAfterFirst = dead.st.calls;
+      await call({ port: gw.port, body });
+      assert.ok(dead.st.calls > deadAfterFirst,
+        '短前缀应照常按 priority 重试第一家（不启用亲和），实际 ' + dead.st.calls + ' vs ' + deadAfterFirst);
+    } finally { killGw(gw); closeUp(dead); closeUp(ok); }
+  });
+
+  t('⑤ 会话亲和：配置 sessionAffinity=off → 完全关闭（长前缀也照常重试第一家）', async () => {
+    const dead = await startFakeUpstream({ status: 500, errorBody: { error: { message: 'boom' } } });
+    const ok = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      providerOf('dead', dead, { priority: 1 }),
+      providerOf('ok', ok, { priority: 2 }),
+    ], 'aff-off', undefined, { sessionAffinity: 'off' });
+    try {
+      const body = { model: 'test-model', messages: [{ role: 'user', content: LONG_PREFIX }] };
+      await call({ port: gw.port, body });
+      const deadAfterFirst = dead.st.calls;
+      await call({ port: gw.port, body });
+      assert.ok(dead.st.calls > deadAfterFirst,
+        '关掉之后应回到"每轮都从 priority 头开始"，实际 ' + dead.st.calls + ' vs ' + deadAfterFirst);
+    } finally { killGw(gw); closeUp(dead); closeUp(ok); }
+  });
+
+  t('⑤ 会话亲和：被钉住的那家转坏时，亲和跟着新的成功方走（不会一直钉在坏家）', async () => {
+    const a = await startFakeUpstream({ status: 200 });
+    const b = await startFakeUpstream({ status: 500, errorBody: { error: { message: 'boom' } } });
+    const gw = await startGatewayWith([
+      providerOf('a', a, { priority: 1 }),
+      providerOf('b', b, { priority: 2 }),
+    ], 'aff-move');
+    try {
+      const body = { model: 'test-model', messages: [{ role: 'user', content: LONG_PREFIX }] };
+      const r1 = await call({ port: gw.port, body });
+      assert.strictEqual(r1.status, 200, '第一轮应走 a，实际 ' + r1.status);
+      // a 转坏 → 下一轮应由 b 服务，并把亲和改记到 b
+      a.st.status = 500;
+      b.st.status = 200;
+      const r2 = await call({ port: gw.port, body });
+      assert.strictEqual(r2.status, 200, '第二轮应 failover 到 b，实际 ' + r2.status);
+      assert.ok(b.st.calls >= 1, 'b 应被尝试');
+      const aAfter = a.st.calls;
+      // 第三轮：亲和已改记 b → 不该再白打 a
+      const r3 = await call({ port: gw.port, body });
+      assert.strictEqual(r3.status, 200, '第三轮实际 ' + r3.status);
+      assert.strictEqual(a.st.calls, aAfter, '第三轮不该再尝试已转坏的 a，实际 ' + a.st.calls);
+    } finally { killGw(gw); closeUp(a); closeUp(b); }
+  });
+
+  /* ==================================================================================
+   * ⑥ 免费通道预设：OpenCode 客户端仿真（头 + 工具指纹门 + 稳定会话 id）
+   * ================================================================================== */
+
+  t('⑥ OpenCode 车道：按对话内容补三种仿真头（静态头做不到会话/请求 id）', async () => {
+    const up = await startFakeUpstream({ status: 200 });
+    const p = providerOf('oc1', up, { priority: 1 });
+    p.clientProfile = 'opencode';
+    const gw = await startGatewayWith([p], 'oc-headers');
+    try {
+      const r = await call({
+        port: gw.port,
+        body: { model: 'test-model', messages: [{ role: 'user', content: LONG_PREFIX }] },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 160));
+      const h = up.st.headers[up.st.headers.length - 1];
+      assert.strictEqual(h['x-opencode-client'], 'desktop', '应有客户端身份头');
+      assert.ok(/^opencode\/\d+\.\d+/.test(h['user-agent'] || ''), 'UA 应是 opencode/<版本>：' + h['user-agent']);
+      assert.ok(/^ses_/.test(h['x-opencode-session'] || ''), '会话 id 形态应为 ses_…：' + h['x-opencode-session']);
+      assert.ok(/^msg_/.test(h['x-opencode-request'] || ''), '请求 id 形态应为 msg_…：' + h['x-opencode-request']);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('⑥ OpenCode 车道：同一对话的会话 id 必须跨轮稳定（每请求换一个会直接 429）', async () => {
+    const up = await startFakeUpstream({ status: 200 });
+    const p = providerOf('oc2', up, { priority: 1 });
+    p.clientProfile = 'opencode';
+    const gw = await startGatewayWith([p], 'oc-session');
+    try {
+      const body = { model: 'test-model', messages: [{ role: 'user', content: LONG_PREFIX }] };
+      await call({ port: gw.port, body });
+      await call({ port: gw.port, body });
+      const sids = up.st.headers.map((h) => h['x-opencode-session']);
+      assert.ok(sids.length >= 2, '应收到两次请求，实际 ' + sids.length);
+      assert.strictEqual(sids[0], sids[1],
+        '同一段对话两轮的会话 id 必须相同（上游按会话计费）：' + sids[0] + ' vs ' + sids[1]);
+      const rids = up.st.headers.map((h) => h['x-opencode-request']);
+      assert.notStrictEqual(rids[0], rids[1], '请求 id 应当每轮不同');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('⑥ OpenCode 车道：补齐免费档要求的工具四元组（缺了上游 403 FreeTierError）', async () => {
+    const up = await startFakeUpstream({ status: 200 });
+    const p = providerOf('oc3', up, { priority: 1 });
+    p.clientProfile = 'opencode';
+    const gw = await startGatewayWith([p], 'oc-tools');
+    try {
+      const r = await call({
+        port: gw.port,
+        body: {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          tools: [{ type: 'function', function: { name: 'my_tool', description: 'x', parameters: {} } }],
+        },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      const sent = up.st.bodies[up.st.bodies.length - 1];
+      const names = (sent.tools || []).map((t) => (t.function && t.function.name) || t.name);
+      for (const need of ['bash', 'glob', 'grep', 'read']) {
+        assert.ok(names.includes(need), '应补出工具 ' + need + '，实际 ' + names.join(','));
+      }
+      assert.ok(names.includes('my_tool'), '客户端自己的工具必须原样保留');
+      const log = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/工具指纹：补声明/.test(log), '日志应如实记下补了哪些占位工具');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('⑥ OpenCode 车道：四元组已齐时不重复补（上游把大小写变体当重复项拒）', async () => {
+    const up = await startFakeUpstream({ status: 200 });
+    const p = providerOf('oc4', up, { priority: 1 });
+    p.clientProfile = 'opencode';
+    const gw = await startGatewayWith([p], 'oc-tools-dup');
+    try {
+      const r = await call({
+        port: gw.port,
+        body: {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          tools: [
+            { type: 'function', function: { name: 'Bash', description: 'x', parameters: {} } },
+            { type: 'function', function: { name: 'glob', description: 'x', parameters: {} } },
+            { type: 'function', function: { name: 'grep', description: 'x', parameters: {} } },
+            { type: 'function', function: { name: 'read', description: 'x', parameters: {} } },
+          ],
+        },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      const sent = up.st.bodies[up.st.bodies.length - 1];
+      const names = (sent.tools || []).map((t) => (t.function && t.function.name) || t.name);
+      // 'Bash' 大小写不同也算"已有"（不补第二个），但不得改写成小写（那是客户端的工具名）
+      assert.strictEqual(names.filter((n) => String(n).toLowerCase() === 'bash').length, 1,
+        'bash/Bash 不得同时出现（上游当重复项拒）：' + names.join(','));
+      assert.ok(names.includes('Bash'), '客户端自己的拼写不能被改：' + names.join(','));
     } finally { killGw(gw); closeUp(up); }
   });
 

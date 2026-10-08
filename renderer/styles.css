@@ -390,3 +390,29 @@ details.adv[open] > summary, details.gw-adv[open] > summary { margin-bottom: 8px
 /* 「顺便实测超时」这类带长说明的勾选项：说明要能换行，别把行撑爆 */
 label.chk { display: inline-flex; align-items: flex-start; gap: 6px; }
 label.chk .hint { display: inline; }
+
+/* 免费通道预设：状态徽章必须显眼 —— 这些通道随时会失效，
+   用户第一眼要看到的是「现在到底能不能用」，而不是宣传语。 */
+.preset-row {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 11px 13px;
+  margin: 10px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.preset-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.preset-badge {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  white-space: nowrap;
+}
+.preset-badge.ok { color: #7ee2a8; border-color: #2f6f4f; background: #16281f; }
+.preset-badge.bad { color: #ff9c9c; border-color: #7a2f2f; background: #2a1717; }
+.preset-badge.warn { color: #ffd479; border-color: #7a5a17; background: #2a2211; }
+.preset-status { line-height: 1.7; }
+.preset-row .btn { align-self: flex-start; margin-top: 5px; }
+.preset-risks { margin: 6px 0; padding-left: 18px; line-height: 1.8; }
