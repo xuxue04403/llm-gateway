@@ -134,14 +134,36 @@ function parseJsonObject(text) {
 function restore(file, suffixes) {
   const info = backupInfo(file, suffixes);
   if (!info) return { ok: false, error: '没有可用的备份：' + file + '（找过 ' + candidateSuffixes(suffixes).join(' / ') + '）' };
-  try {
-    if (exists(file)) {
-      fs.copyFileSync(file, file + '.bak-llmgateway-before-restore');
+  // 恢复前先把"当前内容"留一份 —— 用户可能想反悔（恢复错了备份）
+  let before = '';
+  if (exists(file)) {
+    before = file + '.bak-llmgateway-before-restore';
+    try {
+      fs.copyFileSync(file, before);
+    } catch (e) {
+      return {
+        ok: false,
+        error: '恢复前无法备份当前内容，已中止（不动原文件）：' + (e && e.message ? e.message : e),
+      };
     }
-    fs.copyFileSync(info.path, file);
-    return { ok: true, from: info.path };
+  }
+  // ⚠⚠ 必须走 **tmp + rename**，不能用 `copyFileSync(备份, 目标)`。
+  //
+  // copyFile 是**就地覆盖**：它先把目标截断再写入，中途失败（ENOSPC / EIO / 权限 / 被占用）
+  // 会把用户的配置留成**半截** —— 既不是原文、也不是备份，而且通常已经不是合法 JSON/TOML。
+  // 恢复是用户最后的安全网，这张网自己撕了文件就真没救了。
+  // 实测（审计脚本 audit-restore-atomic）：模拟 ENOSPC 后 settings.json 只剩
+  // `{"env": {"ANTHROPIC_AU`（30 字节，JSON.parse 报 Unterminated string）。
+  // rename 在同一文件系统内是原子的 —— 要么全换、要么完全不换。
+  const tmp = file + '.tmp-llmgateway-restore-' + process.pid;
+  try {
+    fs.copyFileSync(info.path, tmp);
+    fs.renameSync(tmp, file);
+    return { ok: true, from: info.path, before };
   } catch (e) {
-    return { ok: false, error: e && e.message ? e.message : String(e) };
+    // 临时文件里是用户的完整配置，失败时必须清掉（既是垃圾也是泄漏面）
+    try { if (exists(tmp)) fs.unlinkSync(tmp); } catch (_) { /* 忽略 */ }
+    return { ok: false, before, error: e && e.message ? e.message : String(e) };
   }
 }
 
@@ -423,7 +445,42 @@ function tomlHeaderKey(raw) {
 
 /** 真正的表头行（跳过注释与字符串内容）。 */
 function tomlScanHeaders(lines) {
-  return tomlLex(lines).headers;
+  return tomlLexMemo(lines).headers;
+}
+
+/**
+ * `tomlLex` 的**记忆化**：同一份 lines 数组只词法扫描一次。
+ *
+ * ⚠ 这不是"顺手优化一下"，是修一个**实测把主进程冻住 33 秒**的性能 bug。
+ *
+ * `forEachCodeLine()` 每次调用都会重新 `tomlLex(lines)`（整份文件扫一遍），
+ * 而 `tomlValidate()` 的"同一张表内键重复"检查对**每张表**都要调一次它 ——
+ * 于是复杂度是 O(表数 × 行数)，表一多就是平方级。
+ * 而 `tomlValidate` 是在 Electron **主进程里同步**跑的（codex 的 preview/apply 各调 1~2 次），
+ * 阻塞期间窗口与托盘全部无响应。
+ *
+ * 实测（审计脚本 audit-toml-perf / audit-e2e-freeze）：
+ * ```
+ *    表头数   文件      preview+apply 合计（主进程完全阻塞）
+ *     500     27 KB          2.0 s
+ *    1000     55 KB          8.9 s
+ *    2000    110 KB         33.4 s
+ *    4000    222 KB         ~133 s（推算）
+ * ```
+ * 真实用户的 config.toml 很少到 100 KB，但 `[projects."…"]` 那种表会随使用自然堆积 ——
+ * 一旦堆到千级，点一次「写入 Codex」就是几十秒假死。
+ *
+ * 用 WeakMap 以数组**身份**为键：`tomlValidate` 内部从头到尾用的是同一个 lines 数组，
+ * 一次调用只扫一遍；跨调用不缓存（避免文件改了还拿旧结果）。
+ */
+const tomlLexCache = new WeakMap();
+function tomlLexMemo(lines) {
+  let v = tomlLexCache.get(lines);
+  if (!v) {
+    v = tomlLex(lines);
+    tomlLexCache.set(lines, v);
+  }
+  return v;
 }
 
 /**
@@ -435,10 +492,13 @@ function tomlScanHeaders(lines) {
  * 第 1 行命中返回 `1`，既不等于 `true` 也不等于 `false`，于是"找不到键"、顶层键被重复插入）。
  *
  * @param fn (rawLine, index, codeLine) => any
+ * @param from 起始行下标（默认 0）。**必须支持它**：调用方经常只需要扫一段，
+ *   而每次都从 0 扫是 O(表数 × 行数) —— 见 tomlLexMemo 的说明。
  */
-function forEachCodeLine(lines, limit, fn) {
-  const { inMultiAt, codeOf } = tomlLex(lines);
-  for (let i = 0; i < limit; i++) {
+function forEachCodeLine(lines, limit, fn, from) {
+  const { inMultiAt, codeOf } = tomlLexMemo(lines);
+  const start = from === undefined || from === null ? 0 : Math.max(0, from);
+  for (let i = start; i < limit; i++) {
     if (inMultiAt[i]) continue;
     const hit = fn(String(lines[i] == null ? '' : lines[i]), i, codeOf[i]);
     if (hit !== false && hit !== undefined) return i;
@@ -533,7 +593,7 @@ function tomlUpsertTable(text, header, bodyLines) {
  * 用它区分"代码区空行"与"字符串内容空行"。
  */
 function foldBlankLines(lines) {
-  const { inMultiAt } = tomlLex(lines);
+  const { inMultiAt } = tomlLexMemo(lines);
   const out = [];
   let blankRun = 0;
   for (let i = 0; i < lines.length; i++) {
@@ -634,7 +694,7 @@ function endsInsideQuote(code) {
 function tomlValidate(text) {
   const src = String(text == null ? '' : text);
   const lines = src.split(/\r?\n/);
-  const lex = tomlLex(lines);
+  const lex = tomlLexMemo(lines);
 
   // 0) 行形状：代码行必须是"键 = 值"、表头或注释之一。
   //
@@ -722,15 +782,17 @@ function tomlValidate(text) {
       const end = hi + 1 < heads.length ? heads[hi + 1].line : lines.length;
       const seen = new Set();
       let dup = '';
-      forEachCodeLine(lines, end, (raw, i) => {
-        if (i <= h.line) return false;
+      // ⚠ 第四个参数是**起始行**：这一段的扫描范围本来就只有 [h.line+1, end)，
+      // 旧实现从 0 开始扫（靠回调里 `if (i <= h.line) return false` 跳过），
+      // 于是每张表都要重走一遍前面的所有行 → O(表数 × 行数)。
+      forEachCodeLine(lines, end, (raw) => {
         const m = /^\s*([A-Za-z0-9_-]+)\s*=/.exec(raw);
         if (m) {
           if (seen.has(m[1])) dup = m[1];
           seen.add(m[1]);
         }
         return false;
-      });
+      }, h.line + 1);
       if (dup) return (hi < 0 ? '顶层的键 ' : '表 [' + h.name + '] 里的键 ') + dup + ' 重复了';
     }
   }

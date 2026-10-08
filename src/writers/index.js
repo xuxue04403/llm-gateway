@@ -102,12 +102,77 @@ function detectAll(baseCtx) {
   return out;
 }
 
+/**
+ * 预览内容里的**密钥打码**。
+ *
+ * 界面对用户的承诺是「密钥已打码显示」（renderer/js/clients.js），但旧实现只对
+ * **本程序登记过的那把**上游 Key 打码 —— 用户自己文件里的**其它**凭据是原样送到渲染层的。
+ * 实测（审计脚本 audit-leak）三个客户端全中：
+ *   · claude-code：用户原有的 `env.ANTHROPIC_AUTH_TOKEN` 明文
+ *   · opencode：**别的** provider 的 `options.apiKey` 明文
+ *   · codex：`experimental_bearer_token` 明文（before 和 after 里都有）
+ * 预览是要给用户看的，这些却都不是"本程序写入的内容" —— 没必要也不应该出现在界面上。
+ *
+ * 打码策略（**按键名**而不是"见长串就糊"）：
+ *   ① 键名里含 token / key / secret / password / credential 的 → 值的字符串字面量打码
+ *   ② 已知的令牌前缀（sk- / github_pat_ / ghp_ / oc_sk_ / eyJ…）无论键名 → 打码
+ * 这样用户仍然能看清**结构**（哪个键、放在哪一层），只是看不到密钥本体 ——
+ * 既满足"已打码"的承诺，也不妨碍他核对写入位置。
+ *
+ * 只保留首 6 位与末 4 位：够用户认出"是哪一把"，不足以被拿去用。
+ */
+const SECRET_KEY_VALUE_RE = /((?:^|[\s"'[{,])["']?[A-Za-z0-9_.\-[\]]*(?:token|apikey|api_key|secret|password|passwd|credential)[A-Za-z0-9_.\-[\]]*["']?\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|[^\s,}\]]+)/gi;
+const SECRET_TOKEN_RE = /\b((?:sk|oc_sk|github_pat|gh[pousr]|xox[baprs])[-_][A-Za-z0-9_\-]{12,}|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{6,})/g;
+// 明显不是密钥的值：布尔 / null / 纯数字 / 少数几个"值是路径或模式"的常见配置项。
+// 不打码它们，免得把 `key = "file"`、`apiKey = 12345` 这类配置也糊掉，反而看不清结构。
+const SECRET_KEY_NOISE = /^("?)(?:true|false|null|\d+)\1$/i;
+const SECRET_KEY_NOISE_PATHLIKE = /^(?:"?)(?:file|keyring|none|auto|env|inherit|default)(?:"?)$/i;
+
+function maskOne(whole) {
+  const s = String(whole);
+  if (s.length <= 12) return s;
+  return s.slice(0, 6) + '…' + s.slice(-4) + '（已打码）';
+}
+
+function maskSecretsInText(text) {
+  if (typeof text !== 'string' || !text) return text;
+  let out = text.replace(SECRET_KEY_VALUE_RE, (m, prefix, val) => {
+    // 少打码几类明显不是密钥的值，免得把 `key = "file"` 这种配置项也糊掉
+    if (SECRET_KEY_NOISE.test(val) || SECRET_KEY_NOISE_PATHLIKE.test(val)) return m;
+    const q = val[0] === '"' || val[0] === "'" ? val[0] : '';
+    const inner = q ? val.slice(1, -1) : val;
+    if (inner.length < 8) return m;
+    return prefix + q + maskOne(inner) + q;
+  });
+  out = out.replace(SECRET_TOKEN_RE, (m) => maskOne(m));
+  return out;
+}
+
+/** 对预览结果里的所有文本字段做一遍打码（**不改动磁盘上的任何东西**）。 */
+function maskPreviewResult(p) {
+  if (!p || typeof p !== 'object') return p;
+  const out = Object.assign({}, p);
+  if (Array.isArray(p.files)) {
+    out.files = p.files.map((f) => {
+      if (!f || typeof f !== 'object') return f;
+      const g = Object.assign({}, f);
+      if (typeof g.before === 'string') g.before = maskSecretsInText(g.before);
+      if (typeof g.after === 'string') g.after = maskSecretsInText(g.after);
+      return g;
+    });
+  }
+  if (Array.isArray(p.warnings)) out.warnings = p.warnings.map((w) => maskSecretsInText(w));
+  if (Array.isArray(p.guard)) out.guard = p.guard.map((w) => maskSecretsInText(w));
+  if (typeof p.summary === 'string') out.summary = maskSecretsInText(p.summary);
+  return out;
+}
+
 function preview(id, ctx) {
   const t = get(id);
   if (!t) return { ok: false, errors: ['未知目标：' + id] };
   try {
     const p = t.preview(ctx);
-    return Object.assign({ ok: true, errors: [] }, p);
+    return Object.assign({ ok: true, errors: [] }, maskPreviewResult(p));
   } catch (e) {
     return { ok: false, errors: ['预览失败：' + (e && e.message ? e.message : e)] };
   }

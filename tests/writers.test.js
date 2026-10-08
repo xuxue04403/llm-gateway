@@ -867,4 +867,110 @@ t('dsh：patch 里已有别的供应商时不得被抹掉（合并而不是整�
   assert.ok(/^\s{6}gateway:\s*$/m.test(patch), 'gateway 应当被加进去');
 });
 
+/* ==================== 第六轮审计修复的回归测试 ==================== */
+
+t('util.restore：回拷失败也必须让文件保持完整（旧实现是就地覆盖，会留半截）', () => {
+  // 实测事故（审计脚本 audit-restore-atomic）：旧实现用 fs.copyFileSync(备份, 目标)，
+  // 那是**就地覆盖** —— 中途失败（ENOSPC/EIO/权限）会把用户配置截断成半截，
+  // 既不是原文也不是备份，而且通常已经不是合法 JSON。恢复是最后的安全网，
+  // 这张网自己撕了文件就真没救了。现在走 tmp+rename（同文件系统内原子）。
+  const home = newHome('restore-atomic');
+  const f = path.join(home, 'settings.json');
+  fs.mkdirSync(home, { recursive: true });
+  const ORIG = '{ "user": "keep-me" }';
+  fs.writeFileSync(f, ORIG, 'utf8');
+  const w = util.writeAtomic(f, '{ "gateway": 1 }');
+  assert.strictEqual(w.ok, true, '写入应成功');
+  assert.ok(util.backupInfo(f), '应留下备份');
+
+  // 让回拷那一步失败：把 renameSync 换成抛错（模拟目标被独占 / 磁盘写不进去）
+  const realRename = fs.renameSync;
+  fs.renameSync = () => { const e = new Error('ENOSPC: no space left on device'); e.code = 'ENOSPC'; throw e; };
+  let r;
+  try { r = util.restore(f); } finally { fs.renameSync = realRename; }
+
+  assert.strictEqual(r.ok, false, '回拷失败时 restore 应如实返回失败');
+  const now = fs.readFileSync(f, 'utf8');
+  assert.strictEqual(now, '{ "gateway": 1 }',
+    '失败后文件必须**原封不动**（tmp+rename 的语义），实际内容：' + JSON.stringify(now.slice(0, 60)));
+  // 半截的典型特征：能读出来但 JSON.parse 失败
+  assert.doesNotThrow(() => JSON.parse(now), '文件必须仍是合法 JSON，不能是半截');
+  assert.ok(!/tmp-llmgateway-restore/.test(fs.readdirSync(home).join(',')),
+    '临时文件必须被清掉（里面是用户完整配置）');
+});
+
+t('dsh：DSH_SETTINGS / DSH_CREDENTIALS 不得绕过 ctx.home 指向真实 dsh', () => {
+  // 实测事故（审计脚本 audit-dsh-env / env2）：这两个环境变量**无条件覆盖**了 home 派生的
+  // 路径，于是测试（ctx.home=临时目录）写到了真实 dsh 的配置上。与 DSH_PROFILE_DIR 那次同类：
+  // 环境变量与调用方显式参数争夺同一个路径的所有权。
+  // 规矩：显式参数一旦给出，就必须完全覆盖环境变量。
+  const home = newHome('dsh-env');
+  const fakeReal = path.join(home, 'real-dsh-home');
+  fs.mkdirSync(fakeReal, { recursive: true });
+  const savedS = process.env.DSH_SETTINGS;
+  const savedC = process.env.DSH_CREDENTIALS;
+  process.env.DSH_SETTINGS = path.join(fakeReal, 'settings.yaml');
+  process.env.DSH_CREDENTIALS = path.join(fakeReal, '.credentials.yaml');
+  try {
+    const p = require(path.join(__dirname, '..', 'src', 'writers', 'target-dsh.js')).paths({ home });
+    const want = path.join(home, '.dsh');
+    assert.strictEqual(p.settings, path.join(want, 'settings.yaml'),
+      'ctx.home 给出后，settings 必须由它派生而不是被环境变量带走，实际 ' + p.settings);
+    assert.strictEqual(p.credentials, path.join(want, '.credentials.yaml'),
+      'credentials 同上，实际 ' + p.credentials);
+    assert.ok(p.settings.startsWith(want) && p.credentials.startsWith(want),
+      '两个路径都不得逃出 ctx.home 派生的 .dsh');
+  } finally {
+    if (savedS === undefined) delete process.env.DSH_SETTINGS; else process.env.DSH_SETTINGS = savedS;
+    if (savedC === undefined) delete process.env.DSH_CREDENTIALS; else process.env.DSH_CREDENTIALS = savedC;
+  }
+});
+
+t('dsh：「恢复」必须连 profile patch 一起还原（否则 dsh 里网关照旧生效）', async () => {
+  // 实测事故（审计脚本 audit-dsh-restore）：只恢复 settings + credentials 时，
+  // 点完「恢复」profile patch 里的 providers.gateway **仍然在** ——
+  // 用户以为撤掉了，其实 dsh 里网关照旧生效，而界面显示「恢复成功」。
+  // profile patch 才是 dsh 0.1.7+ 真正加载的载体（settings.yaml 已是一次性导入源）。
+  const home = newHome('dsh-restore-patch');
+  const profDir = path.join(home, '.dsh', 'profiles', 'desktop');
+  fs.mkdirSync(profDir, { recursive: true });
+  const patch = path.join(profDir, 'cordis.patch.yml');
+  const ORIG_PATCH = ['- id: llm-pi-ai', '  name: x', '  config:', '    providers: {}', ''].join('\n');
+  fs.writeFileSync(patch, ORIG_PATCH, 'utf8');
+
+  const w = await writers.apply('dsh', ctxFor(home));
+  assert.strictEqual(w.ok, true, '写入应成功：' + JSON.stringify(w.errors || w.output));
+  assert.ok(/gateway:/.test(fs.readFileSync(patch, 'utf8')), '写入后 patch 里应有 gateway');
+
+  const r = await writers.restore('dsh', ctxFor(home));
+  assert.strictEqual(r.ok, true, '恢复应成功：' + JSON.stringify(r.errors));
+  const after = fs.readFileSync(patch, 'utf8');
+  assert.strictEqual(after, ORIG_PATCH,
+    'profile patch 必须被逐字节还原，实际：' + JSON.stringify(after.slice(0, 80)));
+  assert.ok(!/gateway:/.test(after), '恢复后 patch 里不得再有 gateway');
+});
+t('预览：必须对**用户自己文件里**的其它凭据也打码（界面对此有明确承诺）', () => {
+  // 实测事故（审计脚本 audit-leak）：界面上写着「密钥已打码显示」，但旧实现只对本程序
+  // **登记过的那把**上游 Key 打码 —— 用户自己配置里的其它凭据原样送到了渲染层。三个客户端全中：
+  //   claude-code: env.ANTHROPIC_AUTH_TOKEN   opencode: 别的 provider 的 options.apiKey
+  //   codex:       experimental_bearer_token
+  // 预览是给人看的，那些又不是本程序写入的内容，没必要也不应该出现在界面上。
+  const home = newHome('mask-preview');
+  const cc = path.join(home, '.claude');
+  fs.mkdirSync(cc, { recursive: true });
+  const OTHER = 'agentrouter-7f3d9c2e5a1b4c8d';
+  fs.writeFileSync(path.join(cc, 'settings.json'), JSON.stringify({
+    env: { ANTHROPIC_AUTH_TOKEN: OTHER, ANTHROPIC_BASE_URL: 'https://example.com' },
+  }, null, 2), 'utf8');
+
+  const p = writers.preview('claude-code', ctxFor(home));
+  assert.strictEqual(p.ok, true, '预览应成功：' + JSON.stringify(p.errors));
+  const blob = JSON.stringify(p.files || []);
+  assert.ok(!blob.includes(OTHER), '用户原有的第三方 token 不得出现在预览里（明文泄漏）');
+  assert.ok(/已打码/.test(blob), '应当明确标出"已打码"，让用户知道被遮了');
+  // 结构仍要看得见 —— 打码不能把预览变得没用
+  assert.ok(blob.includes('ANTHROPIC_AUTH_TOKEN'), '键名必须保留（用户要核对结构）');
+  assert.ok(blob.includes('ANTHROPIC_BASE_URL'), '非密钥字段不能被误伤');
+  assert.ok(blob.includes('https://example.com'), '普通值必须原样可见');
+});
 run();

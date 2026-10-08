@@ -22,6 +22,17 @@
  */
 const MAX_TIMEOUT_MS = 600 * 1000;             // 逐模型/供应商级超时上限 10 分钟
 const MAX_CONTEXT_WINDOW = 10 * 1000 * 1000;   // 上下文长度上限 1000 万
+
+/**
+ * 客户端仿真档的**唯一清单**（全局 `clientProfile` 与逐供应商 `clientProfile` 共用）。
+ *
+ * ⚠ 这份清单必须与引擎 `model-gateway.mjs` 的 `upstreamRequestHeaders()` 分支一一对应。
+ * 曾经这里只写了 claude/codex/cline，而引擎那轮已加了 opencode ——
+ * 于是**免费通道预设写进去的 `clientProfile: 'opencode'` 被保存校验直接拒掉**，
+ * 用户点「保存并生效」只看到一句"非法"，功能等于没做（审计脚本 audit-preset 抓到的）。
+ * `tests/unit.js` 有一条守卫测试会拿引擎源码来比这份清单，两边再也漂不了。
+ */
+const CLIENT_PROFILES = ['claude', 'codex', 'cline', 'opencode'];
 const MAX_MAX_TOKENS = 1000 * 1000;            // 单次最大输出上限 100 万
 
 const { spawn, spawnSync } = require('child_process');
@@ -226,8 +237,8 @@ function validateConfigText(text) {
   // 客户端仿真档（本程序新增校验）：拼错会静默回落成"不透传标识"
   if (cfg.clientProfile !== undefined && cfg.clientProfile !== null && String(cfg.clientProfile).trim() !== '') {
     const c = String(cfg.clientProfile).trim();
-    if (!['claude', 'codex', 'cline'].includes(c)) {
-      return { ok: false, error: 'clientProfile 非法（可选：claude / codex / cline，留空=关闭）当前：' + JSON.stringify(cfg.clientProfile) };
+    if (!CLIENT_PROFILES.includes(c)) {
+      return { ok: false, error: 'clientProfile 非法（可选：' + CLIENT_PROFILES.join(' / ') + '，留空=关闭）当前：' + JSON.stringify(cfg.clientProfile) };
     }
   }
   // 代理（本程序新增校验）：enabled=true 但 url 空会让引擎回退自动探测，
@@ -365,8 +376,8 @@ function validateConfigText(text) {
       }
       if (p.clientProfile !== undefined && String(p.clientProfile).trim() !== '') {
         const c = String(p.clientProfile).trim();
-        if (!['claude', 'codex', 'cline'].includes(c)) {
-          return { ok: false, error: who + ' 的 clientProfile 非法（可选：claude / codex / cline）' };
+        if (!CLIENT_PROFILES.includes(c)) {
+          return { ok: false, error: who + ' 的 clientProfile 非法（可选：' + CLIENT_PROFILES.join(' / ') + '）' };
         }
       }
       if (p.accounts !== undefined) {

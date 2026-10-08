@@ -983,4 +983,83 @@ t('图标：PNG 编码合法（签名 + IHDR 尺寸 + IEND 结尾）', () => {
   assert.ok(url.startsWith('data:image/png;base64,'), 'dataURL 前缀');
 });
 
+/* ---- 第六轮审计：clientProfile 的三份清单必须同源 ---- */
+
+t('clientProfile：主进程校验白名单与引擎分支一一对应（曾经漂移导致新功能直接不可用）', () => {
+  // 实测事故（审计脚本 audit-preset）：引擎那轮加了 `clientProfile: 'opencode'`，
+  // 而 gateway-manager.js 的校验白名单还只有 claude/codex/cline ——
+  // 于是「免费通道 → OpenCode Go 套餐」预设写进去的配置**被保存校验直接拒掉**，
+  // 用户点「保存并生效」只看到一句"clientProfile 非法"，功能等于没做。
+  // 更隐蔽的是编辑抽屉的 <select> 也没有这个选项：打开编辑器时
+  // `$('#edProfile').value = p.clientProfile` 匹配不到任何 option → 变成空串 →
+  // 点「应用」时被 `delete next.clientProfile` **静默抹掉**。
+  //
+  // 这条测试直接拿引擎源码来比，三份清单（引擎分支 / 主进程白名单 / 界面选项）从此漂不了。
+  const engineSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'gateway', 'model-gateway.mjs'), 'utf8');
+  const mgrSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'gateway-manager.js'), 'utf8');
+  const uiSrc = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'js', 'providers.js'), 'utf8');
+
+  // ① 引擎实际认识哪些档：upstreamRequestHeaders() 里的 `clientProfile === 'x'` 分支
+  const engineProfiles = new Set();
+  for (const m of engineSrc.matchAll(/clientProfile\s*===\s*'([a-z]+)'/g)) engineProfiles.add(m[1]);
+  assert.ok(engineProfiles.size >= 3, '应从引擎里解析出至少 3 个档，实际 ' + [...engineProfiles].join(','));
+
+  // ② 主进程白名单
+  const wl = /const CLIENT_PROFILES = \[([^\]]+)\]/.exec(mgrSrc);
+  assert.ok(wl, 'gateway-manager.js 里应有一份 CLIENT_PROFILES 常量（唯一清单）');
+  const mgrProfiles = new Set(wl[1].split(',').map((s) => s.trim().replace(/^'|'$/g, '')).filter(Boolean));
+
+  // ③ 界面下拉的选项
+  const sel = /<select class="input" id="edProfile">([\s\S]*?)<\/select>/.exec(uiSrc);
+  assert.ok(sel, '应能找到 #edProfile 的 select 块');
+  const uiProfiles = new Set([...sel[1].matchAll(/<option value="([a-z]+)"/g)].map((m) => m[1]));
+
+  // 三份清单必须完全一致
+  const sortJoin = (s) => [...s].sort().join(',');
+  assert.strictEqual(sortJoin(mgrProfiles), sortJoin(engineProfiles),
+    '主进程白名单与引擎分支不一致：\n  引擎 = ' + sortJoin(engineProfiles) + '\n  白名单 = ' + sortJoin(mgrProfiles)
+      + '\n  → 引擎支持但白名单没有的档，保存时会被拒（功能等于没做）；反之则是放行了引擎不认的值（静默回落）');
+  assert.strictEqual(sortJoin(uiProfiles), sortJoin(engineProfiles),
+    '界面下拉选项与引擎分支不一致：\n  引擎 = ' + sortJoin(engineProfiles) + '\n  下拉 = ' + sortJoin(uiProfiles)
+      + '\n  → 下拉里没有的档，打开编辑器时会被 value 匹配失败重置成空串，点「应用」时静默删掉该字段');
+});
+
+/* ---- 第六轮审计：tomlValidate 的复杂度守卫 ---- */
+
+t('tomlValidate：大文件不得出现平方级退化（实测曾让主进程冻住 33 秒）', () => {
+  // 实测事故（审计脚本 audit-toml-perf / audit-e2e-freeze）：
+  // forEachCodeLine 每次调用都重新词法扫描整份文件，而"同一张表内键重复"检查
+  // 对**每张表**都要调一次 → O(表数 × 行数)。而 tomlValidate 在 Electron 主进程里**同步**跑，
+  // 于是点一次「写入 Codex」会假死：
+  //     1000 表 / 55 KB → 1.6 s
+  //     2000 表 / 110 KB → 6.6 s（端到端 preview+apply 合计 33.4 s）
+  //     4000 表 / 222 KB → 27 s
+  // 修法是 tomlLex 记忆化 + 给 forEachCodeLine 加起始行。
+  // 这条守卫用"翻倍后耗时的增长倍数"判定：线性/常数级应远低于 4×（平方级会接近 4×）。
+  // 阈值放得很宽（只看数量级），避免在慢机器上误报。
+  const util = require(path.join(__dirname, '..', 'src', 'writers', 'util.js'));
+  const build = (n) => {
+    const L = ['cli_auth_credentials_store = "file"', ''];
+    for (let i = 0; i < n; i++) L.push('[projects."D:\\\\w\\\\p' + i + '"]', 'trust_level = "trusted"', '');
+    return L.join('\n');
+  };
+  const timeIt = (n) => {
+    const text = build(n);
+    const t0 = Date.now();
+    util.tomlValidate(text);
+    return Date.now() - t0;
+  };
+  timeIt(200);                      // 预热（首次会建缓存/填 JIT）
+  const t1 = Math.max(1, timeIt(1000));
+  const t2 = Math.max(1, timeIt(2000));
+
+  // 绝对上界：2000 张表在现代机器上应在百毫秒级（修复前是 6.6 秒）
+  assert.ok(t2 < 1500, '2000 张表的 tomlValidate 不应超过 1.5 秒，实际 ' + t2 + 'ms（平方级退化回来了？）');
+  // 增长趋势：表数翻倍，耗时不应接近 4 倍（平方级特征）
+  const ratio = t2 / t1;
+  assert.ok(ratio < 3.2,
+    '表数翻倍后耗时增长了 ' + ratio.toFixed(2) + '×（' + t1 + 'ms → ' + t2 + 'ms），'
+      + '接近平方级特征 —— 检查 tomlLexMemo 与 forEachCodeLine 的 starting-line 参数是否还在');
+});
+
 run();

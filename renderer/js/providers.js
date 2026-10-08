@@ -308,6 +308,7 @@ function openEditor(i) {
             <option value="cline">cline</option>
             <option value="claude">claude</option>
             <option value="codex">codex</option>
+            <option value="opencode">opencode（OpenCode 端点必需：补 x-opencode-session 等头）</option>
           </select>
         </div>
 

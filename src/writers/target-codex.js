@@ -313,7 +313,15 @@ function apply(ctx) {
     const authObj = parsed.value;
     authObj.OPENAI_API_KEY = String(ctx.apiKey || '');
     const wa = util.writeAtomic(authFile, JSON.stringify(authObj, null, 2) + '\n');
-    if (!wa.ok) return { ok: false, errors: ['config.toml 已写入，但 auth.json 写入失败：' + wa.error], files: done, backups };
+    if (!wa.ok) {
+      // ⚠ 失败时也必须带上 auth.json 自己的备份路径。
+      // writeAtomic 是"先备份再写"，走到这里它的备份**已经在磁盘上了** ——
+      // 而写入失败恰恰是用户最需要知道备份在哪的时候（否则他可能把那份唯一备份当垃圾删掉）。
+      // 实测（审计脚本 audit-restore-atomic）：`auth.json.bak-llmgateway` 确实生成且内容正确，
+      // 但界面拿不到它，用户只能自己去目录里翻。
+      const withAuthBak = wa.backup ? backups.concat([wa.backup]) : backups;
+      return { ok: false, errors: ['config.toml 已写入，但 auth.json 写入失败：' + wa.error], files: done, backups: withAuthBak };
+    }
     done.push(authFile);
     if (wa.backup) backups.push(wa.backup);
   }

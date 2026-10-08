@@ -55,10 +55,19 @@ function effectiveKey(ctx) {
 
 function paths(ctx) {
   const home = dshHome(ctx);
+  // ⚠ 只有"目标就是真实 dsh"（调用方**没有**指定 home）时才看环境变量 ——
+  // 与 resolveProfile 同一条规矩。
+  //
+  // 实测事故（审计脚本 audit-dsh-env / audit-dsh-env2）：测试把 ctx.home 指向临时目录，
+  // 但开发机的 shell 里带着 DSH_SETTINGS / DSH_CREDENTIALS —— 这两个变量**无条件覆盖**了
+  // home 派生的路径，于是写入落到了**真实 dsh 的配置文件**上（脚本确认内容真的被改写）。
+  // 这和之前 DSH_PROFILE_DIR 那次是同一类错误：环境变量与调用方显式参数争夺同一个路径的
+  // 所有权。规矩很简单 —— **显式参数一旦给出，就必须完全覆盖环境变量**。
+  const useEnv = !(ctx && ctx.home);
   return {
     home,
-    settings: process.env.DSH_SETTINGS || path.join(home, 'settings.yaml'),
-    credentials: process.env.DSH_CREDENTIALS || path.join(home, '.credentials.yaml'),
+    settings: (useEnv && process.env.DSH_SETTINGS) || path.join(home, 'settings.yaml'),
+    credentials: (useEnv && process.env.DSH_CREDENTIALS) || path.join(home, '.credentials.yaml'),
     profilesDir: path.join(home, 'profiles'),
   };
 }
@@ -422,7 +431,15 @@ function apply(ctx) {
 function restore(ctx) {
   const p = paths(ctx);
   const results = [];
-  for (const f of [p.settings, p.credentials]) {
+  // ⚠ profile patch **必须一起恢复**：它才是 dsh 0.1.7+ 真正加载的载体
+  //（settings.yaml 已退化成一次性导入源，见 findProfilePatch 的说明）。
+  // 审计脚本 audit-dsh-restore 实测：只恢复 settings + credentials 时，点完「恢复」
+  // profile patch 里的 `providers.gateway` **仍然在** —— 用户以为撤掉了，其实 dsh 里
+  // 网关照旧生效，而界面上显示的是"恢复成功"。
+  const prof = resolveProfile(ctx);
+  const targets = [p.settings, p.credentials];
+  if (prof.patch) targets.push(prof.patch);
+  for (const f of targets) {
     if (util.backupInfo(f)) results.push(Object.assign({ file: f }, util.restore(f)));
   }
   return {
