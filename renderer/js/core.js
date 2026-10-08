@@ -212,7 +212,24 @@ function modelEntriesOf(p) {
 
 function collectModels() {
   const map = new Map();
-  for (const p of enabledProviders()) {
+  const provs = enabledProviders();
+  // 提供方在"模型总览"里的排列顺序 = **网关实际的路由顺序**（优先级升序；同级按配置顺序）。
+  //
+  // 旧实现直接按配置数组顺序 push，于是 `deepseek-v4-flash` 显示成
+  // `sensenova, agentrouter, cline, amd, workbuddy`，而网关真实的尝试顺序是
+  // `sensenova(1) → amd(2) → workbuddy(2) → agentrouter(5) → cline(6)`。
+  // 这一列是用户判断"这家挂了还有没有救"的唯一依据，顺序错了会直接误导他
+  //（比如以为 cline 排在 amd 前面、挂了会先切 cline）。
+  //
+  // 与引擎的 providerPriority() 同一条规矩：缺省/非数字/≤0 一律按 1。
+  const prio = new Map();
+  const seq = new Map();
+  provs.forEach((p, i) => {
+    const n = Number(p.priority);
+    prio.set(p.id, Number.isFinite(n) && n > 0 ? n : 1);
+    seq.set(p.id, i);
+  });
+  for (const p of provs) {
     for (const e of modelEntriesOf(p)) {
       let r = map.get(e.as);
       if (!r) { r = { id: e.as, vision: false, contextWindow: null, maxTokens: null, providers: [] }; map.set(e.as, r); }
@@ -224,7 +241,13 @@ function collectModels() {
       if (mt) r.maxTokens = r.maxTokens ? Math.min(r.maxTokens, mt) : mt;
     }
   }
-  return [...map.values()].sort((a, b) => String(a.id).localeCompare(String(b.id), 'en', { numeric: true, sensitivity: 'base' }));
+  const out = [...map.values()].sort((a, b) => String(a.id).localeCompare(String(b.id), 'en', { numeric: true, sensitivity: 'base' }));
+  // 按路由顺序排每个模型的提供方，并把优先级一并带出去（界面用它做 tooltip）
+  for (const r of out) {
+    r.providers.sort((x, y) => (prio.get(x) - prio.get(y)) || (seq.get(x) - seq.get(y)));
+    r.providerPriority = r.providers.map((id) => prio.get(id));
+  }
+  return out;
 }
 
 function modelNames() { return collectModels().map((m) => m.id); }

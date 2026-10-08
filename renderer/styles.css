@@ -245,6 +245,10 @@ select.input { cursor: pointer; }
 .tag.info { border-color: #2b5bd7; color: #9dc0ff; background: #14213d; }
 .tag.purple { border-color: #5b3a91; color: #d5b3ff; background: #21163a; }
 .tag.sm { font-size: 10px; padding: 0 6px; }
+/* 「模型总览」里排在最前、且**该优先级层只有它一家**的提供方 —— 也就是一定会被先试的那个。
+   刻意只用左边框加一道竖线（而不是整块高亮）：这一列的用处是快速扫读顺序，
+   整块高亮会把"顺序"这个主要信息淹掉。同级多家时不加（层内轮转，谁先试不确定）。 */
+.tag.lead { border-left: 2px solid var(--green, #22c55e); }
 
 /* ================= 表格 ================= */
 .table-wrap { overflow: auto; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); }
