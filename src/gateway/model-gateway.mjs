@@ -2646,6 +2646,13 @@ async function aggregateOpenAIStream(upstream, headBytes) {
       if (choice.finish_reason) finish = choice.finish_reason;
     }
   };
+  // ⚠ 跟踪"上游说完了吗"。`finish` 为 null 且没见到 `[DONE]` 时，下面那句
+  // `finish_reason: finish || 'stop'`（L2673）会**凭空造一个正常的结束原因** ——
+  // 上游被干净腰斩（代理掉线、对端 close 而不 reset，`reader.read()` 返回 `done:true`
+  // 且**不抛异常**，所以 catch 抓不到）时，客户端拿到的是
+  // `200 + 半截内容 + finish_reason:"stop"`，**看起来完全正常**。
+  // 这是"任务静默终止"在本路径（上游强制流式 + 客户端要非流式）上的形态。
+  let sawDone = false;
   try {
     // 注意：forward() 为识别"首事件即错误"已偷看过首个事件，那些字节必须原样喂回来，否则丢内容
     if (headBytes && headBytes.length) feed(Buffer.from(headBytes).toString('utf8'));
@@ -2653,12 +2660,21 @@ async function aggregateOpenAIStream(upstream, headBytes) {
       // eslint-disable-next-line no-await-in-loop
       const { done, value } = await reader.read();
       if (done) break;
-      feed(decoder.decode(value, { stream: true }));
+      const text = decoder.decode(value, { stream: true });
+      if (text.includes('[DONE]')) sawDone = true;
+      feed(text);
     }
   } catch (e) {
     log(`上游流聚合失败：${e && e.message}`);
+    return { truncated: true, reason: '上游响应读取失败（流中途断开）' };
   } finally {
     try { reader.releaseLock(); } catch { /* 忽略 */ }
+  }
+  // `[DONE]` 与 `finish_reason` 任一出现都算"上游说完了"（有些上游省略前者）。
+  if (!finish && !sawDone) {
+    log(`上游流被截断（直通聚合）：未收到 finish_reason 也未收到 [DONE]`
+      + `—— 已聚合 ${content.length} 字符，明确报错而非交付半截内容`);
+    return { truncated: true, reason: '上游响应被中断（未收到结束信号）—— 这条回复不完整，请重试' };
   }
   const message = { role: 'assistant', content: content === '' && toolCalls.size ? null : content };
   if (reasoning) message.reasoning_content = reasoning;
@@ -4695,6 +4711,13 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
   if (needAggregate && bodyStream && /event-stream/i.test(ctype)) {
     const completion = await aggregateOpenAIStream(upstream, pendingHead);
     if (res.destroyed || res.writableEnded) return false;
+    // ⚠ 上游被腰斩 → 就地回 502，**不要**把半截内容包装成 `finish_reason:"stop"` 交付，
+    // 也不要返回 falsy 触发 failover（那会把 502 变成误导性的
+    // `all providers … are unavailable`）。客户端此时还没收到任何东西。
+    if (completion && completion.truncated) {
+      json(res, 502, { error: { message: completion.reason, type: 'upstream_truncated' } });
+      return true;
+    }
     json(res, 200, completion);
     return true;
   }
