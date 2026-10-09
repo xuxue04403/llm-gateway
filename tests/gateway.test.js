@@ -436,6 +436,98 @@ let upstreamPort = 0;
     }
   });
 
+  t('网关：Codex 订阅后端 —— 谎报 content-type + 要求 store:false 也能用', async () => {
+    // Codex 订阅后端有三个**实测发现的怪癖**，缺一条就整轮报废：
+    //   ① 无论客户端要不要流式，它都返回 SSE，而 Content-Type 谎报 `application/json`
+    //      → 旧条件 `mayLieAboutJson = … && wantsStream` 在"客户端要非流式"时跳过嗅探，
+    //        把整条 SSE 当 JSON 解析 → 回 502「上游返回的不是 JSON」（实测复现）
+    //   ② 请求体不带 `store:false` 直接 400 {"detail":"Store must be set to false"}
+    //   ③ 路径不能有 /v1（实测 /codex/v1/responses → 404，只有 /codex/responses 可用）
+    //
+    // 这条用例用一个**假 Codex 后端**把三点全钉住。
+    const seen = { paths: [], bodies: [] };
+    const fake = http.createServer((q, s) => {
+      let b = '';
+      q.on('data', (c) => { b += c; });
+      q.on('end', () => {
+        seen.paths.push(q.url);
+        let j = null; try { j = JSON.parse(b); } catch (_) { /* 忽略 */ }
+        seen.bodies.push(j);
+        if (!j || j.store !== false) {   // ② 后端硬要求
+          s.writeHead(400, { 'content-type': 'application/json' });
+          s.end('{"detail":"Store must be set to false"}');
+          return;
+        }
+        s.writeHead(200, { 'content-type': 'application/json' });   // ① content-type 谎报 JSON
+        s.write('event: response.created\ndata: {"type":"response.created","response":{"id":"r1","object":"response","status":"in_progress","model":"gpt-5.6-luna","output":[]}}\n\n');
+        s.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"可用"}\n\n');
+        s.write('event: response.completed\ndata: {"type":"response.completed","response":{"id":"r1","object":"response","status":"completed","model":"gpt-5.6-luna","output":[{"id":"o1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"可用"}]}],"usage":{"input_tokens":10,"output_tokens":2}}}\n\n');
+        s.end();
+      });
+    });
+    await new Promise((r) => fake.listen(0, '127.0.0.1', r));
+
+    const dir = fs.mkdtempSync(path.join(tmp, 'codex-'));
+    const port = await freePort();
+    fs.writeFileSync(path.join(dir, 'c.json'), JSON.stringify({
+      port,
+      apiKey: GATEWAY_KEY,
+      providers: [{
+        id: 'codex-sub',
+        baseURL: 'http://127.0.0.1:' + fake.address().port + '/backend-api/codex',   // ③ 无 /v1
+        auth: 'codex',
+        protocol: 'openai-responses',
+        models: ['gpt-5.6-luna'],
+        priority: 1, enabled: true,
+      }],
+    }), 'utf8');
+    // 假凭据文件（结构照真实 auth.json）
+    const ch = path.join(dir, 'codexhome');
+    fs.mkdirSync(ch, { recursive: true });
+    fs.writeFileSync(path.join(ch, 'auth.json'), JSON.stringify({
+      auth_mode: 'chatgpt',
+      OPENAI_API_KEY: null,
+      tokens: { access_token: 'fake.jwt.token', refresh_token: 'rt', account_id: 'acct-123' },
+      last_refresh: new Date().toISOString(),
+    }), 'utf8');
+
+    const proc = spawn(process.execPath,
+      [MJS, '--config', path.join(dir, 'c.json'), '--log', path.join(dir, 'g.log'), '--port', String(port)],
+      { stdio: 'ignore', windowsHide: true, env: { ...process.env, CODEX_HOME: ch } });
+    try {
+      const ok = await waitHealth(port, 20000);
+      if (!ok) { console.log('    [SKIP] Codex 测试网关未就绪'); return; }
+
+      // ① 非流式（旧实现会在这里 502）
+      const rn = await call({ port, p: '/v1/messages', body: { model: 'gpt-5.6-luna', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(rn.status, 200, '非流式应 200（content-type 谎报不该让它 502），实际 ' + rn.status + ' ' + rn.text.slice(0, 200));
+      assert.ok(/可用/.test(rn.text), '应拿到正文，实际：' + rn.text.slice(0, 200));
+
+      // ② 流式
+      const rs = await call({ port, p: '/v1/messages', body: { model: 'gpt-5.6-luna', max_tokens: 16, stream: true, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(rs.status, 200, '流式应 200，实际 ' + rs.status);
+      assert.ok(/message_stop/.test(rs.text), '流式应正常收尾');
+
+      // ③ 路径不带 /v1
+      assert.ok(seen.paths.length > 0, '假后端应收到请求');
+      for (const p2 of seen.paths) {
+        assert.ok(!/\/v1\//.test(p2), 'Codex 路径不该出现 /v1，实际：' + p2);
+        assert.ok(/\/backend-api\/codex\/responses$/.test(p2), '路径应为 …/codex/responses，实际：' + p2);
+      }
+      // ④ 请求体必须 store:false
+      for (const b of seen.bodies) {
+        assert.strictEqual(b && b.store, false, '请求体必须 store:false，实际：' + JSON.stringify(b && b.store));
+      }
+      // ⑤ 凭据不进日志
+      const log = fs.readFileSync(path.join(dir, 'g.log'), 'utf8');
+      assert.ok(!/fake\.jwt\.token/.test(log), 'access_token 不该出现在日志里');
+      assert.ok(!/acct-123/.test(log), 'account_id 不该出现在日志里');
+    } finally {
+      try { proc.kill(); } catch { /* 忽略 */ }
+      try { fake.close(); } catch { /* 忽略 */ }
+    }
+  });
+
   t('网关：缓存字段必须传给 Anthropic 客户端（否则命中率恒为 0%）', async () => {
     // 上游在 usage 里报 `prompt_tokens_details.cached_tokens`，客户端读的是
     // Anthropic 的 `cache_read_input_tokens` —— 不翻译就等于把缓存信息抹平，
