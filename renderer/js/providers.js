@@ -362,6 +362,16 @@ function openEditor(i) {
   $('#edProtocol').value = p.protocol || '';
   $('#edProfile').value = p.clientProfile || '';
   $('#edAuth').value = p.auth || '';
+  // ⚠ 用了"凭据不在配置里"的鉴权方式时，**自动展开**高级字段。
+  //
+  // 「鉴权方式」下拉在折叠的 <details> 里（它平时是高级设置）。但 codex / workbuddy
+  // 这类供应商**整个凭据来源都由这个下拉决定** —— 折起来的话，用户看到一条
+  // 空着 API Key 的配置，却找不到该在哪里选鉴权方式（实测反馈：
+  // 截图里只有 ID/Base URL/API Key/优先级，然后就被校验拦住说"请至少填一把 API Key"）。
+  if (p.auth === 'codex' || p.auth === 'workbuddy') {
+    const adv = $('#editorDrawer').querySelector('details.adv');
+    if (adv) adv.open = true;
+  }
 
   renderEditorModels(models);
   wireEditor();
@@ -909,9 +919,19 @@ function applyEditor() {
 
   const keys = String($('#edKeys').value || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
   const auth = $('#edAuth').value;
-  if (keys.length === 0 && auth !== 'workbuddy') {
+  // ⚠ 这些鉴权方式的凭据**不在配置里**（由本机其它程序提供），所以不能要求填 Key：
+  //   · workbuddy —— 用桌面客户端凭据（authFile / 自动发现）
+  //   · codex     —— 用 Codex 桌面版/CLI 已登录的 auth.json（含自动刷新）
+  // 旧实现硬编码成 `auth !== 'workbuddy'`，于是选了 codex 仍被要求填 Key，
+  // 而 Codex 订阅**根本没有 Key 可填** → 预设加进来的条目**永远保存不了**
+  //（实测 2026-10-09：面板报「请至少填一把 API Key」）。
+  // 判据必须是个集合：加新鉴权方式时同步加进来。
+  const CREDENTIAL_FREE_AUTH = ['workbuddy', 'codex'];
+  if (keys.length === 0 && !CREDENTIAL_FREE_AUTH.includes(auth)) {
     const accountsRaw = $('#edAccounts').value.trim();
-    if (!accountsRaw) return fail('请至少填一把 API Key（或选择 workbuddy 鉴权，或填账户池）');
+    if (!accountsRaw) {
+      return fail('请至少填一把 API Key（或选择 workbuddy / codex 鉴权，或填账户池）');
+    }
   }
 
   // 高级字段解析
