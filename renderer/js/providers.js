@@ -339,8 +339,12 @@ function openEditor(i) {
           <select class="input" id="edAuth">
             <option value="">普通 API Key</option>
             <option value="workbuddy">workbuddy（用桌面客户端凭据，自动刷新）</option>
+            <option value="codex">codex（用 Codex 桌面版/CLI 的订阅凭据，自动刷新）</option>
           </select>
           <span class="hint">选 workbuddy 后 Key 栏可留空，凭据按平台默认位置自动发现</span>
+          <span class="hint">选 <b>codex</b> 后 Key 栏留空即可 —— 凭据从 <code>$CODEX_HOME/auth.json</code>（或 <code>~/.codex/auth.json</code>）读取，
+            适用于 ChatGPT Plus/Pro 订阅的 Codex 后端。此时 baseURL 填 <code>https://chatgpt.com/backend-api/codex</code>、
+            协议选 <code>openai-responses</code>（这两项网关会按 codex 自动兜底，但填上更直观）</span>
         </div>
 
         <label>账户池</label>
