@@ -4554,6 +4554,37 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
   //（延迟 + 计费），设计意图（连续 3 次即退避保护账号）完全落空。
   let bodyStream = upstream.body;
   let ctype = String(upstream.headers.get('content-type') || 'application/json');
+  // ⚠ 截断检测的状态必须声明在**函数作用域**，不能放进下面的 `if (bodyStream) { … }` 块。
+  //
+  // 第一版就写在了块内（`const`/`let` 是块级作用域），而收尾时在**块外**引用
+  // `isSseStream` / `tailHasTerminal` —— 直接 ReferenceError，`forward()` 抛异常、
+  // 客户端拿不到任何响应，表现为**整条直通路径挂起**
+  //（实测：上游 SSE 全部发完并 end()，客户端一个字节都收不到）。
+  //
+  // 教训：这段逻辑跨"读循环"与"收尾"两处使用，状态就必须活在两者共同的祖先作用域里。
+  const TAIL_MAX = 8192;
+  let tail = '';
+  let truncated = false;
+  const TERMINAL_RES = [
+    // anthropic：`message_stop` 是显式结束帧；但**不少中转省略它**，
+    // 只给 `message_delta` 里的 `stop_reason` —— 那也是"上游说完了"。
+    // 第一版只认 message_stop，实测把这种**正常**收尾判成截断（审计复现：
+    // anthropic 上游发 message_start+delta+message_delta(stop_reason) 就结束 → 误报 error）。
+    /"type"\s*:\s*"message_stop"/,
+    /"stop_reason"\s*:\s*"(end_turn|max_tokens|stop_sequence|tool_use)"/,
+    /\[DONE\]/,                              // openai chat
+    /"type"\s*:\s*"response\.(completed|failed|incomplete)"/,   // openai responses
+    /"finish_reason"\s*:\s*"(stop|length|tool_calls|content_filter|function_call)"/,   // chat 兜底
+  ];
+  const tailHasTerminal = () => TERMINAL_RES.some((re) => re.test(tail));
+  // 客户端的线协议：矩阵路径看 clientWire；直通路径看上游路径本身
+  //（同协议透传 ⟹ 客户端与上游同一 wire）。
+  const clientWire = (opts && opts.matrix && opts.matrix.clientWire)
+    || (isAnthropicWire ? 'anthropic-messages' : (responsesMode ? 'openai-responses' : 'openai-chat'));
+  // 只有 SSE 响应才谈得上"缺终止标记"：非流式响应的 complete 语义由 HTTP 层保证。
+  // 用函数而不是常量 —— `ctype` 会被后面的内容嗅探改写（实测有上游用
+  // application/json 回完整的 SSE 帧序列），收尾时要读**改写后**的值。
+  const isSseStream = () => String(ctype || '').includes('event-stream');
   // —— SSE「首事件就是错误」识别（2026-09-15 实测事故）——
   // 部分上游（实测 api.chiyi.cc）对失败的请求回 **HTTP 200 + text/event-stream**，流里第一件事
   // 就是 `event: error` + `data: {"error":{"message":"Service temporarily unavailable",...}}`。
@@ -4711,6 +4742,9 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
   if (pendingHead && pendingHead.length) {
     // 偷看过的首事件原样补发（客户端不该察觉这一步）
     try { feedDecodeMeter(meter, pendingHead.toString('utf8')); } catch { /* 计量失败绝不影响转发 */ }
+    // 截断检测的尾部窗口也要吃进这一口 —— 否则"整个流只有首事件"这种
+    // 极短响应（偷看把全部字节都读进 pendingHead）会被误判成截断。
+    try { tail = (tail + pendingHead.toString('utf8')).slice(-TAIL_MAX); } catch { /* 忽略 */ }
     if (opts && typeof opts.onSniff === 'function') {
       try { opts.onSniff(pendingHead.toString('utf8')); } catch { /* 忽略 */ }
     }
@@ -4718,6 +4752,26 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
   }
   if (bodyStream) {
     const reader = bodyStream.getReader();
+    // ⚠ 直通路径的**截断检测**（2026-10-09 第三次审计补）。
+    //
+    // 同协议（客户端 anthropic ← 上游 anthropic，或 chat ← chat）时矩阵为空，
+    // 走这条"一个字节都不多绕"的透传路径。它此前**只转发、不判断上游有没有说完** ——
+    // 于是上游被干净腰斩（代理掉线、对端 close 而不 reset，`reader.read()` 返回
+    // `done:true` 且**不抛异常**）时，照样 `res.end()` 收尾：
+    // 客户端拿到 200 + 半截内容，以为模型答完了。**这正是用户报的"任务静默终止"。**
+    //
+    // 实测（审计复现）：上游 anthropic-messages 只发 message_start + 一个
+    // content_block_delta 就断开 → 客户端 anthropic 拿到 200 + 半截内容，无任何错误。
+    //
+    // 这里不解析协议（那会把这个"零开销透传"的路径变成第二个翻译器），
+    // 只用**尾部标记**判断 —— 各家协议都有唯一的终止标记，扫最后几 KB 字节即可：
+    //   · anthropic-messages : `message_stop`
+    //   · openai-chat        : `[DONE]`
+    //   · openai-responses   : `response.completed` / `response.failed`
+    // 只在**流式**响应上做（非流式有 content-length，短读会被 HTTP 层发现）。
+    // 成本：一个 8KB 的滚动尾巴，与既有的 decode meter / sniff 同级。
+    // ⚠ 状态（tail / truncated / TERMINAL_RES / clientWire）已声明在**函数作用域**
+    // —— 收尾阶段在块外也要用，放块内会 ReferenceError（见上面的教训注释）。
     // R7 强壮性：读流加"空闲超时"——上游已连接但长时间不吐数据（挂起/代理卡死）时
     // 主动断开，避免 dsh 客户端无限等待后重连（表现为"经常重连模型请求"）。
     const IDLE_READ_MS = 90_000;
@@ -4757,6 +4811,10 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         if (done) break;
         lastRead = Date.now();
         try { feedDecodeMeter(meter, Buffer.from(value).toString('utf8')); } catch { /* 计量失败绝不影响转发 */ }
+        // 尾部窗口（截断检测用）：只留最后 TAIL_MAX 字节，不随流长度增长
+        try {
+          tail = (tail + Buffer.from(value).toString('utf8')).slice(-TAIL_MAX);
+        } catch { /* 忽略 */ }
         if (sniff) {
           try {
             sniff.text += Buffer.from(value).toString('utf8');
@@ -4802,10 +4860,35 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     if (dec) log(`[decode] ${(body && body.model) || '(no model)'} via=${provider.id} ${decodeMeterText(dec)}`);
   }
   if (res.destroyed || res.writableEnded) return false;
+  // ⚠ 上游被干净腰斩 → 明确告知客户端，别让它以为答完了（见上面 tail 的说明）。
+  // 响应头与部分内容**已经发出**，所以不能改状态码，只能补一个协议内的错误事件。
+  if (isSseStream() && !tailHasTerminal()) {
+    log(`直通路径：上游流被截断（${provider.id}）：尾部未出现任何终止标记`
+      + `（message_stop / [DONE] / response.completed）—— 已转发 ${tail.length} 字节尾部窗口；`
+      + '明确告知客户端"回复不完整"');
+    try {
+      if (clientWire === 'anthropic-messages') {
+        res.write('event: error\ndata: ' + JSON.stringify({
+          type: 'error',
+          error: { type: 'api_error', message: '上游响应被中断（未收到结束信号）—— 这条回复不完整，请重试' },
+        }) + '\n\n');
+        res.write('event: message_stop\ndata: ' + JSON.stringify({ type: 'message_stop' }) + '\n\n');
+      } else if (clientWire === 'openai-responses') {
+        res.write('event: response.failed\ndata: ' + JSON.stringify({
+          type: 'response.failed',
+          response: { id: 'resp_truncated', object: 'response', status: 'failed', error: { code: 'upstream_truncated', message: '上游响应被中断（未收到结束信号）—— 这条回复不完整，请重试' } },
+        }) + '\n\n');
+      } else {
+        res.write('data: ' + JSON.stringify({ error: { message: '上游响应被中断（未收到结束信号）—— 这条回复不完整，请重试', type: 'upstream_truncated' } }) + '\n\n');
+        res.write('data: [DONE]\n\n');
+      }
+    } catch { /* 客户端已断开 */ }
+    truncated = true;
+  }
   try {
     res.end();
   } catch { }
-  return true;
+  return truncated ? 'truncated' : true;
 }
 
 /* ================= 协议翻译：Anthropic ↔ OpenAI（2026-09-16） =================
@@ -6106,7 +6189,13 @@ function canonicalToChatCompletion(acc, model) {
 
 /** 把 canonical 事件累积成完整响应（不写任何东西到 res）。 */
 function makeCanonicalCollector() {
-  const acc = { text: '', thinking: '', tools: [], stop: 'stop', usageIn: 0, usageOut: 0 };
+  // ⚠ `sawTerminal` 是**必须**的：`acc.stop` 有默认值 `'stop'`，所以上游被腰斩时
+  // 光看 `acc.stop` 分不出"答完了"与"被切断了"—— 于是聚合出来的响应会带着
+  // `finish_reason: "stop"` 回给客户端，看起来一切正常。
+  // 实测（2026-10-09 第三次审计）：客户端要 openai-chat **非流式**、上游是
+  // anthropic-messages 且中途干净断开 → 回 `HTTP 200` + 半截内容 + `finish_reason:"stop"`，
+  // 日志记 `status=ok`。这就是用户报的"任务静默终止"在**矩阵聚合路径**上的形态。
+  const acc = { text: '', thinking: '', tools: [], stop: 'stop', usageIn: 0, usageOut: 0, sawTerminal: false };
   const bySlot = new Map();
   return {
     acc,
@@ -6122,10 +6211,13 @@ function makeCanonicalCollector() {
         } else if (e.t === 'args') {
           const t = bySlot.get(e.i);
           if (t) t.args += e.d;
-        } else if (e.t === 'stop') acc.stop = e.r;
+        } else if (e.t === 'stop') { acc.stop = e.r; acc.sawTerminal = true; }
+        else if (e.t === 'end') acc.sawTerminal = true;
         else if (e.t === 'usage') { if (e.in) acc.usageIn = e.in; if (e.out) acc.usageOut = e.out; }
       }
     },
+    /** 上游**明说**结束了（finish_reason / stop_reason / 显式结束帧）吗？ */
+    sawTerminal() { return acc.sawTerminal; },
   };
 }
 
@@ -6225,6 +6317,22 @@ async function forwardMatrixResponse({ res, upstream, bodyStream, ctype, pending
     } catch (e) {
       log(`matrix: 读上游流失败（${mx.upstreamWire} → ${mx.clientWire}）：${e && e.message}`);
       return { stop: { status: 502, upstreamStatus: upstream.status, reason: '上游响应读取失败（流中途断开）' } };
+    }
+    // ⚠ 上游**干净地**腰斩时 `reader.read()` 返回 `done:true`（不抛异常），
+    // 上面那个 catch 抓不到 —— 于是聚合成一条"看起来完整"的响应回给客户端：
+    // `HTTP 200` + 半截内容 + `finish_reason:"stop"`，日志还记 `status=ok`。
+    // 实测（2026-10-09 第三次审计复现）就是这个现象。
+    // 客户端要非流式时**还没收到任何东西**，所以必须明确报错，而不是交付半截内容。
+    if (!col.sawTerminal()) {
+      log(`matrix: 上游流被截断（${mx.upstreamWire} → ${mx.clientWire}）：未收到结束信号`
+        + `（无 finish_reason/stop_reason/结束帧）—— 已聚合 ${col.acc.text.length} 字符，明确报错而非交付半截内容`);
+      return {
+        stop: {
+          status: 502,
+          upstreamStatus: upstream.status,
+          reason: '上游响应被中断（未收到结束信号）—— 这条回复不完整，请重试',
+        },
+      };
     }
     canon = canonicalToChatCompletion(col.acc, mx.model);
   } else {
