@@ -1024,7 +1024,7 @@ function addProvider() {
   openEditor(pendingNewIndex);
 }
 
-/* ==================== 免费通道预设 ====================
+/* ==================== 渠道预设（免费通道 / 订阅通道）====================
  * 来源：社区插件 dsh-our-free-model（它把每条都对着活网关直接请求核对过）。
  * 共同点：**不花你自己的钱，但也不是你的额度** —— 用的是上游给自家用户的免费池。
  *
@@ -1052,7 +1052,51 @@ const OPENCODE_GO_CHAT_MODELS = [
 ];
 const OPENCODE_GO_ANTHROPIC_MODELS = ['claude-haiku-5-5', 'minimax-m2.7'];
 
+/**
+ * Codex 订阅后端的有效模型名。
+ *
+ * 来源：`$CODEX_HOME/models_cache.json`（官方客户端自己拉的清单，2026-10-09 实测快照）。
+ * ⚠ **`gpt-5-codex` 不在这里** —— 它是 API Key 路径的模型名，用 ChatGPT 订阅调它会 400：
+ *   {"detail":"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account."}
+ * 用户 `~/.codex/config.toml` 里默认写的正是它，所以这里必须把清单摆出来。
+ */
+const CODEX_SUB_MODELS = [
+  'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-reserve',
+  'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'codex-auto-review',
+];
+
 const FREE_CHANNEL_PRESETS = [
+  // ⚠ 说明字段（what / statusNote）是**渲染层硬编码常量**，不是用户或上游输入，
+  // 且内容里有意写了 <b>/<code> 排版 —— 所以渲染时**不能** esc()，否则标签会原样显示成文字。
+  // （旧实现只对 what 转了义、对 statusNote 没转，于是预设说明里全是 `&lt;b&gt;` 字面量。）
+  // 同理，risks 数组项也是常量，直接拼进 <li>。
+  {
+    key: 'codex-sub',
+    name: 'Codex 订阅（ChatGPT Plus/Pro）',
+    baseURL: 'https://chatgpt.com/backend-api/codex',
+    apiKey: '',                       // 凭据从磁盘读，不需要 key
+    status: 'verified',
+    statusNote: '本机实测（2026-10-09，真实 Codex Plus 订阅）：<code>/v1/models</code> 列出 <b>10 个模型</b>；'
+      + 'Anthropic 协议**非流式与流式都返回 200**，内容正确；日志零凭据泄漏。',
+    what: '用你的 <b>ChatGPT 订阅</b>（Codex）当上游 —— 不消耗 OpenAI Platform 的 API Key 额度。'
+      + '凭据复用官方 Codex 桌面版/CLI 已登录的 <code>auth.json</code>，'
+      + '网关自动读取并在过期前 5 分钟刷新（刷新后原子写回，与官方客户端共用一份，不会互相作废）。',
+    risks: [
+      '<b>别填 <code>gpt-5-codex</code></b> —— 实测 400「not supported when using Codex with a ChatGPT account」。'
+      + '用本预设带的这 10 个。',
+      '这是<b>订阅额度</b>，计费与限流遵循你的 ChatGPT 计划，与 OpenAI Platform API Key 是两套。',
+      '需要本机已登录 Codex 桌面版或 CLI（<code>$CODEX_HOME/auth.json</code> 或 <code>~/.codex/auth.json</code>）。'
+      + '没登录时网关会明确报错，不会静默失败。',
+      '上游 Content-Type 会<b>谎报</b> <code>application/json</code>（正文其实是 SSE）、'
+      + '要求请求体带 <code>store:false</code>、且路径不能有 <code>/v1</code> —— 这三点网关都已按 codex 自动兜底。',
+      '可用模型由上游随时增删 —— 上面那份清单是实测快照，不是承诺。',
+    ],
+    apply: (p) => {
+      p.auth = 'codex';                 // ← 走官方客户端凭据（含自动刷新）
+      p.protocol = 'openai-responses';  // ← Codex 后端是 Responses API
+      p.models = CODEX_SUB_MODELS.slice();
+    },
+  },
   {
     key: 'opencode-go',
     name: 'OpenCode Go 套餐（自带 key）',
@@ -1151,13 +1195,13 @@ function openFreeChannelPicker() {
         <span class="preset-badge ${cls}">${esc(label)}</span>
       </div>
       <div class="hint">${esc(c.baseURL)}${c.apiKey ? ' · apiKey=' + esc(c.apiKey) : ' · 无需凭据'}</div>
-      <div class="hint">${esc(c.what)}</div>
+      <div class="hint">${c.what}</div>
       <div class="hint preset-status">${c.statusNote}</div>
       <button class="btn" data-preset="${esc(c.key)}">了解风险并添加</button>
     </div>`;
   }).join('');
   Modal.open({
-    title: '免费通道预设',
+    title: '渠道预设（免费通道 / 订阅通道）',
     body: `<p class="hint">这些是<b>第三方公共额度</b>，不是本项目的资源，也不是你的额度。
       添加前请读完说明 —— 要不要用、合不合规，由你判断。</p>${rows}`,
     buttons: [{ label: '关闭', cls: 'btn-ghost' }],
@@ -1205,7 +1249,7 @@ function confirmAddPreset(c) {
           };
           if (typeof c.apply === 'function') c.apply(p);
           LG.config.providers.push(p);
-          markDirty('添加免费通道 ' + c.name);
+          markDirty('添加渠道 ' + c.name);
           LG.renders.providers();
           renderTopbar();
           openEditor(LG.config.providers.length - 1);
