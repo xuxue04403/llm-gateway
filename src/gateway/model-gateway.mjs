@@ -1452,6 +1452,10 @@ function providerHasCredential(provider) {
   if (!upstreamKeyMissing(provider.apiKey)) return true;
   // ③ workbuddy 走桌面 App 凭据，本机登录状态不在配置里 → 不能据此判死
   if (String(provider.auth || '').toLowerCase() === 'workbuddy') return true;
+  // ④ Codex 走官方客户端的 auth.json，同样不在配置里。
+  //    只在**文件确实存在**时放行 —— 没装 Codex 的家应当被如实挡掉，
+  //    而不是放行后在每次请求时抛异常（那会让 /v1/models 把它列出来却永远调不通）。
+  if (isCodexProvider(provider)) return !!findCodexAuthFile();
   return false;
 }
 
@@ -2438,6 +2442,216 @@ function pickHeaderCI(obj, name) {
  *  ④ 合并供应商 `headers` 自定义头。
  * 凭据不可用时抛错，由调用方决定"换账户"还是"放弃该供应商"。
  */
+/* ==================================================================================
+ * Codex 订阅后端（ChatGPT Plus/Pro 的 Codex）
+ *
+ * 与 WorkBuddy 同一思路：**不自己实现 OAuth 登录**，而是复用官方客户端已经登录好的
+ * 凭据文件。用户装了 Codex 桌面版/CLI 并登录后，令牌就在磁盘上，读它即可 ——
+ * 自己走 PKCE 登录流程是多余的复杂度（还要处理回调与轮换）。
+ *
+ * 全部事实来自本机权威来源（2026-10-09 实测，非猜测）：
+ *   · 端点与请求头 → `~/.dsh/profiles/node_modules/@earendil-works/pi-ai/dist/api/openai-codex-responses.js`
+ *     （DSH 自己调 Codex 用的客户端）：DEFAULT_CODEX_BASE_URL = https://chatgpt.com/backend-api
+ *   · OAuth client_id / 刷新端点 / scope → 官方 `codex.exe`（318MB Rust 二进制）字符串提取
+ *   · 协议 = **Responses API** —— 本引擎已支持 `openai-responses` 上游，故零翻译成本
+ *
+ * ⚠ 这是**订阅凭据**，等价于用户的 ChatGPT 登录态：
+ *   · 绝不写进日志（log() 前的 maskSecrets 已覆盖 `Bearer eyJ…` 形态，另有测试钉住）
+ *   · 绝不进 /health、write:detect、配置导出
+ * ================================================================================== */
+
+/** OAuth 刷新用（从官方 codex.exe 提取的公开常量，不是密钥） */
+const CODEX_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
+const CODEX_OAUTH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
+const CODEX_OAUTH_SCOPE = 'openid profile email';
+/** 官方后端基址；`/codex/responses` 由本引擎按 responses 协议拼出 */
+const CODEX_DEFAULT_BASE_URL = 'https://chatgpt.com/backend-api';
+
+/**
+ * 凭据文件候选位置（按优先级）。
+ * `CODEX_HOME` 优先 —— 实测本机该变量指向 `D:\IDE\stockbase\.codex`，
+ * 而 `~/.codex/auth.json` 里只有 API Key。**只读 ~/.codex 会读到一个没用的文件。**
+ */
+function codexAuthFileCandidates() {
+  const out = [];
+  const envHome = String(process.env.CODEX_HOME || '').trim();
+  if (envHome) out.push(path.join(envHome, 'auth.json'));
+  out.push(path.join(os.homedir(), '.codex', 'auth.json'));
+  return out;
+}
+
+function findCodexAuthFile() {
+  for (const p of codexAuthFileCandidates()) {
+    try { if (fs.statSync(p).isFile()) return p; } catch { /* 不存在 → 试下一个 */ }
+  }
+  return '';
+}
+
+/** 读 auth.json（按 mtime 缓存：官方客户端刷新令牌后我们能立刻看到新值） */
+let codexAuthCache = null;
+function readCodexAuth(force) {
+  const file = findCodexAuthFile();
+  if (!file) return { file: '', auth: null, error: '未找到 Codex 凭据文件（请先登录 Codex 桌面版/CLI）' };
+  let st = null;
+  try { st = fs.statSync(file); } catch (e) { return { file, auth: null, error: '无法读取：' + (e && e.message) }; }
+  if (!force && codexAuthCache && codexAuthCache.file === file && codexAuthCache.mtimeMs === st.mtimeMs) {
+    return codexAuthCache.value;
+  }
+  let auth = null;
+  let error = '';
+  try {
+    auth = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    error = '凭据文件不是合法 JSON：' + (e && e.message);
+  }
+  const value = { file, auth, error };
+  codexAuthCache = { file, mtimeMs: st.mtimeMs, value };
+  return value;
+}
+
+/** 从 JWT 里取过期时间（秒 → 毫秒）。取不到返回 0。 */
+function jwtExpMs(token) {
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length !== 3) return 0;
+    const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    return Number(claims.exp) > 0 ? Number(claims.exp) * 1000 : 0;
+  } catch { return 0; }
+}
+
+/** 需要刷新吗？提前 5 分钟算过期，避免"刚好在边界上"被上游 401。 */
+const CODEX_REFRESH_SKEW_MS = 5 * 60_000;
+function codexNeedsRefresh(accessToken) {
+  const exp = jwtExpMs(accessToken);
+  if (!exp) return false;                     // 读不出过期时间 → 交给上游判定，不盲目刷新
+  return Date.now() + CODEX_REFRESH_SKEW_MS >= exp;
+}
+
+const codexRefreshInflight = new Map();
+
+/**
+ * 用 refresh_token 换新 access_token，并**原子写回**凭据文件。
+ *
+ * 写回是必须的：官方客户端也用同一个文件，不回写会导致两边各自刷新、
+ * 互相把对方的 refresh_token 作废（refresh_token 通常是一次性的）。
+ * 写回时保留文件里其它字段（`auth_mode` / `last_refresh` …），只更新 `tokens`。
+ */
+async function refreshCodexToken(file, auth) {
+  const tok = (auth && auth.tokens) || {};
+  if (!tok.refresh_token) throw new Error('凭据里没有 refresh_token，无法自动刷新（请重新登录 Codex）');
+  const key = file;
+  if (codexRefreshInflight.has(key)) return codexRefreshInflight.get(key);
+  const task = (async () => {
+    const payload = JSON.stringify({
+      client_id: CODEX_OAUTH_CLIENT_ID,
+      grant_type: 'refresh_token',
+      refresh_token: tok.refresh_token,
+      scope: CODEX_OAUTH_SCOPE,
+    });
+    const res = await fetch(CODEX_OAUTH_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: payload,
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      // 错误体可能回显 token → 打码后再进日志
+      throw new Error(`刷新 Codex 令牌失败 HTTP ${res.status}：${maskSecrets(text).slice(0, 200)}`);
+    }
+    let j = null;
+    try { j = JSON.parse(text); } catch { throw new Error('刷新响应不是 JSON'); }
+    if (!j || !j.access_token) throw new Error('刷新响应里没有 access_token');
+    const next = { ...auth };
+    next.tokens = {
+      ...tok,
+      access_token: j.access_token,
+      // 有些实现不返回新 refresh_token → 沿用旧的（**不要**置空，否则下次无法刷新）
+      refresh_token: j.refresh_token || tok.refresh_token,
+      ...(j.id_token ? { id_token: j.id_token } : {}),
+    };
+    next.last_refresh = new Date().toISOString();
+    // 原子写：先写临时文件再 rename，避免官方客户端读到半截 JSON
+    const tmp = file + '.tmp-llmgateway-' + process.pid;
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(next, null, 2), { mode: 0o600 });
+      fs.renameSync(tmp, file);
+    } catch (e) {
+      try { fs.unlinkSync(tmp); } catch { /* 忽略 */ }
+      throw new Error('刷新成功但写回凭据文件失败：' + (e && e.message));
+    }
+    log(`Codex 令牌已刷新并写回 ${path.basename(path.dirname(file))}/auth.json`);
+    codexAuthCache = null;                    // 让下次读到新值
+    return next;
+  })();
+  codexRefreshInflight.set(key, task);
+  try { return await task; } finally { codexRefreshInflight.delete(key); }
+}
+
+/** 解析出可用于请求的 Codex 凭据（必要时自动刷新）。 */
+async function resolveCodexCredential() {
+  let { file, auth, error } = readCodexAuth(false);
+  if (!auth) throw new Error(error || 'Codex 凭据不可用');
+  const tok = auth.tokens || {};
+  if (!tok.access_token) {
+    throw new Error(String(auth.auth_mode || '') === 'apikey'
+      ? 'Codex 当前用的是 API Key 登录方式，不是 ChatGPT 订阅。请在 Codex 里改用 ChatGPT 账号登录'
+      : '凭据里没有 access_token（请先登录 Codex）');
+  }
+  if (codexNeedsRefresh(tok.access_token)) {
+    const next = await refreshCodexToken(file, auth);
+    auth = next;
+  }
+  const t = auth.tokens || {};
+  // account_id：文件里直接有；没有就从 JWT 的 claim 推（pi-ai 用的是这条路径）
+  let accountId = String(t.account_id || '').trim();
+  if (!accountId) {
+    try {
+      const claims = JSON.parse(Buffer.from(String(t.access_token).split('.')[1], 'base64url').toString('utf8'));
+      accountId = String((claims['https://api.openai.com/auth'] || {}).chatgpt_account_id || '').trim();
+    } catch { /* 忽略 */ }
+  }
+  if (!accountId) throw new Error('推不出 chatgpt-account-id（凭据格式可能变了）');
+  return { accessToken: t.access_token, accountId, file, plan: codexPlanOf(t.access_token) };
+}
+
+/** 从 JWT 读订阅档位（仅用于日志/界面显示，不参与鉴权） */
+function codexPlanOf(token) {
+  try {
+    const claims = JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString('utf8'));
+    return String((claims['https://api.openai.com/auth'] || {}).chatgpt_plan_type || '');
+  } catch { return ''; }
+}
+
+/**
+ * Codex 后端的必需请求头。
+ * 逐个来自实测（少任何一个都会被拒）：
+ *   authorization / chatgpt-account-id / originator / OpenAI-Beta / session-id / x-client-request-id
+ */
+function codexUpstreamHeaders(cred, base) {
+  const out = { ...(base || {}) };
+  // 这些头由本函数独占，先清掉所有大小写变体，避免出现重复头
+  for (const k of ['authorization', 'chatgpt-account-id', 'openai-beta', 'originator',
+    'session-id', 'x-client-request-id', 'user-agent', 'accept', 'content-type']) {
+    dropHeaderCI(out, k);
+  }
+  const sid = crypto.randomUUID();
+  out.authorization = 'Bearer ' + cred.accessToken;
+  out['chatgpt-account-id'] = cred.accountId;
+  out.originator = 'codex_cli_rs';
+  out['OpenAI-Beta'] = 'responses=experimental';
+  out['session-id'] = sid;
+  out['x-client-request-id'] = sid;
+  out.accept = 'text/event-stream';
+  out['content-type'] = 'application/json';
+  out['user-agent'] = 'codex_cli_rs/0.162.0 (Windows 10; x64)';
+  return out;
+}
+
+/** 该供应商是不是走 Codex 订阅后端 */
+function isCodexProvider(provider) {
+  return String((provider && provider.auth) || '').toLowerCase() === 'codex';
+}
+
 async function accountUpstreamHeaders(provider, acct, baseHeaders, { anthropicUpstream }) {
   const extra = providerExtraHeaders(provider);
   const base = { ...(baseHeaders || {}) };
@@ -2450,6 +2664,13 @@ async function accountUpstreamHeaders(provider, acct, baseHeaders, { anthropicUp
   const out = { ...base, ...extra };
   dropHeaderCI(out, 'user-agent');
   if (acct && acct.id) accountLastUsed.set(provider.id, acct.id);   // 日志/health 标注本次账户
+  // Codex 订阅后端：凭据来自官方客户端已登录的 auth.json（见上方模块注释）。
+  // 必须走它自己的头集合 —— 用普通 `authorization: Bearer <apiKey>` 打这个端点会 401。
+  if (isCodexProvider(provider)) {
+    const cred = await resolveCodexCredential();
+    Object.assign(out, codexUpstreamHeaders(cred, out));
+    return out;
+  }
   if (String(provider.auth || '').toLowerCase() === 'workbuddy') {
     const cred = await resolveWorkBuddyCredential(provider, acct || { id: 'default' });
     Object.assign(out, workbuddyHeaders(provider, cred, out, true));   // 内部设置唯一的桌面身份 UA
@@ -4241,6 +4462,22 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
           log(`Anthropic 缓存断点：放置 ${bp.placed} 处（缓存读 ×0.1 vs 未缓存输入 ×1）`);
         }
       }
+      // ③b Codex 订阅后端的请求体要求。
+      //
+      // 实测（2026-10-09）：不带 `store:false` 会被直接拒 ——
+      //   HTTP 400 {"detail":"Store must be set to false"}
+      // 订阅后端的会话存储由它自己管，不接受调用方指定。这是**上游的硬要求**，
+      // 所以在这里统一强制，而不是指望用户在每家配置里手写。
+      if (isCodexProvider(provider)) {
+        if (outBody.store !== false) {
+          outBody = { ...outBody, store: false };
+        }
+        // 同一类硬要求：`stream` 必须为 true（订阅后端只走 SSE）。
+        // 客户端要非流式时由引擎自己聚合（wantsStream=false 的聚合路径已具备）。
+        if (outBody.stream !== true) {
+          outBody = { ...outBody, stream: true };
+        }
+      }
       // ③ OpenCode 免费车道：两件只有网关才知道怎么做的事。
       // 用**标记头**判断车道，而不是再穿一个 cfg 进来（上游请求头里已经有 x-opencode-client）。
       if (upstreamHeaders && upstreamHeaders['x-opencode-client']) {
@@ -4615,7 +4852,12 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
   // 现在：客户端要流式、header 却说 JSON 时，先偷看首块按**响应体形状**定夺。
   const ctypeSaysSse = /event-stream/i.test(ctype);
   const wantsStream = !!(body && typeof body === 'object' && body.stream === true);
-  const mayLieAboutJson = !ctypeSaysSse && /json/i.test(ctype) && wantsStream;
+  const mayLieAboutJson = !ctypeSaysSse && /json/i.test(ctype)
+    // ⚠ Codex 订阅后端**无论客户端要不要流式都返回 SSE**，而 Content-Type 谎报
+    // `application/json`（实测 2026-10-09）。所以对它必须**无条件**嗅探 ——
+    // 旧条件只看 `wantsStream`，于是"客户端要非流式"时跳过嗅探、走 JSON 分支，
+    // 把整条 SSE 当 JSON 解析 → 回 502「上游返回的不是 JSON」（实测复现）。
+    && (wantsStream || isCodexProvider(provider));
   let pendingHead = null;   // 偷看得到的首事件字节（未判失败时原样补发给客户端）
   if (bodyStream && (ctypeSaysSse || mayLieAboutJson)) {
     try {
@@ -7833,6 +8075,16 @@ function trimSlash(u) { return u.replace(/\/+$/, ''); }
 function upstreamBase(baseURL) {
   let b = trimSlash(String(baseURL || ''));
   if (!b) return b;
+  // ⚠ Codex 订阅后端**不能**补 `/v1`。
+  //
+  // 它的端点是 `https://chatgpt.com/backend-api/codex/responses`，路径里没有版本段。
+  // 实测（2026-10-09）后端对此很严格：
+  //   /backend-api/codex/responses     → 200 ✓
+  //   /backend-api/codex/v1/responses  → 404
+  //   /backend-api/v1/responses        → 404
+  // 所以配置里 baseURL 写 `…/backend-api/codex`，这里原样返回，由 responses 协议拼上
+  // `/responses` 得到正确路径。判据用 `/codex` 结尾 —— 足够窄，不会误伤普通供应商。
+  if (/\/codex$/i.test(b)) return b;
   // 2026-09-16：泛化到任意 /vN —— WorkBuddy 的接口在 /v2（旧实现只认 /v1，会拼成 /v1/chat/completions）。
   // 带版本号（/v1、/v2…）→ 收敛到该版本；不带 → 补 /v1（OpenAI SDK 惯例，保持旧行为）。
   const m = b.match(/\/(v\d+)(?:\/.*)?$/i);
