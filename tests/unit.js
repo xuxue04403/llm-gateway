@@ -187,12 +187,29 @@ t('datadir.isPlaceholderConfig：示例文件判为占位（含 workbuddy/cline 
   assert.strictEqual(datadir.isPlaceholderConfig(text), true);
 });
 
-t('datadir.isPlaceholderConfig：全停用 / 空 providers / 坏 JSON 都判为占位', () => {
-  assert.strictEqual(datadir.isPlaceholderConfig('{}'), true);
-  assert.strictEqual(datadir.isPlaceholderConfig('{oops'), true);
+t('datadir.isPlaceholderConfig：只有"出厂示例"才算占位；用户状态一律判真实（防数据丢失）', () => {
+  // ⚠ 这条测试在 2026-10-09 被**反转**过，理由值得写下来。
+  //
+  // 旧断言把「全停用 → 占位」锁成了目标行为。但那个判定的端到端后果是：
+  // `importGatewayConfig` 看到"目标是占位"就**备份后覆盖**它 —— 也就是说
+  // **用户临时把供应商全部停用，下次启动配置就被别的来源覆盖了**（不可逆数据丢失，
+  // 只剩一份 .bak-import）。同理，用自建中转 / Ollama 的用户 Key 短于 16 字符时
+  // 也会被判成占位。两条都实测复现过（渲染/宿主审计 D1）。
+  //
+  // 现在的判据是**正向识别示例**（必须含 `provider-a` 这类示例专属锚点，
+  // 且每一项的 id 与 baseURL 都落在示例取值范围内），保守到底：
+  // 误判成"真实"的代价只是示例没被替换（用户看得见、随手能删）；
+  // 误判成"占位"的代价是用户数据没了。
+  assert.strictEqual(datadir.isPlaceholderConfig('{}'), true, '没有 providers 字段 → 空配置，没有可丢的数据');
+  assert.strictEqual(datadir.isPlaceholderConfig('{oops'), true, '坏 JSON → 仍是占位（文件本来也用不了，覆盖前有备份）');
+  assert.strictEqual(datadir.isPlaceholderConfig(JSON.stringify({ providers: [] })), true,
+    '空数组 → 同样没有可丢的数据，允许被导入替换');
   assert.strictEqual(datadir.isPlaceholderConfig(JSON.stringify({
     providers: [{ id: 'real', baseURL: 'https://real.example.org/v1', apiKey: 'sk-' + 'a'.repeat(40), enabled: false }],
-  })), true, '一家都没启用 → 占位');
+  })), false, '★ 全停用是用户的选择 → 绝不覆盖');
+  assert.strictEqual(datadir.isPlaceholderConfig(JSON.stringify({
+    providers: [{ id: 'myrelay', baseURL: 'http://192.168.1.9:8080/v1', apiKey: 'localkey123', enabled: true }],
+  })), false, '★ 自建中转的短 Key 不是占位特征 → 绝不覆盖');
 });
 
 t('datadir.isPlaceholderConfig：真实配置判为非占位', () => {

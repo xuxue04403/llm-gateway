@@ -121,7 +121,12 @@ function detectAll(baseCtx) {
  *
  * 只保留首 6 位与末 4 位：够用户认出"是哪一把"，不足以被拿去用。
  */
-const SECRET_KEY_VALUE_RE = /((?:^|[\s"'[{,])["']?[A-Za-z0-9_.\-[\]]*(?:token|apikey|api_key|secret|password|passwd|credential)[A-Za-z0-9_.\-[\]]*["']?\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|[^\s,}\]]+)/gi;
+// ⚠ `api[-_]?key` 这一支不能省：配置里常见的拼法是 **`x-api-key`**（连字符），
+// 而旧模式只有 `apikey|api_key`，于是 `"x-api-key" = "真实密钥"` 完全不被识别 ——
+// 审计（2026-10-09 D2）实测：claude-code 的 `env.MY_CUSTOM_AUTH`、opencode 与 codex 的
+// `http_headers = { "x-api-key" = … }` 在预览里**明文**送进了渲染层，
+// 而预览弹窗上写着"密钥已打码显示"。同理补上 `auth[-_]?token` 与 `bearer`。
+const SECRET_KEY_VALUE_RE = /((?:^|[\s"'[{,])["']?[A-Za-z0-9_.\-[\]]*(?:token|api[-_]?key|secret|password|passwd|credential|bearer)[A-Za-z0-9_.\-[\]]*["']?\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|[^\s,}\]]+)/gi;
 const SECRET_TOKEN_RE = /\b((?:sk|oc_sk|github_pat|gh[pousr]|xox[baprs])[-_][A-Za-z0-9_\-]{12,}|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{6,})/g;
 // 明显不是密钥的值：布尔 / null / 纯数字 / 少数几个"值是路径或模式"的常见配置项。
 // 不打码它们，免得把 `key = "file"`、`apiKey = 12345` 这类配置也糊掉，反而看不清结构。
@@ -147,7 +152,14 @@ function maskSecretsInText(text) {
     if (SECRET_KEY_NOISE.test(val) || SECRET_KEY_NOISE_PATHLIKE.test(val)) return m;
     const q = val[0] === '"' || val[0] === "'" ? val[0] : '';
     const inner = q ? val.slice(1, -1) : val;
-    if (inner.length < 8) return m;
+    // ⚠ 这里**不再**有 `inner.length < 8 → 原样返回`。
+    // 能走到这一行说明**键名已经命中了 secret 特征**（token/api-key/secret/…），
+    // 也就是说这个值按定义就是凭据 —— 再按长度网开一面，就是把短凭据（自建中转、
+    // 本地代理、Ollama 常见的 6~8 字符 key）明文送进渲染层。
+    // 审计（2026-10-09 D2）实测：7 字符的 `abc1234` 挂在 `"x-api-key"` 下时明文可见。
+    // 「不是密钥」的情形由上面的 NOISE / PATHLIKE 两条过滤器负责（true/null/数字/file/keyring…），
+    // 与长度无关。
+    if (!inner) return m;   // 空串没什么可打码的
     return prefix + q + maskOne(inner) + q;
   });
   out = out.replace(SECRET_TOKEN_RE, (m) => maskOne(m));

@@ -392,6 +392,27 @@ function renderEditorModels(list) {
   updateEditorModelCount();
 }
 
+/**
+ * 逐模型协议的**别名归一**（与引擎 `wireOfName()` 认的拼法一致，见 `model-gateway.mjs`）。
+ *
+ * ⚠ 为什么必须有这个函数：引擎接受多种拼法（`openai` / `openai-completions` /
+ * `responses`…），而下拉框只列得出 3 个规范值。没有归一的话，"打开抽屉 → 点应用"
+ * 会把 `api: 'openai'` 读成空值、再写回时**丢掉整个字段**，界面上还显示成「跟随」——
+ * 与今天刚修的"一键获取抹掉 api"是同一类静默数据丢失（审计 2026-10-09 D4）。
+ *
+ * 归一本身是**无损**的：这些拼法在引擎里解析成同一个 wire。
+ * 归一不了的（例如用户手写的 `gemini`）返回 null，由调用方原样保留——宁可留着一个
+ * 不认识的字符串，也不要静默删掉用户写的东西。
+ */
+function canonicalApiValue(v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  if (!s) return '';
+  if (s === 'openai-chat' || s === 'openai-completions' || s === 'openai' || s === 'chat') return 'openai-chat';
+  if (s === 'anthropic' || s === 'anthropic-messages' || s === 'messages') return 'anthropic-messages';
+  if (s === 'openai-responses' || s === 'responses') return 'openai-responses';
+  return null;   // 认不出来 → 保留原值
+}
+
 function modelRow(e) {
   const tr = el('tr');
   // ⚠ `api` 这一列必须存在，哪怕它平时是「跟随」。
@@ -403,9 +424,14 @@ function modelRow(e) {
   // `ModelProtocolUnsupported`（实测：一键获取之后该家 11 个模型全部 400）。
   //
   // 显示为「跟随」是准确的语义：留空 = 用供应商级 protocol，再不行跟随客户端请求。
-  const apiVal = String(e.api || '');
-  const opts = [['', '跟随'], ['openai-chat', 'chat'], ['anthropic-messages', 'anth.'], ['openai-responses', 'resp.']]
-    .map(([v, label]) => `<option value="${v}"${apiVal === v ? ' selected' : ''}>${label}</option>`).join('');
+  const rawApi = String(e.api || '');
+  const canon = canonicalApiValue(rawApi);
+  const known = [['', '跟随'], ['openai-chat', 'chat'], ['anthropic-messages', 'anth.'], ['openai-responses', 'resp.']];
+  // 认不出来的值 → 额外补一个选项把它**原样带下去**（不静默删用户的写法）
+  const extra = (rawApi && canon === null) ? [[rawApi, rawApi.length > 10 ? rawApi.slice(0, 9) + '…' : rawApi]] : [];
+  const sel = canon === null ? rawApi : canon;
+  const opts = known.concat(extra)
+    .map(([v, label]) => `<option value="${attr(v)}"${sel === v ? ' selected' : ''}>${esc(label)}</option>`).join('');
   tr.innerHTML = `
     <td><input class="input" data-f="up" value="${attr(e.up || '')}" placeholder="上游真实模型 ID" style="width:100%" /></td>
     <td><input class="input" data-f="as" value="${attr(e.as && e.as !== e.up ? e.as : '')}" placeholder="留空 = 同名" style="width:100%" /></td>

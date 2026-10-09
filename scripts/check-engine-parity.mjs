@@ -215,6 +215,12 @@ const DECLARED = [
   { name: 'upstreamKeyMissing', why: '新增：上游 Key 是否"没填/还是模板值"。占位清单与 src/writers/util.js 的 PLACEHOLDER_KEYS 保持一致（引擎是独立 .mjs 不能 require，故复制一份，改一处要改两处）' },
   { name: 'PLACEHOLDER_UPSTREAM_KEYS', why: '新增：占位 Key 清单（同 writers/util.js）' },
   { name: 'apiKeysOf', why: '无改动（附近插入了新函数导致块指纹变化）' },
+  { name: 'proxyStatus', why: '修（安全 V2）：抹掉代理 URL 里的 user:password 再外露。这个对象进**免鉴权**的 /health（watchdog 要用它自检，不能加鉴权），而代理 URL 是应用自己注入的且允许带 userinfo —— 实测带 userinfo 的代理会原文出现在 /health 里，任何本机进程读一次就拿到代理口令。只保留 host:port，口令换成 ***' },
+  { name: 'log', why: '修（安全 V5）：日志消息转义换行。消息里带客户端可控内容（model 名、URL 路径、上游错误体），不转义时一条请求就能**伪造出完整的日志行**（含伪造时间戳与级别）—— 实测 model="nope\n[时间戳] breaker OPEN: ..." 一次写出 3 行。宿主 logger.js:161 早有这条转义并写明理由，引擎这份一直漏着。顺带挡住 16MB 级单行日志的写放大' },
+  { name: 'json', why: '修（正确性 D3/D5/D6 的公共放大器）：headersSent 时 catch 里**必须 destroy**。典型情形是流式响应中途出错、兜底 catch 又想回一个 JSON 错误 —— 此时一个字节也写不出去，而也没有别人负责收尾（pumpMatrixStream → forward → handleCompletion → routeRequest catch → replyBodyError → 这里），旧实现静默 return 导致**客户端永远等不到终止**（实测矩阵路径悬挂 4s+ 不关，直通路径 202ms 就关）' },
+  { name: 'accountKey', why: '无改动（附近插入新常量导致块指纹变化）' },
+  { name: 'accountModelKey', why: '修（安全 V3）：model 必须截断到 128 字符。它是客户端可控的，而这个键会 ① 成为 accountPool 的键 → 512 条 × 16MB ≈ 8GB 常驻内存；② 被 accountPoolSnapshot 原样列进免鉴权的 /health。实测 4 个 20 万字符的 model 名 → GET /health 返回 801KB。条目数早有上界，漏的正是"值"这一维。三个调用点传同一个 model 值，截断后仍自洽' },
+  { name: 'ACCOUNT_MODEL_KEY_MAX', why: '新增：模型级冷却键里 model 部分的长度上限（128）' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

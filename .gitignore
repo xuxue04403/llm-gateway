@@ -16,3 +16,5 @@ out/_test-leak-settings.yaml
 
 # 我用来写 commit message 的临时文件（忘了删就会被提交 —— 已经犯过两次）
 *.txt
+# 审计复现脚本（本地留档，不入库）
+.audit/

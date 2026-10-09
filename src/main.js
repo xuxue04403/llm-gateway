@@ -684,7 +684,16 @@ function registerIpc() {
 
   handle('write:detect', () => {
     const ctx = writeCtx({});
-    return { ok: true, targets: writers.detectAll(ctx) };
+    // ⚠ 必须和 write:preview 一样脱敏。
+    //
+    // `detectAll()` 的返回值里带着各目标**当前配置的原始内容**（例如 claude-code 的
+    // `current.authToken`、codex 的 `model_providers.*.experimental_bearer_token`）——
+    // 那是用户自己的真实凭据。旧实现只把它原样经 IPC 送进渲染进程，而隔壁
+    // `write:preview` 走的是 `sanitizePreview`。界面当前不显示 `current`，
+    // 但值已经进了渲染进程内存（XSS / devtools / 堆转储都能读）。
+    // 审计（2026-10-09 渲染/宿主 D3）实测：detect 返回的 authToken 是明文，
+    // 而同一份文件走 preview 已打码成 ***。
+    return sanitizePreview({ ok: true, targets: writers.detectAll(ctx) });
   });
 
   handle('write:preview', (_e, id, options) => {

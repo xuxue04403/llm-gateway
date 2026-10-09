@@ -198,7 +198,25 @@ function proxyStatus() {
   const env = process.env;
   const url = env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy || '';
   const noProxy = env.NO_PROXY || env.no_proxy || '';
-  return { url: url || null, noProxy: noProxy || null, envProxy: env.NODE_USE_ENV_PROXY === '1' };
+  // ⚠ 必须抹掉 URL 里的 `user:password` 再外露。
+  //
+  // 这个对象会进**免鉴权**的 `/health`（watchdog 要用它自检，不能加鉴权），
+  // 而代理 URL 是**应用自己注入**的（gateway-manager 允许配 `http://user:pw@host:port`），
+  // 实测（2026-10-09 安全审计 V2）带 userinfo 的代理会**原文**出现在 /health 里 ——
+  // 任何本机进程读一次 /health 就拿到了代理口令。
+  // 只保留"走不走代理 + 哪个 host:port"，口令换成 ***。
+  let shown = url || null;
+  if (url) {
+    try {
+      const u = new URL(url);
+      if (u.username || u.password) {
+        u.username = u.username ? '***' : '';
+        u.password = '';
+        shown = u.toString();
+      }
+    } catch { shown = '<无法解析的代理 URL>'; }
+  }
+  return { url: shown, noProxy: noProxy || null, envProxy: env.NODE_USE_ENV_PROXY === '1' };
 }
 
 /** host 是否命中 NO_PROXY 清单（精确或后缀——实测 `tencent.com` 命中 copilot.tencent.com）。 */
@@ -271,7 +289,14 @@ function localStamp(d) {
 }
 
 function log(msg) {
-  const line = `[${localStamp()}] ${msg}`;
+  // ⚠ 必须转义换行 —— 日志消息里带**客户端可控**的内容（model 名、URL 路径、上游错误体…），
+  // 不转义的话一条请求就能**伪造出完整的日志行**（含伪造时间戳与级别）。
+  // 实测（2026-10-09 安全审计 V5）：`model: "nope\n[2026-10-09 00:00:00.000] breaker OPEN: ALL 失败（401）"`
+  // → 一次请求写出 3 行日志，中间那行看起来完全像网关自己记的。
+  // 宿主侧的 logger.js:161 早就有这条转义并写明了理由（"否则能伪造出完整的日志行"），
+  // 引擎这份一直漏着。
+  // 顺带也挡住"超长单行日志"的磁盘写放大（16MB 的 model 名会变成一条 16MB 的日志行）。
+  const line = `[${localStamp()}] ${String(msg).replace(/[\r\n\u2028\u2029]+/g, '\\n')}`;
   try {
     // 轮转：超过上限时重置文件
     try {
@@ -939,6 +964,17 @@ function json(res, status, obj) {
     res.end(buf);
   } catch (e) {
     log(`client already gone when sending ${status}: ${e.message}`);
+    // ⚠ 这里**必须 destroy**，不能只记一行日志就返回。
+    //
+    // 走到 catch 的典型情形是「响应头已经发出去了」（流式响应中途出错，兜底 catch 又想
+    // 回一个 JSON 错误）—— 此时 `json()` 一个字节也写不出去，而**也没有别人负责收尾**：
+    // 调用链是 `pumpMatrixStream` 抛异常 → `forward` → `handleCompletion`
+    // → `routeRequest` 的 catch → `replyBodyError` → 这里。
+    // 旧实现在这里静默 return，于是**客户端永远等不到任何终止**（实测：矩阵路径上游中途
+    // 断连时，客户端拿着半截 SSE 悬挂，socket 十几秒不关；直通路径因为有自己的
+    // res.destroy 分支所以没事）。
+    // destroy 让客户端立刻感知到连接断了，可以自己重试 —— 这比"假装还活着"好。
+    try { if (!res.writableEnded) res.destroy(); } catch { /* 忽略 */ }
   }
 }
 
@@ -1495,9 +1531,23 @@ const ACCOUNT_POOL_MAX = Number(process.env.DSH_GATEWAY_ACCOUNT_POOL_MAX) > 0
   ? Number(process.env.DSH_GATEWAY_ACCOUNT_POOL_MAX) : 512;
 
 function accountKey(providerId, acctId) { return providerId + '#' + acctId; }
-/** 模型作用域的冷却键（仅限流类用，见 markAccountFailure 的 model 参数说明）。 */
+
+/**
+ * 模型作用域的冷却键（仅限流类用，见 markAccountFailure 的 model 参数说明）。
+ *
+ * ⚠ model 必须截断。它是**客户端可控**的（请求体里的 model 字段），而这个键会
+ *   ① 成为 `accountPool` 的键 → 512 条 × 16MB 上限 ≈ 8GB 常驻内存；
+ *   ② 被 `accountPoolSnapshot` 原样列进**免鉴权**的 `/health`。
+ * 审计（2026-10-09 V3）实测：4 个 20 万字符的 model 名 → `GET /health` 返回 **801 KB**；
+ * 最坏 512 × 16MB ≈ 8GB。条目数早有上界，漏的正是"值"这一维。
+ *
+ * 截断到 128 字符：足够区分任何真实模型名（最长的公开模型名远小于它），
+ * 且三个调用点（查冷却 L1552 / 写冷却 L1631 / 清冷却 L1659）传的是同一个 model
+ * 值，截断后三者仍然自洽 —— 不会出现"写进去的键查不到"。
+ */
+const ACCOUNT_MODEL_KEY_MAX = 128;
 function accountModelKey(providerId, acctId, model) {
-  return providerId + '#' + acctId + '@' + String(model || '');
+  return providerId + '#' + acctId + '@' + String(model || '').slice(0, ACCOUNT_MODEL_KEY_MAX);
 }
 
 /** 冷却条目是否已过冷却期（纯读，无副作用） */
@@ -1602,7 +1652,14 @@ function markAccountFailure(providerId, acct, kind, detail, model, serverMs) {
     // D6（安全）：必须过 maskSecrets —— 上游鉴权失败时回显收到的 Authorization 是常见实现，
     // 不过滤会让用户的统一网关 key 明文进 /health（免鉴权）与日志。这是同文件里唯一的裸输出点。
     reason: maskSecrets(String(detail || kind)).replace(/\s+/g, ' ').slice(0, 120),
-    ...(scoped ? { model: String(model) } : {}),
+    // ⚠ model 必须截断。它是**客户端可控**的（请求体里的 model 字段），
+    // 而这条记录会被 `accountPoolSnapshot` 全量列进**免鉴权**的 `/health`。
+    // 条目数早有上界（ACCOUNT_POOL_MAX=512），但**值长度**一直没有 ——
+    // 审计（2026-10-09 V3）实测：200000 字符的 model 名进池后，
+    // 再发 3 个 15 万字符的不同名，`GET /health` 返回 **2.6 MB**；
+    // 最坏 512 × 16MB ≈ 8GB 常驻内存 + 一条巨型响应。
+    // 128 字符足够区分任何真实模型名（最长的公开模型名远小于它）。
+    ...(scoped ? { model: String(model).slice(0, 128) } : {}),
   });
   // D6（安全）：同上——日志与 /health 的 reason 是两个出口，都要脱敏
   log(`account ${providerId}#${acct.id}${scoped ? ' 模型 ' + model : ''} 标记为 ${kind}（冷却 ${Math.round(ms / 1000)}s`
@@ -4370,6 +4427,18 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     if (MODEL_UNSUPPORTED_BY_PROVIDER_RE.test(detail)) {
       log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"这家不提供该模型"（含地区/套餐受限）`
         + ' → 继续 failover（**不熔断该家**；该家对别的模型仍然正常。若长期如此，请从配置的 models 里移除该映射）');
+      // ⚠ 必须交还半开探测名额 —— 与上方"账户级失败"、下方"确定性 4xx"同一个理由：
+      // 这家上游**能正常应答**（只是没有这个模型），连接性是健康的。
+      //
+      // 漏掉它的后果实测（2026-10-09，`.audit\a1-breaker-halfopen.js`）：
+      // 上游先 500 三次 → 熔断开闸；冷却到点后放行一次半开探测，这次探测恰好命中
+      // "这家不提供该模型" → 直接 return 不结算 → 名额被永久占用，`breakerIsOpen()`
+      // 对未超期的 half-open 恒为真 → **该家所有模型在 180s 内全部 503**
+      //（实测请求同家另一个完全正常的模型 m2 也拿到
+      // `all providers for model "m2" are temporarily in breaker cooldown`，
+      //  而上游命中 0 次；对照组把这次换成 422（会走结算）时 m2 = 200）。
+      // 这正是上方 :4377 注释所警告的"连坐"。
+      breakerRecordSuccess(provider.id);
       return rawMode ? { retryable: upstream.status } : false;
     }
     if (CLIENT_FINGERPRINT_RE.test(String(detail || ''))) {
@@ -4467,7 +4536,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       // 同样刻意不调 breakerRecordFail（可能是该模型个例，不该连坐整家）。
       if (UPSTREAM_BROKEN_4XX_RE.test(detail)) {
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"上游侧故障被包成 4xx"`
-          + `（${String(detail || '').slice(0, 80)}）→ 继续 failover（不熔断该家）`);
+          + `（${maskSecrets(String(detail || '')).slice(0, 80)}）→ 继续 failover（不熔断该家）`);
         return rawMode ? { retryable: upstream.status } : false;
       }
       const status = DETERMINISTIC_4XX_STATUS[upstream.status] || 400;
@@ -4558,8 +4627,22 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       }
       peekReader.releaseLock();   // 未判失败：把流交回下面的正常消费路径
     } catch (peekErr) {
-      log(`upstream ${provider.id} 首事件偷看失败（按正常流继续）：${peekErr && peekErr.message}`);
+      // ⚠ 偷看抛错 = **上游流本身坏了**，不能"按正常流继续"。
+      //
+      // `getReader()` / `read()` 只会在两种情况下抛：流被锁住，或流已 errored。
+      // 两种都意味着这个 body 已经**用不了**了 —— 继续往下走，正常消费路径会在
+      // 更靠后的位置再炸一次，而那时可能已经 `writeHead(200)`，
+      // 于是异常冒到 `routeRequest` 的兜底 catch、被包装成 400 却一个字节也写不出去
+      // → **客户端 0 字节、连接不关**（审计 2026-10-09 D5 实测：
+      //   客户端 4s 内既没收到响应头也没收到错误，socket 一直开着）。
+      //
+      // 此刻**还没向客户端写过任何字节**，所以"换下一家"是安全且正确的选择 ——
+      // 与下方"上游响应头之前出错就 failover"的处理一致。
+      log(`upstream ${provider.id} 首事件偷看失败（流已损坏，换下一家）：${peekErr && peekErr.message}`);
       pendingHead = null;
+      try { peekReader.releaseLock(); } catch { /* 已释放/已取消 → 忽略 */ }
+      try { await bodyStream.cancel(); } catch { /* 忽略 */ }
+      return rawMode ? { retryable: 0 } : false;
     }
   }
   // D2（审计修复）：到这里才确认"上游确实给出了正常事件"（用了流式则已通过首事件偷看），
@@ -5817,20 +5900,56 @@ async function pumpMatrixStream({ res, upstream, upstreamWire, clientWire, model
     }
   };
 
+  // ⚠ 客户端断开 → 立刻取消上游读取。
+  //
+  // 直通路径早有这一手（`onClientClose` → `reader.cancel()`，日志
+  // "client closed connection, cancelling upstream stream"），**翻译路径一直漏着**。
+  // 后果与那边注释里描述的已修旧 bug 逐字相同：用户在界面上点「停止」之后，
+  // 上游**继续生成到结束**（重复计费 / 白占额度），而网关还把它记成
+  // `served … status=ok`（审计 2026-10-09 D4/V4 实测：客户端收到第 3 帧就断开，
+  // 上游仍然把 40 帧全发完，耗时 4.3s，日志 status=ok）。
+  // 只置标志、由读循环自己收手：在 'close' 回调里直接调 reader.cancel() 会和
+  // 正在进行的 read() 抢锁。
+  let clientGone = false;
+  const onClose = () => { clientGone = true; };
+  res.once('close', onClose);
+  const cancelUpstream = async () => {
+    try { await reader.cancel(); } catch { /* 忽略 */ }
+  };
+
   try {
     for (;;) {
+      if (clientGone) { await cancelUpstream(); break; }
       const { done, value } = await reader.read();
       if (done) break;
       buf += td.decode(value, { stream: true });
       flush();
+      // ⚠ 背压：直通路径 res.write()===false 时会等 drain（否则慢客户端 + 快上游
+      // 会把整段响应堆在 Node 缓冲里）。翻译路径一直没等 —— 这里补上。
+      if (res.writableNeedDrain && !clientGone) {
+        await new Promise((r) => { res.once('drain', r); res.once('close', r); });
+      }
+      if (res.destroyed || res.writableEnded) { clientGone = true; }
     }
     flush();   // 收尾：偷看过的字节可能整条都在 buf 里（见上面的说明）
+  } catch (e) {
+    // 上游流中途断连：客户端已经收到 200 + 半截 SSE，**不可能**再改状态码了。
+    // 唯一诚实的收尾是让连接断掉，客户端据此知道自己拿到的是残帧、可以重试。
+    // （旧实现让异常一路冒到 routeRequest 的兜底 catch，而 `json()` 在 headersSent 时
+    //   一个字节也写不出去、也不销毁 —— 客户端于是**永远等不到终止**，
+    //   实测矩阵路径悬挂 4s+ 不关，直通路径 202ms 就关了。）
+    log(`[matrix] 上游流中断（${upstreamWire} → ${clientWire}）：${e && e.message}；已断开客户端连接（残帧）`);
+    await cancelUpstream();
+    try { if (!res.destroyed && !res.writableEnded) res.destroy(); } catch { /* 忽略 */ }
+    return { clientGone: false, broken: true };
   } finally {
+    try { res.removeListener('close', onClose); } catch { /* 忽略 */ }
     try { reader.releaseLock(); } catch { /* 忽略 */ }
   }
   // 上游没有明确的结束帧时（如 Anthropic 的 message_stop 不映射成事件）也要收尾，
   // 否则客户端会一直等 message_stop / response.completed / [DONE]。
-  if (!sawEnd) encoder.finish();
+  if (!sawEnd && !clientGone) encoder.finish();
+  return { clientGone };
 }
 
 /** canonical 事件 → chat 的完整响应（用于"上游流式、客户端要非流式"）。 */
@@ -5945,11 +6064,21 @@ async function forwardMatrixResponse({ res, upstream, bodyStream, ctype, pending
   // ① 客户端要流式 + 上游是流式 → 真正的逐帧翻译
   if (isSse && mx.clientStream) {
     try { res.writeHead(200, headers); } catch (e) { log(`client disconnected before headers: ${e.message}`); return false; }
-    await pumpMatrixStream({
+    const pr = await pumpMatrixStream({
       res, upstream, upstreamWire: mx.upstreamWire, clientWire: mx.clientWire,
       model: mx.model, inputTokens: mx.inputTokens, headBytes: pendingHead,
     });
     if (!res.destroyed && !res.writableEnded) { try { res.end(); } catch { /* 忽略 */ } }
+    // 客户端中途走了 → 返回 false，让调用方**别把它记成 status=ok**。
+    // 直通路径早有这个语义（`onClientClose` → 日志 `stream-broken status=fail`），
+    // 翻译路径一直记成 ok —— 于是"用户点了停止"在日志里看起来像一次成功调用，
+    // 排障时完全看不出上游其实被取消了（审计 2026-10-09 D4 实测：
+    // 客户端收到第 3 帧就断开，日志仍是 `served … status=ok dur=4313ms`）。
+    // 返回 false 不会引发 failover：调用方有 headersSent 守卫（响应头已发出）。
+    if (pr && pr.clientGone) {
+      log('[matrix] 客户端中途断开，已取消上游读取（不记 ok）');
+      return false;
+    }
     return true;
   }
 
@@ -5959,7 +6088,19 @@ async function forwardMatrixResponse({ res, upstream, bodyStream, ctype, pending
   if (isSse) {
     const col = makeCanonicalCollector();
     // 客户端要非流式，但上游已经在流了：把偷看过的首块也喂回去
-    await drainCanonicalStream({ upstream, upstreamWire: mx.upstreamWire, collector: col, headBytes: pendingHead });
+    //
+    // ⚠ 必须 try/catch。`drainCanonicalStream` 只做了 finally（释放 reader 锁），
+    // **没有 catch** —— 上游流中途断连时 `reader.read()` 抛出的异常会一路冒到
+    // `routeRequest` 的兜底 catch，最后被 `replyBodyError` 包装成
+    // **`400 invalid JSON body: terminated`** 回给客户端：
+    // 请求体明明是合法的，却被指着说 JSON 无效（审计 2026-10-09 D6 实测），
+    // 而且不会 failover。下面非 SSE 分支对同一种失败是正确返回 502 的 —— 这里对齐它。
+    try {
+      await drainCanonicalStream({ upstream, upstreamWire: mx.upstreamWire, collector: col, headBytes: pendingHead });
+    } catch (e) {
+      log(`matrix: 读上游流失败（${mx.upstreamWire} → ${mx.clientWire}）：${e && e.message}`);
+      return { stop: { status: 502, upstreamStatus: upstream.status, reason: '上游响应读取失败（流中途断开）' } };
+    }
     canon = canonicalToChatCompletion(col.acc, mx.model);
   } else {
     let text = '';
@@ -5987,7 +6128,7 @@ async function forwardMatrixResponse({ res, upstream, bodyStream, ctype, pending
     let json = null;
     try { json = JSON.parse(text); } catch (e) {
       // 最常见的真实形态：反代/网关插在中间，上游 200 但返回 HTML 错误页。
-      log(`matrix: 上游响应不是合法 JSON（${mx.upstreamWire} → ${mx.clientWire}）：${String(text).slice(0, 120)}`);
+      log(`matrix: 上游响应不是合法 JSON（${mx.upstreamWire} → ${mx.clientWire}）：${maskSecrets(String(text)).slice(0, 120)}`);
       return {
         stop: {
           status: 502,
@@ -6417,6 +6558,12 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"这家不提供该模型"（含地区/套餐受限）`
           + ' → 继续 failover（**不熔断该家、不冷却账户**；该家对别的模型仍然正常。'
           + '若长期如此，请从配置的 models 里移除该映射）');
+        // ⚠ 必须交还半开探测名额。理由与直通路径同一处完全相同：
+        // 上游能正常应答（只是没有这个模型），连接性是健康的；不交还的话
+        // half-open 名额被永久占用 → 该家所有模型在熔断窗口内全部 503（连坐）。
+        // 实测（.audit\a2-breaker-anthropic-path.js）：Anthropic 客户端 → openai-chat 上游，
+        // 半开探测命中这条 early return 后，请求同家另一个正常模型也拿 503、上游命中 0。
+        breakerRecordSuccess(provider.id);
         return false;
       }
       // 与直通路径同一条判据（见 UPSTREAM_BROKEN_4XX_RE 的定义处）：
@@ -6425,7 +6572,9 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       // 少了它，"优先级更高但坏掉的家"照样能把请求打死。
       if (UPSTREAM_BROKEN_4XX_RE.test(String(lastDetail || ''))) {
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"上游侧故障被包成 4xx"`
-          + `（${String(lastDetail || '').slice(0, 80)}）→ 继续 failover（不熔断该家、不冷却账户）`);
+          + `（${maskSecrets(String(lastDetail || '')).slice(0, 80)}）→ 继续 failover（不熔断该家、不冷却账户）`);
+        // 同 MODEL_UNSUPPORTED 那处：上游连接性是健康的 → 必须交还半开探测名额。
+        breakerRecordSuccess(provider.id);
         return false;
       }
       if (CLIENT_FINGERPRINT_RE.test(String(lastDetail || ''))) {
@@ -6525,6 +6674,10 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         } catch (peekErr) {
           log(`上游首事件偷看失败（按正常流继续）：${peekErr && peekErr.message}`);
           headBytes = null;
+          // 同直通路径那处：锁必须在异常路径也释放，否则下面的
+          // `upstream.body.getReader()` 会抛 `ReadableStream is locked`，
+          // 而此时 200 已发出 → 客户端 0 字节悬挂（审计 2026-10-09 D5）。
+          try { peekReader.releaseLock(); } catch { /* 已释放/已取消 → 忽略 */ }
         }
         if (wantsStream && !opts?.aggregateOnly) {
           res.writeHead(200, {
@@ -6565,7 +6718,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         // `all providers ... are unavailable`，真正的原因（反代插了 HTML 错误页）只躺在日志里。
         // 实测（2026-10-08）：这是 Anthropic 客户端 → chat 上游这条**最常用**路径上的行为，
         // 与矩阵路径的 502 处置不一致。
-        log(`upstream ${provider.id} 非 JSON 响应（anthropic→openai 翻译路径，Content-Type: ${ctype || '未声明'}）：${String(text).slice(0, 120)}`);
+        log(`upstream ${provider.id} 非 JSON 响应（anthropic→openai 翻译路径，Content-Type: ${ctype || '未声明'}）：${maskSecrets(String(text)).slice(0, 120)}`);
         return {
           stop: {
             status: 502,
@@ -6612,7 +6765,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
   // 同 UPSTREAM_BROKEN_4XX_RE 的定义处：上游自己坏了却包成 4xx → 该家不算"请求有错"，
   // 交还半开名额、不熔断，让 failover 继续。
   if (UPSTREAM_BROKEN_4XX_RE.test(String(lastDetail || ''))) {
-    log(`provider ${provider.id} 的失败原因是"上游侧故障被包成 4xx"（${String(lastDetail || '').slice(0, 80)}）`
+    log(`provider ${provider.id} 的失败原因是"上游侧故障被包成 4xx"（${maskSecrets(String(lastDetail || '')).slice(0, 80)}）`
       + ' → 交还半开名额，**不熔断该家**，继续 failover');
     breakerRecordSuccess(provider.id);
     return false;
@@ -7373,6 +7526,23 @@ async function routeRequest(cfg, req, res) {
       log(`rejected non-loopback Origin: ${JSON.stringify(String(req.headers.origin || ''))}（DNS rebinding 防护）`);
       json(res, 403, { error: { message: 'gateway only accepts browser requests from loopback origins' } });
       return;
+    }
+    // 绝对形式 request-URI（`GET http://evil.com/... HTTP/1.1`）里的 host 也要检查。
+    //
+    // 这不是一条**在野**漏洞：浏览器永远发 origin-form（`GET /path`），
+    // 绝对形式只出现在"客户端以为自己在跟代理说话"时 —— 能构造它的客户端已经
+    // 能直接对 127.0.0.1 发原始 HTTP 了，本来就在本机权限内。
+    // 但一个请求同时声明两个不同的 host（Host 头说回环、request-target 说 evil.com）
+    // 本就是自相矛盾的，**放行它只会让"守卫到底信哪个"变成需要推理的事**。
+    // 5 行换掉这个歧义，值。（实测：bash 构造该请求能拿到 200，加这条后 403。）
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(String(req.url || ''))) {
+      let absHost = '';
+      try { absHost = new URL(req.url).host; } catch (_) { absHost = ''; }
+      if (!hostIsLoopback(absHost)) {
+        log(`rejected absolute-form request-target with non-loopback host: ${JSON.stringify(String(req.url || '').slice(0, 120))}（DNS rebinding 防护）`);
+        json(res, 403, { error: { message: 'gateway only accepts requests addressed to loopback' } });
+        return;
+      }
     }
     let url;
     try {

@@ -269,6 +269,53 @@ let upstreamPort = 0;
     assert.strictEqual((await req({ host: '127.0.0.1:' + gwPort, origin: 'http://evil.example.com' })).st, 403, '非回环 Origin 必须拒绝');
   });
 
+  t('网关：Host 解析的 IPv6 / 端口剥离（变异测试证明这段逻辑此前零覆盖）', async () => {
+    // ⚠ 这条测试的由来：2026-10-09 的变异测试发现，把 `hostnameOfHost` 整个换成天真的
+    // `h.split(':')[0]`，**全量 142 条测试 0 条失败** —— 也就是说这段"IPv6 方括号感知"
+    // 的逻辑没有任何回归保护，而改错的后果是**合法的 IPv6 回环被 403**。
+    //
+    // 不能简单 split(':') 的三个理由（逐个钉住）：
+    //   · `[::1]:3091` → 天真切法得到 `[`，回环被误拒
+    //   · `[::1]`（无端口）→ 天真切法得到 `[`
+    //   · 裸 `::1`（无方括号）→ 里面的冒号**不是**端口分隔符，不能截断
+    //
+    // ⚠ 必须用**裸 socket**：Node 的 http 客户端对 `Host: [::1]`（无端口）会 ECONNRESET，
+    // 测不出服务端的真实行为。另外裸 `::1`（不加方括号）是 RFC 违规，
+    // **Node 的 HTTP 解析器自己就回 400**，根本到不了我们的守卫 —— 这条也钉住。
+    const raw = (hostHeader) => new Promise((resolve) => {
+      const sock = net.connect(gwPort, '127.0.0.1', () => {
+        sock.write('GET /health HTTP/1.1\r\nHost: ' + hostHeader + '\r\nConnection: close\r\n\r\n');
+      });
+      let buf = '';
+      sock.setTimeout(6000, () => { sock.destroy(); resolve(buf); });
+      sock.on('data', (c) => { buf += c; });
+      sock.on('close', () => resolve(buf));
+      sock.on('error', () => resolve(buf));
+    });
+    const codeOf = (b) => (String(b).match(/^HTTP\/1\.1 (\d{3})/m) || [])[1] || '(无响应)';
+
+    // 合法的 IPv6 回环形态都必须放行
+    for (const h of ['[::1]:' + gwPort, '[::1]']) {
+      assert.strictEqual(codeOf(await raw(h)), '200',
+        `Host=${h} 是合法 IPv6 回环，必须放行（不能因切端口切坏而误拒）`);
+    }
+    // 非回环的 IPv6 形态必须拒绝
+    for (const h of ['[::ffff:127.0.0.1]:' + gwPort, '[::]', '[2001:db8::1]:' + gwPort, '[0:0:0:0:0:0:0:2]']) {
+      assert.strictEqual(codeOf(await raw(h)), '403', `Host=${h} 不是回环，必须拒绝`);
+    }
+    // 裸 IPv6（无方括号）是 RFC 违规 → Node 解析器回 400，不归我们管
+    assert.strictEqual(codeOf(await raw('::1')), '400',
+      'Host=::1 应被 Node 的 HTTP 解析器拒掉（未加方括号是 RFC 违规）');
+    // 端口剥离 + 大小写 + 尾空格
+    for (const h of ['127.0.0.1:' + gwPort, '127.0.0.1:0', 'LOCALHOST:' + gwPort, '127.0.0.1:' + gwPort + ' ']) {
+      assert.strictEqual(codeOf(await raw(h)), '200', `Host=${h} 应放行（大小写/端口 0/尾空格）`);
+    }
+    // 看着像但不是回环的形态
+    for (const h of ['127.0.0.2:' + gwPort, '127.1', '2130706433', 'localhost.', '0.0.0.0:' + gwPort, '127.0.0.1.nip.io']) {
+      assert.strictEqual(codeOf(await raw(h)), '403', `Host=${h} 不是回环，必须拒绝`);
+    }
+  });
+
   // ---- 6) 上游错误响应体挂起 → 网关不永久挂起（P2-3）----
   t('网关：上游错误体挂起 → 网关仍在 5s 超时内返回（不永久挂起）', async () => {
     upstream.hangBody = true;
@@ -2140,7 +2187,20 @@ let upstreamPort = 0;
   });
 
   t('WorkBuddy 凭据取舍：身份不同（企业变了）→ 必须用桌面文件，不得用自留副本的旧企业', async () => {
-    // ① 的反向用例：uid 相同但 enterpriseId 不同 = 换了企业身份。
+    // ⚠ 先说清这条测试**能**守什么、**不能**守什么（2026-10-09 变异测试实测）：
+    //
+    //  · 它**不能**区分 v0.7.8 的 `cred = desktop || own` —— 因为两段式的规则①
+    //    （身份不同 → 桌面）与旧写法**行为完全重合**：只要桌面副本存在，两者都选桌面。
+    //    实测：把修复回退掉，这条照样 PASS。真正有行为差异的只有规则②（同身份 → 谁新用谁），
+    //    那条由上面「身份相同 → 谁新用谁」的姊妹用例守着，回退后会 FAIL。
+    //
+    //  · 它**能**守住的是另一个方向的回归：把取舍写成"无条件优先自留副本"
+    //    （`own || desktop`、或"同身份判断写反"），那样就会把自留副本里的**旧企业身份**
+    //    发出去 —— 同一账号退出/换企业后 uid 不变、只有 enterpriseId 变，
+    //    串号的后果是上游按旧企业鉴权。
+    //
+    // 保留它的理由：断言本身是对的、也是便宜的；只是别把它当成"守住了规则①"。
+    // uid 相同但 enterpriseId 不同 = 换了企业身份。
     // 自留副本**过期更晚**（正是最容易被误选的那种），必须仍然选桌面。
     const up = await startFakeOpenAIUpstream({ json: true });
     const dir = fs.mkdtempSync(path.join(tmp, 'wb-ent-'));

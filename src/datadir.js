@@ -100,14 +100,34 @@ function looksReal(p) {
   return false;
 }
 
+/** 出厂示例里出现过的供应商 id（只有它们同时出现在示例中）。 */
+const SAMPLE_PROVIDER_IDS = new Set(['provider-a', 'provider-b', 'provider-c', 'workbuddy', 'cline']);
+/** 出厂示例里出现过的 baseURL 形态。 */
+const SAMPLE_URL_RE = /^https?:\/\/(api\.example\d?\.com|copilot\.tencent\.com|api\.cline\.bot)(\/|$)/i;
+/** 示例专属 id：真实用户不会这么命名（这是判定的**锚点**）。 */
+const SAMPLE_ANCHOR_RE = /^provider-[a-z]\d*$/i;
+
 /**
- * 判断一份网关配置是不是"示例/占位"而不是用户的真实配置。
+ * 判断一份网关配置是不是"出厂示例"而不是用户的真实配置。
  *
- * 规则：**只看启用的供应商里有没有一家看起来是真的**。
- * 这样处理是必须的 —— 示例文件里除了 provider-a/provider-b 还带着 workbuddy 与 cline
- * 两个"示范条目"（enabled: false，密钥是 `sk_在此填入…` 这类占位）。旧实现要求
- * "每一个条目都像占位"才算占位，于是示例文件因为这两个条目被误判成"真实配置"，
- * 首次运行的导入被直接跳过（实测踩到：用户那 12 家供应商没被导进来）。
+ * ## 为什么改成"正向识别示例"，而不是"启发式判断真假"
+ *
+ * 旧实现是 `!enabled.some(looksReal)` —— 从"有没有一家看起来是真的"反推。
+ * 这条路会**把真实配置误判成示例**，而后果是**启动时静默覆盖用户配置（不可逆数据丢失）**。
+ * 实测（2026-10-09 渲染/宿主审计 D1，两条都能复现）：
+ *   · 用户**临时停用全部供应商** → `enabled.length===0` → 判为占位 → 下次启动被覆盖
+ *   · 用户用**自建中转 / Ollama / 本地代理**，Key 短于 16 字符（如 `localkey123`）
+ *     → `looksReal` 为假 → 判为占位 → 被覆盖
+ * 两者都只剩一份 `.bak-import`，且该备份只在第一次生成。
+ *
+ * 判据现在改成**正向匹配出厂示例的特征**，并保守到底：
+ *   ① 必须**含示例专属锚点**（`provider-a` 这类 id）—— 真实用户不会这么命名；
+ *     这条锚点让"用户只用 cline"这种巧合不会被误判（他们的配置里没有 provider-a）；
+ *   ② **每一个**供应商的 id 与 baseURL 都必须落在示例的取值范围内；
+ *   ③ 缺任何一条 → 判为"真实配置"，**宁可不去导入，也绝不覆盖**。
+ *
+ * 取舍是不对称的：误判成"真实"的代价只是示例没被替换掉（用户看得见、随手能删）；
+ * 误判成"占位"的代价是**用户数据没了**。
  */
 function isPlaceholderConfig(text) {
   if (!text) return true;
@@ -115,16 +135,23 @@ function isPlaceholderConfig(text) {
   try {
     cfg = JSON.parse(text);
   } catch (_) {
-    return true;      // 解析不了 → 当作占位，允许被导入覆盖
+    // 解析不了 → 仍按占位处理（允许被导入覆盖）。此时文件本来也**用不了**，
+    // 且 importGatewayConfig 覆盖前会先备份成 .bak-import，可人工找回。
+    return true;
   }
   const ps = Array.isArray(cfg.providers) ? cfg.providers : [];
   if (ps.length === 0) {
-    // 空 providers：只要没有像样的统一 Key，就算占位
-    return !/"apiKey"\s*:\s*"(?!dsh-gateway-change-me)[^"]{16,}"/.test(text);
+    // 一条供应商都没有（字段缺失或空数组）→ **没有任何可丢的数据**，
+    // 允许被导入替换（首次运行、或用户把配置清空了想重新导入）。
+    // ⚠ 注意与"有供应商但全停用"的区别：那才是有数据、必须保护（见下方 every 判定）。
+    return true;
   }
-  const enabled = ps.filter((p) => p && p.enabled !== false);
-  if (enabled.length === 0) return true;
-  return !enabled.some(looksReal);
+  // ① 锚点：没有示例专属 id，就不是出厂示例
+  if (!ps.some((p) => p && SAMPLE_ANCHOR_RE.test(String(p.id || '')))) return false;
+  // ② 每一项都必须落在示例范围内
+  return ps.every((p) => p && typeof p === 'object'
+    && SAMPLE_PROVIDER_IDS.has(String(p.id || ''))
+    && SAMPLE_URL_RE.test(String(p.baseURL || '')));
 }
 
 /**
