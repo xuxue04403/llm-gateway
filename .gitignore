@@ -18,3 +18,6 @@ out/_test-leak-settings.yaml
 *.txt
 # 审计复现脚本（本地留档，不入库）
 .audit/
+
+# 子审计员的工作产物（diff / 复现脚本），不入库
+.audit-*.diff
