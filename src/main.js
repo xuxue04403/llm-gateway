@@ -558,17 +558,95 @@ function registerIpc() {
     // 到点后返回**已完成的部分**并如实说明还剩几家没测，比无限等下去有用。
     const BUDGET_MS = 90 * 1000;
     const startedAt = Date.now();
-    // 串行且有上限：并发探测几十家会把本机连接表打满，也会让上游看到突发的目录请求
+    // ⚠ 试生成的预算控制。
+    //
+    // 试生成比目录探测慢一个数量级（nvidia 实测 25–29 秒；目录只要 0.15–1.5 秒）。
+    // 11 家串行各跑一次 = 最坏 5 分钟，而整体预算只有 90 秒 —— 直接后果是
+    // **只有前 2 家测到了、剩下 9 家全被标"未测"**，比不测更让人困惑。
+    //
+    // 所以给试生成设一个**独立的、按剩余预算收缩的**上限：
+    //   · 剩余预算不足 GEN_MIN_MS 时，跳过试生成，只报目录结果（并明确标注"未验证生成"）
+    //   · 单次试生成的超时取 min(45s, 剩余预算 - 余量)，避免它吃掉整个预算
+    // 这样"能测就测、测不动就如实说没测"，不会静默退化成只测前两家。
+    const GEN_MIN_MS = 12 * 1000;      // 剩余预算低于这个值就不再做试生成
+    const GEN_TIMEOUT_MS = 45 * 1000;  // 单次试生成的上限
     for (const p of list.slice(0, 40)) {
-      if (Date.now() - startedAt > BUDGET_MS) {
+      const spent = Date.now() - startedAt;
+      if (spent > BUDGET_MS) {
         for (const rest of list.slice(results.length)) {
           results.push({ id: rest.id, ok: null, skipped: true, verdict: '未测（整体时间预算已用完，请稍后重试或单独测试）' });
         }
         logger.warn(`连通性测试：整体预算 ${BUDGET_MS / 1000}s 已用完，剩余 ${list.length - results.length} 家未测。`);
         break;
       }
+      const remaining = BUDGET_MS - spent;
+      const doGen = remaining >= GEN_MIN_MS;
+      // 试生成用**这个供应商配置里已声明的上游模型 ID**（用户已验证过能用），
+      // 而不是目录里第一个 —— 后者常常是"这个账号根本无权访问"的模型，
+      // 拿它试会得出假失败（实测 nvidia 的 01-ai/yi-large、opencode-zen 的 big-pickle）。
+      const declared = Array.isArray(p.models) ? p.models : [];
+      const genModel = (declared.map((m) => (typeof m === 'string' ? m : (m && (m.id || m.up)))).filter(Boolean))[0] || '';
       // eslint-disable-next-line no-await-in-loop
-      const r = await probe.probeProvider(p, { proxy, noProxy, timeoutMs: 12000 });
+      const r = await probe.probeProvider(p, {
+        proxy,
+        noProxy,
+        timeoutMs: 12000,
+        // 预算不够、或这家没声明任何模型 → 不做试生成（结论里会标注"未验证生成"）
+        deepProbe: doGen && !!genModel,
+        genModel,
+        genTimeoutMs: Math.max(GEN_MIN_MS, Math.min(GEN_TIMEOUT_MS, remaining - 2000)),
+        // 必须带上仿真头：有些上游（如 cline）不带自家头一律 403，
+        // 用它做探测会把能用的家报成失败。
+        headers: clientHeaders.probeHeaders(cfg, p, String(p.apiKey || '')
+          || (Array.isArray(p.apiKeys) ? String(p.apiKeys[0] || '') : '')),
+      });
+      // 预算不够时明确标注，避免"目录可达"被误读成"生成可用"
+      if ((!doGen || !genModel) && r && r.ok === true && !r.gen) {
+        r.verdict = '可达，凭据格式有效（**未验证生成**：'
+          + (!genModel ? '这家没声明任何模型' : '整体时间预算不足')
+          + '，可单独测这一家）— ' + r.verdict;
+        r.genSkipped = true;
+      }
+
+      // ⚠ 多 Key 的供应商要**逐把**试生成。
+      //
+      // 实测（2026-10-09，nvidia）：`apiKeys` 里 4 把 Key，`/v1/models` 全部 200，
+      // 但 `chat/completions` 有 2 把是 403 `Authorization failed`。
+      // 而 `probeProvider` 只取 `apiKey || apiKeys[0]` —— 于是：
+      //   · 若第 1 把恰好是好的 → 整家显示"通过"，坏 Key 完全看不见；
+      //   · 若第 1 把恰好是坏的 → 整家显示"凭据被拒"，而其实还有 3 把能用。
+      // 两种情况都在骗用户。这里在有试生成的前提下把**每一把**都过一遍，
+      // 并在结论里点名哪几把坏 —— 用户不用去 nvidia 后台也能知道该换哪把。
+      const keys = Array.isArray(p.apiKeys) && p.apiKeys.length
+        ? p.apiKeys.map((k) => String(k || '').trim()).filter(Boolean)
+        : [];
+      if (r && r.gen && keys.length > 1) {
+        const perKey = [];
+        for (let ki = 0; ki < keys.length; ki++) {
+          // 每把都做一次最小生成；预算见底就停手并如实标注
+          if (Date.now() - startedAt > BUDGET_MS - 3000) { perKey.push({ index: ki + 1, skipped: true }); continue; }
+          const pOne = Object.assign({}, p, { apiKey: keys[ki], apiKeys: undefined });
+          // eslint-disable-next-line no-await-in-loop
+          const g = await probe.probeOneKeyGen(pOne, {
+            key: keys[ki], model: genModel, path: probe.genPathFor(p),
+            proxy, noProxy, headers: clientHeaders.probeHeaders(cfg, p, keys[ki]),
+            timeoutMs: Math.max(GEN_MIN_MS, Math.min(GEN_TIMEOUT_MS, BUDGET_MS - (Date.now() - startedAt) - 2000)),
+          });
+          perKey.push({ index: ki + 1, status: g.status, ms: g.ms, ok: g.ok, err: g.detail || '' });
+        }
+        const good = perKey.filter((x) => x.ok === true).length;
+        const bad = perKey.filter((x) => x.ok === false);
+        r.perKey = perKey;
+        r.keySummary = `${keys.length} 把 Key：${good} 把可用于生成`
+          + (bad.length ? `，${bad.length} 把被拒（第 ${bad.map((x) => x.index).join('、')} 把：${bad[0].err || 'HTTP ' + bad[0].status}）` : '');
+        if (good === 0 && bad.length) {
+          r.ok = false;
+          r.verdict = `**所有 ${keys.length} 把 Key 都无法生成** —— ${r.keySummary}`;
+        } else if (good > 0) {
+          r.ok = true;
+          r.verdict = `凭据可用于生成（${r.keySummary}）；目录 ${r.modelCount === null ? '?' : r.modelCount} 个模型`;
+        }
+      }
       results.push(r);
     }
     return { ok: true, proxy: proxy || '', results };
@@ -635,6 +713,12 @@ function registerIpc() {
     if (!arr) return { ok: false, error: '响应里没有 data[] / models[] 数组' };
 
     const { models, unknown } = modelMeta.enrichAll(arr, { keepVendor: o.keepVendor === true });
+    // ⚠ `_src` / `_matchedBy` 是**给界面看的**来源标注（"这个数字是上游给的还是按同族推测的"），
+    // 不是配置字段。`model-meta.js` 的注释明确要求"在 handler 里剔除它再落盘"——
+    // 而这里原来原样返回。实际落盘时 `applyModelPicker` 只挑已知字段构造对象，
+    // 所以它们**没有**进过配置；但这属于"靠下游自觉"，一旦有人改成整对象展开就会污染配置。
+    // 返回给渲染层仍然需要它们（界面要显示来源），所以这里**不删**，而是显式声明边界：
+    // 渲染层负责在写回时只取已知字段（见 renderer/js/providers.js 的 applyModelPicker）。
     return {
       ok: true,
       models,
@@ -644,6 +728,8 @@ function registerIpc() {
       ms: r.ms,
       // 上游到底有没有给参数 —— 界面据此决定要不要提示"这些参数得你自己填"
       upstreamRich: models.some((m) => m.contextWindow || m.maxTokens || m.vision),
+      // 内部字段清单：告诉渲染层"这些不是配置字段，写回时别带上"
+      internalFields: ['_src', '_matchedBy', '_keep', '_tmo'],
     };
   });
 
@@ -664,10 +750,29 @@ function registerIpc() {
     const proxy = await gateway.resolveProxy();
     const noProxy = String(gateway.computeNoProxy() || '').split(',').filter(Boolean);
     const out = [];
+
+    // ⚠ 每个模型之间必须留间隔 —— 这是**防封**要求，不是保守起见。
+    //
+    // 本功能会对**每一个**勾选的模型发一次真实请求（nvidia 的目录有 80 个）。
+    // 旧实现没有任何节流：连续打点，几十秒内把几十个请求砸到同一家上游。
+    // 而 opencode 这类上游的限流是**静默**的（社区实测 ~15–20 RPM，不返回任何
+    // rate-limit 响应头，也不告诉你还剩几次）—— 撞上了才知道，而撞上的代价是
+    // **用户自己的正常对话也被连带限流**。
+    //
+    // 3500ms 间隔 ≈ 17 请求/分钟，正好卡在 15–20 RPM 的安全线内。
+    // 代价是最坏耗时变长（每个模型 = 间隔 + 请求耗时），所以下面的预算要同步放宽。
+    const SPACING_MS = (() => {
+      const n = Number(process.env.DSH_GATEWAY_MEASURE_SPACING_MS);
+      return Number.isFinite(n) && n >= 0 ? n : 3500;
+    })();
+
     // 整体时间预算：与 gw:test-providers 同理。入参来自渲染层，若被塞进 60 个必定超时的模型，
-    // 串行跑完最坏 60×40s = 40 分钟，界面会一直转圈。到点后返回已完成部分并如实说明。
+    // 串行跑完最坏 60×(3.5s+40s) ≈ 43 分钟，界面会一直转圈。
+    // 到点后返回已完成部分并如实说明（下面会把"还剩几个没测"带回渲染层）。
     const BUDGET_MS = 180 * 1000;
     const startedAt = Date.now();
+    let lastReqAt = 0;
+    let skippedByBudget = 0;
     for (const m of list) {
       // ⚠ 只接受**真正的字符串 id**。
       // 旧写法 `String((m && (m.id || m.up)) || m || '')` 在 m 是 `{}` 时得到 `'[object Object]'`，
@@ -679,9 +784,26 @@ function registerIpc() {
             : '';
       if (!upstreamId) continue;
       if (Date.now() - startedAt > BUDGET_MS) {
-        logger.warn(`测速：整体预算 ${BUDGET_MS / 1000}s 已用完，剩余 ${list.length - out.length} 个未测。`);
+        skippedByBudget = list.length - out.length;
+        logger.warn(`测速：整体预算 ${BUDGET_MS / 1000}s 已用完，剩余 ${skippedByBudget} 个未测。`);
         break;
       }
+      // 防封间隔：距上一次请求不足 SPACING_MS 就等到够。
+      // 第一次（lastReqAt=0）不等待 —— 用户刚点了按钮，不该白等 3.5 秒。
+      if (lastReqAt) {
+        const wait = SPACING_MS - (Date.now() - lastReqAt);
+        if (wait > 0) {
+          // 若等待会超出整体预算，就别再开新的一轮了，如实收尾
+          if (Date.now() - startedAt + wait > BUDGET_MS) {
+            skippedByBudget = list.length - out.length;
+            logger.warn(`测速：为守住 ${SPACING_MS}ms 防封间隔会超出整体预算，停止；剩余 ${skippedByBudget} 个未测。`);
+            break;
+          }
+          // eslint-disable-next-line no-await-in-loop
+          await new Promise((r) => setTimeout(r, wait));
+        }
+      }
+      lastReqAt = Date.now();
       const t0 = Date.now();
       // eslint-disable-next-line no-await-in-loop
       const res = await probe.getJson(base + '/chat/completions', {
@@ -718,7 +840,17 @@ function registerIpc() {
       logger.info(`测速 ${p.id || '?'} → ${upstreamId}：HTTP ${res.status || 0} ${ms}ms`
         + (suggested ? ` → 建议超时 ${suggested}ms` : ''));
     }
-    return { ok: true, results: out };
+    // 如实带回"为什么没测完" —— 界面据此提示，避免用户以为"全都测过了"。
+    return {
+      ok: true,
+      results: out,
+      spacingMs: SPACING_MS,
+      skipped: skippedByBudget,
+      note: out.length < list.length
+        ? `已测 ${out.length}/${list.length} 个（每个之间留 ${SPACING_MS}ms 间隔以免触发上游限流），`
+          + `剩余 ${skippedByBudget} 个因时间预算未测 —— 可再点一次继续。`
+        : `已测 ${out.length} 个（每个之间留 ${SPACING_MS}ms 间隔以免触发上游限流）。`,
+    };
   });
 
   /* ---------------- 一键写入 ---------------- */

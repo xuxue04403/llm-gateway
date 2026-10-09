@@ -532,7 +532,8 @@ function openModelPicker(fetched, probeProvider) {
     </div>
     <div class="row-inline" style="margin-top:10px;flex-wrap:wrap;gap:12px">
       <label class="chk"><input type="checkbox" id="mpMeasure" /> 顺便实测超时
-        <span class="hint">（对每个勾选的模型发一次最小请求，会消耗极少量额度；实测值 ×4 取整，夹在 10s–120s）</span></label>
+        <span class="hint">（对每个勾选的模型发一次最小请求，会消耗极少量额度；实测值 ×4 取整，夹在 10s–120s。
+          <b>每个之间会留 3.5 秒间隔</b>以免触发上游限流 —— 所以勾选的模型越多等得越久，中途可取消。）</span></label>
       <label class="chk"><input type="checkbox" id="mpReplace" checked /> 替换现有模型列表
         <span class="hint">（不勾 = 追加到现有列表后面）</span></label>
     </div>
@@ -624,7 +625,12 @@ function openModelPicker(fetched, probeProvider) {
           }
         });
         st.textContent = `实测完成：${got}/${picked.length} 个拿到建议超时`
-          + (got < picked.length ? '；其余失败或超时，未给建议（不会用"超时"当"很慢"）' : '');
+          + (got < picked.length ? '；其余失败或超时，未给建议（不会用"超时"当"很慢"）' : '')
+          // ⚠ 如实说出"为什么没测完"。为防封给每个模型之间加了间隔，
+          // 模型多时会撞上整体时间预算而提前收尾 —— 不说清楚的话，
+          // 用户会以为"全都测过了"，而实际上后面几十个还是空的。
+          + (r.note ? '　' + r.note : '')
+          + (r.skipped ? '（再点一次「顺便实测超时」可继续测剩下的）' : '');
         toast(`已按实测填写 ${got} 个建议超时`, got ? 'ok' : 'warn');
       });
     },
@@ -645,10 +651,21 @@ function openModelPicker(fetched, probeProvider) {
       // 数字字段一律收敛：上游给字符串时不能原样落进配置（会让 `Number.isFinite` 判假、静默失效）
       const ctx = Number(m.contextWindow);
       const mt = Number(m.maxTokens);
-      const tmo = Number(m._tmo);
+      // ⚠ 超时字段的键名要**两种都认**。
+      //
+      // `gw:fetch-models` 返回的是 `timeoutMs`（model-meta.enrichModel 的字段名），
+      // 而 `openModelPicker` 会额外挂一个 `_tmo` 供弹窗内排序/表单使用。
+      // 旧实现只读 `_tmo` —— 它恰好因为 openModelPicker 挂了那个字段而"能用"，
+      // 但这是**依赖调用顺序的巧合**：任何直接喂 fetched.models 的路径
+      //（比如把 picker 的数据源换成别的）都会静默丢掉超时。
+      // 两个都读，谁有值用谁。
+      const tmo = Number(m._tmo || m.timeoutMs);
       if (Number.isFinite(ctx) && ctx > 0) e.contextWindow = ctx;
       if (Number.isFinite(mt) && mt > 0) e.maxTokens = mt;
       if (Number.isFinite(tmo) && tmo > 0) e.timeoutMs = tmo;
+      // ⚠ 不把 _src / _matchedBy / _keep / _tmo 这些"界面内部字段"带进配置。
+      // 上面只挑已知字段构造 `e`，所以它们天然进不去 —— 这里写一句是为了
+      // 防止以后有人图省事改成 `Object.assign({}, m, …)`。
       keep.push(e);
     });
     if (!keep.length) {

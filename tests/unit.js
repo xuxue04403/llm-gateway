@@ -269,6 +269,62 @@ t('probe.hostInList：裸后缀与点前缀都算命中，不误伤同后缀不�
   assert.strictEqual(probe.hostInList('cline.bot.evil.com', ['cline.bot']), false);
 });
 
+t('probe.genPathFor：按声明的协议选生成端点（缺省按 OpenAI chat）', () => {
+  // 试生成必须打**正确的**端点，否则会把能用的家报成失败。
+  assert.strictEqual(probe.genPathFor({ protocol: 'openai-chat' }), '/chat/completions');
+  assert.strictEqual(probe.genPathFor({ protocol: 'anthropic-messages' }), '/messages');
+  assert.strictEqual(probe.genPathFor({ protocol: 'anthropic' }), '/messages');
+  assert.strictEqual(probe.genPathFor({ protocol: 'openai-responses' }), '/responses');
+  assert.strictEqual(probe.genPathFor({ protocol: 'responses' }), '/responses');
+  assert.strictEqual(probe.genPathFor({}), '/chat/completions');
+  assert.strictEqual(probe.genPathFor(null), '/chat/completions');
+});
+
+t('probe.extractUpstreamError：把上游错误体抠成一句人话', () => {
+  // 这是"凭据为什么被拒"的唯一线索。旧实现只报 HTTP 状态码，
+  // 用户看到 403 却不知道是"Key 无效"还是"模型无权"还是"额度用完"。
+  assert.strictEqual(
+    probe.extractUpstreamError('{"status":403,"title":"Forbidden","detail":"Authorization failed"}'),
+    'Forbidden — Authorization failed');
+  assert.strictEqual(probe.extractUpstreamError('{"error":{"message":"Invalid API key"}}'), 'Invalid API key');
+  assert.strictEqual(probe.extractUpstreamError('{"message":"quota exceeded"}'), 'quota exceeded');
+  assert.strictEqual(probe.extractUpstreamError('plain text error'), 'plain text error');
+  assert.strictEqual(probe.extractUpstreamError(''), '(上游未给原因)');
+  assert.strictEqual(probe.extractUpstreamError(null), '(上游未给原因)');
+  // 不要把 title 和 detail 重复输出两遍
+  assert.strictEqual(probe.extractUpstreamError('{"title":"A","detail":"A"}'), 'A');
+});
+
+t('probe.probeProvider：试生成的模型必须由调用方指定，不能拿目录第一个', () => {
+  // ⚠ 这条盯的是一个**已经踩过的坑**：第一版实现拿 `sample[0]`（目录里第一个模型）去试生成，
+  // 实测两处假失败 ——
+  //   · nvidia：第一个是 `01-ai/yi-large` → 404 `Function … Not found for account`（模型级限制）
+  //   · opencode-zen：第一个是 `big-pickle` → 403 `free tier can only be used from within OpenCode`
+  //     （而这家的 `space-bunny-free` 实测 200）
+  // 那会把"目录能读、凭据没问题"的家报成不可用，**比不测更误导**。
+  // 现在：没给 genModel 就**不做**试生成（宁可不测，也不给假结论）。
+  return probe.probeProvider(
+    { id: 'x', baseURL: 'http://127.0.0.1:1/v1', apiKey: 'sk-a' },
+    { proxy: null, noProxy: [], timeoutMs: 300, deepProbe: true },   // 没给 genModel
+  ).then((r) => {
+    // 连不上时会在目录那一步就提前返回（r.gen 为 undefined）；
+    // 连得上但没给 genModel 时 r.gen 为 null。两种都表示"没发起试生成"。
+    assert.ok(r.gen === null || r.gen === undefined,
+      '没指定 genModel 时不应发起试生成，实际 ' + JSON.stringify(r.gen));
+  });
+});
+
+t('probe.probeProvider：连不上时如实报错，不编结论', () => {
+  // 端口 1 必然连不上。这里只验证"不会抛异常、且错误可读"。
+  return probe.probeProvider(
+    { id: 'dead', baseURL: 'http://127.0.0.1:1/v1', apiKey: 'sk-a' },
+    { proxy: null, noProxy: [], timeoutMs: 800 },
+  ).then((r) => {
+    assert.strictEqual(r.ok, false, '连不上不该报 ok，实际 ' + r.ok);
+    assert.ok(/连不上/.test(r.verdict), '结论应说明连不上，实际：' + r.verdict);
+  });
+});
+
 /* ==================== gateway-manager：配置校验 ==================== */
 
 const OK_CFG = {

@@ -260,6 +260,7 @@ async function probeProvider(provider, ctx) {
   const directOnly = provider.proxy === false || provider.noProxy === true;
   const res = await getJson(base + '/models', {
     apiKey: key,
+    headers: o.headers || undefined,   // 仿真头（cline 不带 Cline 头一律 403 这类）
     proxy: directOnly ? null : o.proxy,
     noProxy: o.noProxy || [],
     timeoutMs: o.timeoutMs || 12000,
@@ -298,16 +299,139 @@ async function probeProvider(provider, ctx) {
   } else if (res.ok) {
     verdict = modelCount === null
       ? `可达（HTTP ${res.status}，${res.ms}ms）`
-      : `可达且凭据有效（HTTP ${res.status}，${res.ms}ms，目录 ${modelCount} 个模型）`;
+      : `可达，目录 ${modelCount} 个模型（HTTP ${res.status}，${res.ms}ms）`;
   } else {
     verdict = `HTTP ${res.status}（${res.ms}ms）`;
     ok = false;
   }
 
+  // ⚠ 目录能读 **≠** 凭据能用于生成。
+  //
+  // 实测（2026-10-09，nvidia）：4 把 Key 打 `GET /v1/models` **全部 200**（含两把已失效的），
+  // 而打 `POST /v1/chat/completions` 其中两把是 **403 `Authorization failed`**。
+  // 目录端点只校验"Key 格式合法"，生成端点才校验真实权限/额度。
+  //
+  // ⚠⚠ 但**不能拿目录里第一个模型去试**。第一版实现就是这么干的，实测两处假失败：
+  //   · nvidia：目录第一个是 `01-ai/yi-large` → 404
+  //     `Function '01-ai/yi-large': Not found for account '…'` —— 那是**该模型对这个账号
+  //     不可用**，与凭据无关；
+  //   · opencode-zen：目录第一个是 `big-pickle` → 403
+  //     `OpenCode's free tier can only be used from within OpenCode` —— 而这家的
+  //     `space-bunny-free` 实测 200，属于**免费层的客户端校验**，同样与凭据无关。
+  // 拿这种结果去判"这家不可用"，会比不测**更误导**。
+  //
+  // 所以：**只用调用方显式给的模型**（`o.genModel`，通常取该供应商配置里已声明的
+  // 上游模型 ID —— 那是用户已经验证过能用的），拿不到就**不做**试生成。
+  const genModelId = String(o.genModel || '').trim();
+  let gen = null;
+  if (res.ok && o.deepProbe !== false && genModelId) {
+    const path = genPathFor(provider);
+    const r2 = await getJson(base + path, {
+      method: 'POST',
+      body: genBodyFor(provider, path, genModelId),
+      headers: Object.assign({}, o.headers || {}, { 'content-type': 'application/json' }),
+      apiKey: key,
+      proxy: directOnly ? null : o.proxy,
+      noProxy: o.noProxy || [],
+      // 生成比目录慢得多（nvidia 实测 25–29 秒），给足时间；仍受"整体墙钟"兜底保护
+      timeoutMs: o.genTimeoutMs || 45000,
+      limit: 256 * 1024,
+    });
+    const detail = extractUpstreamError(r2.body);
+    gen = { path, model: genModelId, status: r2.status, ms: r2.ms, ok: r2.ok, body: String(r2.body || r2.error || '').slice(0, 200), via: r2.via, detail };
+
+    // 分类：**凭据问题**才算 ok=false；**模型/策略问题**只能判"不确定"。
+    // 这个区分是这次修复的核心 —— 旧实现只有"通/不通"，把模型级问题也算到凭据头上。
+    const blob = String(r2.body || '') + ' ' + String(r2.error || '');
+    const modelScoped = /not found for account|not found for|model.*not.*(support|available|found)|free tier|contributor|deprecated|ModelDeprecated|ModelProtocolUnsupported|MissingSessionID/i.test(blob);
+    if (r2.ok) {
+      ok = true;
+      verdict = `凭据可用于生成（目录 ${modelCount === null ? '?' : modelCount} 个模型；试生成 ${genModelId} 成功，HTTP ${r2.status}，${r2.ms}ms）`;
+    } else if (!r2.status) {
+      ok = null;
+      verdict = `目录可读（HTTP ${res.status}）但**试生成超时/连接失败**（${r2.via}）：${r2.error} —— 无法据此判断凭据好坏，请以网关日志里的真实调用为准`;
+    } else if (modelScoped) {
+      ok = null;
+      verdict = `目录可读、凭据格式有效；试生成 ${genModelId} 被拒（HTTP ${r2.status}）：${detail}`
+        + ' —— 这看着是**该模型对这个账号/这条链路**的限制，**不是凭据问题**';
+    } else {
+      ok = false;
+      verdict = `目录可读（HTTP ${res.status}）但**试生成被拒**（HTTP ${r2.status}）：${detail}`;
+    }
+  }
+
   return {
     id, ok, via: res.via, ms: res.ms, status: res.status, baseUrl: base,
-    modelCount, sample, verdict,
+    modelCount, sample, verdict, gen,
   };
 }
 
-module.exports = { probeProvider, getJson, upstreamBase, hostInList, connectViaProxy };
+/** 生成端点路径：按供应商声明的协议选，缺省按 OpenAI chat。 */
+function genPathFor(provider) {
+  const w = String((provider && provider.protocol) || '').toLowerCase();
+  if (w === 'anthropic' || w === 'anthropic-messages' || w === 'messages') return '/messages';
+  if (w === 'openai-responses' || w === 'responses') return '/responses';
+  return '/chat/completions';
+}
+
+/** 试生成的最小请求体（按端点形状给，尽量便宜：1 个 token）。 */
+function genBodyFor(provider, path, model) {
+  if (path === '/messages') {
+    return { model, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] };
+  }
+  if (path === '/responses') {
+    return { model, max_output_tokens: 16, input: 'hi' };
+  }
+  return { model, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] };
+}
+
+/**
+ * 从上游错误体里抠出**给人看的**原因。
+ * 上游常见的形状：{status:403,title:"Forbidden",detail:"Authorization failed"}、
+ * {error:{message:"..."}}、{message:"..."}。抠不出来就返回原文前 120 字。
+ */
+function extractUpstreamError(bodyText) {
+  const s = String(bodyText || '').replace(/\s+/g, ' ').trim();
+  if (!s) return '(上游未给原因)';
+  try {
+    const j = JSON.parse(s);
+    const cand = (j && (j.detail || (j.error && (j.error.message || j.error.type)) || j.message || j.title)) || '';
+    const title = (j && j.title) || '';
+    const parts = [title, cand].filter(Boolean).filter((x, i, a) => a.indexOf(x) === i);
+    if (parts.length) return parts.join(' — ').slice(0, 160);
+  } catch (_) { /* 不是 JSON：下面回原文 */ }
+  return s.slice(0, 120);
+}
+
+/**
+ * 用**指定的一把 Key** 做一次最小生成请求（多 Key 供应商逐把体检用）。
+ *
+ * 与 `probeProvider` 里的试生成共用同一套端点/请求体/错误解析，
+ * 差别只在于"用哪把 Key"—— 那边取 `apiKey || apiKeys[0]`，这边由调用方指定。
+ *
+ * 返回 `{ ok, status, ms, detail, body }`；`ok` 为 null 表示"判不出来"（超时/连不上），
+ * 与 `false`（上游明确拒绝）区分开 —— 这个区分对避免误导很重要。
+ */
+async function probeOneKeyGen(provider, ctx) {
+  const o = ctx || {};
+  const base = upstreamBase(String((provider && provider.baseURL) || ''));
+  const path = o.path || genPathFor(provider);
+  const r = await getJson(base + path, {
+    method: 'POST',
+    body: genBodyFor(provider, path, o.model),
+    headers: Object.assign({}, o.headers || {}, { 'content-type': 'application/json' }),
+    apiKey: o.key,
+    proxy: o.proxy,
+    noProxy: o.noProxy || [],
+    timeoutMs: o.timeoutMs || 45000,
+    limit: 256 * 1024,
+  });
+  const detail = extractUpstreamError(r.body || r.error);
+  if (r.ok) return { ok: true, status: r.status, ms: r.ms, detail: '' };
+  if (!r.status) return { ok: null, status: 0, ms: r.ms, detail: r.error || '连接失败' };
+  const blob = String(r.body || '') + ' ' + String(r.error || '');
+  const modelScoped = /not found for account|not found for|model.*not.*(support|available|found)|free tier|contributor|deprecated|ModelProtocolUnsupported|MissingSessionID/i.test(blob);
+  return { ok: modelScoped ? null : false, status: r.status, ms: r.ms, detail, body: String(r.body || '').slice(0, 200) };
+}
+
+module.exports = { probeProvider, getJson, upstreamBase, hostInList, connectViaProxy, extractUpstreamError, genPathFor, probeOneKeyGen };
