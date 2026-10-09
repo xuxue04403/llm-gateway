@@ -5605,7 +5605,15 @@ function makeStreamDecoder(wire) {
 
       if (wire === 'openai-chat') {
         if (j.usage && (j.usage.prompt_tokens || j.usage.completion_tokens)) {
-          ev.push({ t: 'usage', in: Number(j.usage.prompt_tokens) || 0, out: Number(j.usage.completion_tokens) || 0 });
+          // ⚠ 缓存字段必须一起带出来。上游（实测 opencode-go）在这里给
+          // `prompt_tokens_details.cached_tokens`，丢掉它客户端就只能看到 0% 命中率。
+          ev.push({
+            t: 'usage',
+            in: Number(j.usage.prompt_tokens) || 0,
+            out: Number(j.usage.completion_tokens) || 0,
+            cached: cachedTokensOf(j.usage),
+            cacheWrite: cacheWriteTokensOf(j.usage),
+          });
         }
         const choice = (Array.isArray(j.choices) ? j.choices[0] : null) || {};
         const d = choice.delta || {};
@@ -5627,7 +5635,17 @@ function makeStreamDecoder(wire) {
         const type = String(evtName || j.type || '');
         if (type === 'message_start') {
           const u = (j.message && j.message.usage) || {};
-          if (u.input_tokens) ev.push({ t: 'usage', in: Number(u.input_tokens) || 0, out: 0 });
+          // Anthropic 原生把缓存字段放在 message_start（服务端开跑前就知道前缀命中多少）——
+          // 这条路径（上游就是 anthropic）要原样带出去。
+          if (u.input_tokens || u.cache_read_input_tokens || u.cache_creation_input_tokens) {
+            ev.push({
+              t: 'usage',
+              in: Number(u.input_tokens) || 0,
+              out: 0,
+              cached: cachedTokensOf(u),
+              cacheWrite: cacheWriteTokensOf(u),
+            });
+          }
           return ev;
         }
         if (type === 'content_block_start') {
@@ -5693,6 +5711,9 @@ function makeStreamEncoder(wire, ctx) {
   const toolSlots = new Map(); // canonical slot → { blockIndex, id }
   let usageIn = ctx.inputTokens || 0;
   let usageOut = 0;
+  // 缓存命中 / 写入的 token（上游收尾才报；见 anthropicUsage 的注释）
+  let usageCached = 0;
+  let usageCacheWrite = 0;
   let ended = false;
   // ⚠ Responses 的 id 必须**整条流共用一个**。旧实现在 response.created 和 response.completed
   // 里各调一次 randomUUID()，于是同一条响应出现两个 id（实测 resp_2537c6… vs resp_008f6f…），
@@ -5766,6 +5787,14 @@ function makeStreamEncoder(wire, ctx) {
         // 保持"没数据就不声明"。
         const deltaUsage = { output_tokens: usageOut };
         if (usageIn !== (ctx.inputTokens || 0)) deltaUsage.input_tokens = usageIn;
+        // ⚠ 缓存字段也只能在这里给。
+        //
+        // Anthropic 原生会把 `cache_read_input_tokens` 放在 message_start（服务端开跑前就知道
+        // 前缀命中了多少）；但我们这条链路的上游（chat 协议）**直到收尾才报 usage**，
+        // message_start 那时早已发出、改不了。所以放在收尾帧 —— 客户端取"最后一次读到的"
+        // 即为真值。（实测：不给这两个字段时，客户端算出的缓存命中率恒为 0%。）
+        if (usageCached > 0) deltaUsage.cache_read_input_tokens = usageCached;
+        if (usageCacheWrite > 0) deltaUsage.cache_creation_input_tokens = usageCacheWrite;
         sseWrite(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: deltaUsage });
         sseWrite(res, 'message_stop', { type: 'message_stop' });
         return;
@@ -5794,6 +5823,44 @@ function makeStreamEncoder(wire, ctx) {
         usage: { prompt_tokens: usageIn, completion_tokens: usageOut, total_tokens: usageIn + usageOut },
       });
       try { res.write('data: [DONE]\n\n'); } catch { /* 客户端已断开 */ }
+    },
+    /**
+     * 上游流**被截断**时给客户端一个明确的错误，而不是伪装成正常结束。
+     *
+     * ⚠ 这是"任务静默终止、不报任何错误"的根因所在（2026-10-09 用户报告）。
+     *
+     * 上游连接被"干净地"切断时（代理掉线、对端 close 而不 reset），
+     * `reader.read()` 返回 `done:true` —— **不抛异常**。旧实现在流结束时无条件调
+     * `finish()`，于是照样发出 `message_stop` / `[DONE]`：
+     * 客户端看到的是一个**语法完整、实则被腰斩**的回复，还以为模型答完了。
+     * 实测日志印证：`stream-broken: 0`、`status=fail: 0` —— 这种截断**从未被记录**。
+     *
+     * 判据：整条流里既没见到协议终止帧（`[DONE]` / `message_stop` / `response.completed`），
+     * 也没见到上游的结束语义（chat 的 `finish_reason`、anthropic 的 `stop_reason`）。
+     * 两者都没有 = 上游没说完 → 必须让客户端知道。
+     */
+    error(message) {
+      if (ended) return;
+      ended = true;
+      const msg = String(message || '上游响应被中断');
+      try {
+        if (wire === 'anthropic-messages') {
+          // Anthropic 协议有专门的 error 事件，客户端会把它当真正的错误显示
+          sseWrite(res, 'error', { type: 'error', error: { type: 'api_error', message: msg } });
+          sseWrite(res, 'message_stop', { type: 'message_stop' });
+          return;
+        }
+        if (wire === 'openai-responses') {
+          sseWrite(res, 'response.failed', {
+            type: 'response.failed',
+            response: { id: respId, object: 'response', status: 'failed', model: ctx.model, error: { code: 'upstream_truncated', message: msg } },
+          });
+          return;
+        }
+        // openai-chat：OpenAI 的流式错误就是一条带 error 的 data 帧
+        sseWrite(res, 'message', { error: { message: msg, type: 'upstream_truncated' } });
+        try { res.write('data: [DONE]\n\n'); } catch { /* 客户端已断开 */ }
+      } catch { /* 客户端已断开 */ }
     },
     emit(events) {
       for (const e of events) {
@@ -5846,6 +5913,8 @@ function makeStreamEncoder(wire, ctx) {
           } else if (e.t === 'usage') {
             if (e.in) usageIn = e.in;
             if (e.out) usageOut = e.out;
+            if (e.cached) usageCached = e.cached;
+            if (e.cacheWrite) usageCacheWrite = e.cacheWrite;
           } else if (e.t === 'end') {
             this.finish();
           }
@@ -5878,6 +5947,8 @@ function makeStreamEncoder(wire, ctx) {
         } else if (e.t === 'usage') {
           if (e.in) usageIn = e.in;
           if (e.out) usageOut = e.out;
+          if (e.cached) usageCached = e.cached;
+          if (e.cacheWrite) usageCacheWrite = e.cacheWrite;
         } else if (e.t === 'stop') {
           stopReason = e.r;
         } else if (e.t === 'end') {
@@ -5897,6 +5968,8 @@ async function pumpMatrixStream({ res, upstream, upstreamWire, clientWire, model
   let buf = headBytes ? Buffer.from(headBytes).toString('utf8') : '';
   let curEvent = '';
   let sawEnd = false;
+  // 上游有没有给出"答完了"的语义（见 flush 里的说明）
+  let sawStop = false;
 
   // ⚠ 必须做成**可重复调用**的：forward 里的"首事件偷看"会把开头那段（对流式短响应来说
   // 往往就是**全部**）先读进 headBytes，于是下面的 read 循环第一次就拿到 done:true ——
@@ -5914,7 +5987,17 @@ async function pumpMatrixStream({ res, upstream, upstreamWire, clientWire, model
       if (payload === '[DONE]') { sawEnd = true; encoder.finish(); continue; }
       let json = null;
       try { json = JSON.parse(payload); } catch { continue; }
-      encoder.emit(decoder.feed(curEvent, json));
+      const evs = decoder.feed(curEvent, json);
+      // ⚠ 跟踪"上游有没有给出结束语义"。这是区分
+      // "上游正常答完（只是没发 [DONE]）" 与 "上游被腰斩" 的唯一依据。
+      // chat 的 finish_reason / anthropic 的 stop_reason 都会变成 {t:'stop'}；
+      // 显式结束帧会变成 {t:'end'}。
+      for (const e of evs) {
+        if (!e) continue;
+        if (e.t === 'stop') sawStop = true;
+        else if (e.t === 'end') sawEnd = true;
+      }
+      encoder.emit(evs);
     }
   };
 
@@ -5963,6 +6046,23 @@ async function pumpMatrixStream({ res, upstream, upstreamWire, clientWire, model
   } finally {
     try { res.removeListener('close', onClose); } catch { /* 忽略 */ }
     try { reader.releaseLock(); } catch { /* 忽略 */ }
+  }
+  // ⚠ 上游流**被腰斩**时必须报错，不能伪装成正常结束。
+  //
+  // 上游连接被"干净地"切断（代理掉线、对端 close 而不 reset）时 `reader.read()`
+  // 返回 `done:true`，**不抛异常** —— 于是会走到下面那行 `finish()`，
+  // 照样发出 `message_stop` / `[DONE]`。客户端看到一个语法完整、实则被截断的回复，
+  // 以为模型答完了，**界面上不会有任何错误**。
+  // 实测日志印证（2026-10-09 用户报"任务不时自动终止但不报错"）：
+  //   `stream-broken: 0`、`status=fail: 0` —— 这种截断从未被记录过一次。
+  //
+  // 判据：整条流里既没有协议终止帧（[DONE]/message_stop/response.completed），
+  // 也没有上游的结束语义（finish_reason / stop_reason）→ 上游没说完。
+  if (!clientGone && !sawEnd && !sawStop) {
+    log(`[matrix] 上游流被截断（${upstreamWire} → ${clientWire}）：未收到任何结束信号`
+      + `（无 [DONE]/message_stop，也无 finish_reason/stop_reason）→ 明确告知客户端"回复不完整"`);
+    encoder.error('上游响应被中断（未收到结束信号）—— 这条回复不完整，请重试');
+    return { clientGone: false, truncated: true };
   }
   // 上游没有明确的结束帧时（如 Anthropic 的 message_stop 不映射成事件）也要收尾，
   // 否则客户端会一直等 message_stop / response.completed / [DONE]。
@@ -6211,7 +6311,68 @@ function chatCompletionToCanonicalEvents(json) {
   return ev;
 }
 
-/** OpenAI 非流式响应 → Anthropic message */
+/**
+ * 从 OpenAI 风格的 usage 里取**缓存命中**的 token 数。
+ *
+ * 各家的字段名不统一，实测见过的：
+ *   · `prompt_tokens_details.cached_tokens`（opencode-go 实测返回 2048/2944）
+ *   · `prompt_cache_hit_tokens`（DeepSeek 官方）
+ *   · `cache_read_input_tokens`（Anthropic 原生）
+ *   · `cached_tokens`（少数中转直接平铺）
+ * 取不到就返回 0。
+ */
+function cachedTokensOf(usage) {
+  if (!usage || typeof usage !== 'object') return 0;
+  const d = usage.prompt_tokens_details || usage.input_tokens_details || {};
+  const n = Number(d.cached_tokens ?? d.cache_read_input_tokens
+    ?? usage.prompt_cache_hit_tokens ?? usage.cached_tokens ?? 0);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/**
+ * 从 OpenAI 风格的 usage 里取**缓存写入**的 token 数（Anthropic 的 cache_creation_input_tokens）。
+ * 同样各家不一：`prompt_tokens_details.cache_creation_input_tokens` / `cache_write_tokens`。
+ */
+function cacheWriteTokensOf(usage) {
+  if (!usage || typeof usage !== 'object') return 0;
+  const d = usage.prompt_tokens_details || usage.input_tokens_details || {};
+  const n = Number(d.cache_creation_input_tokens ?? d.cache_write_tokens ?? 0);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/**
+ * 构造 Anthropic 形状的 usage（**含缓存字段**）。
+ *
+ * ⚠ 这两个字段不能省。客户端（DSH / Claude Code）算"缓存命中率"读的就是
+ * `cache_read_input_tokens` —— 不给它，命中率恒为 **0%**，哪怕上游明明命中了。
+ *
+ * 实测（2026-10-09，用户报"缓存命中率全变成 0%"）：
+ *   · 上游 opencode-go 对同一段长前缀返回
+ *     `prompt_tokens_details: { cached_tokens: 2048 }`（首轮）→ `{ cached_tokens: 2944 }`（次轮）
+ *     —— **上游缓存是好的**；
+ *   · 而本引擎里搜 `cached_tokens` / `cache_read_input_tokens` **零命中** ——
+ *     翻译时整个字段被丢掉，客户端于是只能看到 0。
+ * 这是"上游对了、网关把它抹平了"的典型。
+ *
+ * @param {object} usage 上游的 usage（OpenAI 形状，可空）
+ * @param {number} inTok  已确定的 input_tokens
+ * @param {number} outTok 已确定的 output_tokens
+ */
+function anthropicUsage(usage, inTok, outTok) {
+  const u = {
+    input_tokens: Number(inTok) || 0,
+    output_tokens: Number(outTok) || 0,
+  };
+  const cr = cachedTokensOf(usage);
+  const cw = cacheWriteTokensOf(usage);
+  // 只在有值时附加 —— 上游没给就别凭空声明一个 0，否则客户端无法区分
+  // "确实没命中" 与 "上游没报这个字段"。
+  if (cr > 0) u.cache_read_input_tokens = cr;
+  if (cw > 0) u.cache_creation_input_tokens = cw;
+  return u;
+}
+
+/** 把 OpenAI 非流式响应 → Anthropic message */
 function openaiToAnthropicMessage(json, model, fallbackInTokens) {
   const choice = (json && Array.isArray(json.choices) ? json.choices[0] : null) || {};
   const msg = choice.message || {};
@@ -6256,7 +6417,10 @@ function openaiToAnthropicMessage(json, model, fallbackInTokens) {
     content: content.length ? content : [{ type: 'text', text: '' }],
     stop_reason: stopReason,
     stop_sequence: null,
-    usage: { input_tokens: inTok, output_tokens: outTok },
+    // ⚠ 必须走 anthropicUsage() —— 直接写 { input_tokens, output_tokens } 会把
+    // `prompt_tokens_details.cached_tokens` 丢掉，客户端看到的缓存命中率恒为 0%
+    // （见 anthropicUsage 的注释与实测）。
+    usage: anthropicUsage(usage, inTok, outTok),
   };
 }
 
@@ -6421,6 +6585,33 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
   }
   if (clientGone) return { ok: false };
 
+  // ⚠ 上游流**被腰斩**时必须报错，不能伪装成正常结束。
+  //
+  // `finished` 在 L6520（收到 finish_reason）或 L6567（收到 [DONE]）时置真 ——
+  // 也就是说它**就是**"上游说完了"的判据。但旧实现只把它当普通变量，
+  // 收尾时无条件走正常路径：上游连接被"干净地"切断（代理掉线、对端 close 而不 reset）时
+  // `reader.read()` 返回 `done:true`（**不抛异常**），于是照样发出
+  // `message_delta` + `message_stop` —— 客户端看到一个语法完整、实则被腰斩的回复，
+  // 以为模型答完了，**界面上没有任何错误**。
+  //
+  // 这正是用户报的"任务会不时的自动终止，但是不会报任何错误"（2026-10-09）。
+  // 日志侧的印证：`stream-broken: 0`、`status=fail: 0` —— 这种截断从未被记录过。
+  if (!finished) {
+    log(`流翻译：上游流被截断（未收到 finish_reason 或 [DONE]）`
+      + `—— 已产出 ${outText.length} 字符；明确告知客户端"回复不完整"`);
+    if (!aggregateOnly) {
+      ensureStart();
+      closeBlock();
+      sseWrite(res, 'error', {
+        type: 'error',
+        error: { type: 'api_error', message: '上游响应被中断（未收到结束信号）—— 这条回复不完整，请重试' },
+      });
+      sseWrite(res, 'message_stop', { type: 'message_stop' });
+      try { res.end(); } catch { /* 忽略 */ }
+    }
+    return { ok: false, truncated: true, usage: anthropicUsage(usage, inputTokens || 0, 0), stopReason, text: outText, thinking: outThinking, toolCalls: [] };
+  }
+
   ensureStart();
   flushToolCalls();   // 延迟开块：全部工具调用在此一次性、连续地补出（并行调用不会串台）
   closeBlock();
@@ -6439,6 +6630,13 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
   const realInTok = (usage && Number(usage.prompt_tokens) > 0) ? Number(usage.prompt_tokens) : null;
   const deltaUsage = { output_tokens: outTok };
   if (realInTok !== null) deltaUsage.input_tokens = realInTok;
+  // 缓存命中/写入只能在收尾帧给（上游收尾才报；message_start 早已发出）。
+  // 不给这两个字段，客户端算出的缓存命中率恒为 **0%** —— 实测上游明明报了
+  // `prompt_tokens_details.cached_tokens: 2944`（见 anthropicUsage 的注释）。
+  const realCached = cachedTokensOf(usage);
+  const realCacheWrite = cacheWriteTokensOf(usage);
+  if (realCached > 0) deltaUsage.cache_read_input_tokens = realCached;
+  if (realCacheWrite > 0) deltaUsage.cache_creation_input_tokens = realCacheWrite;
   if (!aggregateOnly) {
     sseWrite(res, 'message_delta', {
       type: 'message_delta',
@@ -6450,7 +6648,7 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
   }
   return {
     ok: true,
-    usage: { input_tokens: (usage && Number(usage.prompt_tokens)) || inputTokens || 0, output_tokens: outTok },
+    usage: anthropicUsage(usage, (usage && Number(usage.prompt_tokens)) || inputTokens || 0, outTok),
     stopReason: toolCalls.size && stopReason === 'end_turn' ? 'tool_use' : stopReason,
     text: outText,
     thinking: outThinking,

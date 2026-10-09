@@ -222,6 +222,9 @@ const DECLARED = [
   { name: 'accountModelKey', why: '修（安全 V3）：model 必须截断到 128 字符。它是客户端可控的，而这个键会 ① 成为 accountPool 的键 → 512 条 × 16MB ≈ 8GB 常驻内存；② 被 accountPoolSnapshot 原样列进免鉴权的 /health。实测 4 个 20 万字符的 model 名 → GET /health 返回 801KB。条目数早有上界，漏的正是"值"这一维。三个调用点传同一个 model 值，截断后仍自洽' },
   { name: 'ACCOUNT_MODEL_KEY_MAX', why: '新增：模型级冷却键里 model 部分的长度上限（128）' },
   { name: 'translateOpenAIStreamToAnthropic', why: '修（正确性 D7）：message_delta 必须带上**真实**的 input_tokens。紧邻的返回值里已经优先用了上游的 prompt_tokens，但收尾帧只带 output_tokens —— 客户端（Claude Code 等）只看流里的 usage，于是同一轮请求非流式看到真值、流式看到 message_start 里的本地估算（len/4），两个口径自相矛盾。实测修后 message_delta.usage = {"output_tokens":56,"input_tokens":1234}，与非流式一致' },
+  { name: 'cachedTokensOf', why: '新增：从 OpenAI 风格 usage 里取缓存命中 token。各家字段名不一（prompt_tokens_details.cached_tokens / prompt_cache_hit_tokens / cached_tokens），统一收口。**这是"缓存命中率全变成 0%"的根因** —— 引擎里原先搜 cached_tokens / cache_read_input_tokens 零命中，上游明明报了也被丢掉' },
+  { name: 'cacheWriteTokensOf', why: '新增：取缓存写入 token（Anthropic 的 cache_creation_input_tokens）' },
+  { name: 'anthropicUsage', why: '新增：构造**含缓存字段**的 Anthropic usage。实测（2026-10-09 用户报"缓存命中率全变成 0%"）：上游 opencode-go 对同一段长前缀返回 prompt_tokens_details.cached_tokens 2048（首轮）→ 2944（次轮），**上游缓存是好的**；而引擎翻译时把整个字段丢掉，客户端（DSH/Claude Code）算命中率读的正是 cache_read_input_tokens，于是恒为 0%。只在有值时附加，不凭空声明 0（否则客户端无法区分"确实没命中"与"上游没报这个字段"）' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */
