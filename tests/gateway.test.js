@@ -50,6 +50,11 @@ const upstream = {
   cancelled: 0,        // 客户端断开后被我们观察到的次数
   streams: 0,
   hangBody: false,     // /v1/chat/completions 返回 500 后不结束 body
+  // 收尾形态：null = 正常（chunk×3 + [DONE]）；否则见 server 里的分支
+  //   'usage-only' → choices:[] + usage（OpenAI 规范的合法终止标记）
+  //   'no-done'    → 给 finish_reason 但不发 [DONE]
+  //   'truncated'  → 真截断：什么都不给，干净地断开
+  tailMode: null,
 };
 
 const upstreamServer = http.createServer((req, res) => {
@@ -68,6 +73,27 @@ const upstreamServer = http.createServer((req, res) => {
         res.write('{"error":{"message":"upstream stalled');
         return;
       }
+      // ⚠ 按 `upstream.tailMode` 决定收尾形态 —— 用于验证"截断检测"不误报。
+      // 这几条都是**合法**的上游收尾方式，旧实现（以及我第一版截断检测）
+      // 会把其中一部分误判成"上游被腰斩"，非流式时还会因此触发 failover 变成 503。
+      if (upstream.tailMode) {
+        upstream.streams++;
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        res.write('data: {"choices":[{"index":0,"delta":{"content":"partial"}}]}\n\n');
+        const mode = upstream.tailMode;
+        if (mode === 'usage-only') {
+          // OpenAI 规范的合法终止标记（stream_options.include_usage）：
+          // choices 为空 + 带 usage。很多上游只发这一帧、不发 [DONE]、不给 finish_reason。
+          res.write('data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}}\n\n');
+        } else if (mode === 'no-done') {
+          // 给 finish_reason 但不发 [DONE]
+          res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n');
+        } else if (mode === 'truncated') {
+          // ★ 真截断：什么都不给，**干净地**结束（模拟代理掉线 / 对端 close 而不 reset）
+        }
+        res.end();
+        return;
+      }
       upstream.streams++;
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
       let n = 0;
@@ -76,6 +102,11 @@ const upstreamServer = http.createServer((req, res) => {
         res.write('data: {"choices":[{"delta":{"content":"chunk' + n + '"}}]}\n\n');
         if (n >= 3) {
           clearInterval(timer);
+          // 收尾：先给一个带**缓存字段**的 usage 帧（OpenAI 规范的合法终止标记，
+          // `stream_options.include_usage` 的形态：choices 为空 + usage），再 [DONE]。
+          // 带 cached_tokens 是为了让"缓存字段必须传出去"那条用例有东西可断言。
+          res.write('data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":3,'
+            + '"total_tokens":103,"prompt_tokens_details":{"cached_tokens":64}}}\n\n');
           res.write('data: [DONE]\n\n');
           res.end();
         }
@@ -325,6 +356,107 @@ let upstreamPort = 0;
     upstream.hangBody = false;
     assert.ok(r.status >= 400 || r.status === 0, '上游 500 时不应回 200：' + r.status);
     assert.ok(dt < 15000, '应在超时内结束（实际 ' + dt + 'ms）');
+  });
+
+  // ---- 6b) 上游收尾形态 → 截断检测**不得误报**（0.7.14 回归）----
+  //
+  // 背景：0.7.13 加的"截断检测"（上游被腰斩时明确报错，别伪装成正常结束）
+  // 第一版漏了 `choices:[]` + `usage` 这种**合法**收尾 —— 而它是 OpenAI 规范里
+  // `stream_options.include_usage` 的终止标记，很多上游**只发它、不发 [DONE]、
+  // 也不给 finish_reason**。误判后果不轻：
+  //   · 流式：一条完全正常的回复被塞进 `event: error`；
+  //   · 非流式：那时响应头还没发，`{ok:false}` 触发 **failover**，
+  //     全部失败后回 `503 all providers … are unavailable`（审计实测复现）。
+  //
+  // 这几条用例把"合法收尾"与"真截断"钉开，防止以后再收窄判据时重新踩进去。
+  //
+  // ⚠ 必须用**独立网关**，且显式声明供应商 `protocol: 'openai-chat'`。
+  // 主用例里的 fake 供应商没声明协议 —— Anthropic 客户端打进来时引擎会按
+  // 客户端协议选上游（即往 `/v1/messages` 发），而那个假上游只认
+  // `/v1/chat/completions`，于是回 404、用例看到的是 404 而不是我们想验的东西。
+  const startTailGateway = async () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'tail-'));
+    const port = await freePort();
+    fs.writeFileSync(path.join(dir, 'c.json'), JSON.stringify({
+      port,
+      apiKey: GATEWAY_KEY,
+      providers: [{
+        id: 'tailf', baseURL: 'http://127.0.0.1:' + upstreamPort + '/v1',
+        apiKey: UPSTREAM_KEY, protocol: 'openai-chat', models: ['test-model'], priority: 1, enabled: true,
+      }],
+    }), 'utf8');
+    const proc = spawn(process.execPath,
+      [MJS, '--config', path.join(dir, 'c.json'), '--log', path.join(dir, 'g.log'), '--port', String(port)],
+      { stdio: 'ignore', windowsHide: true });
+    const ok = await waitHealth(port, 20000);
+    return ok ? { port, proc } : null;
+  };
+
+  for (const [mode, label] of [
+    ['usage-only', 'choices:[] + usage（OpenAI 规范的终止标记）'],
+    ['no-done', '只给 finish_reason、不发 [DONE]'],
+  ]) {
+    t(`网关：上游以「${label}」收尾 → 正常交付，不误报截断`, async () => {
+      const g = await startTailGateway();
+      if (!g) { console.log('    [SKIP] 独立网关未就绪'); return; }
+      upstream.tailMode = mode;
+      try {
+        // 流式：不应出现 error 事件
+        const rs = await call({ port: g.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, stream: true, messages: [{ role: 'user', content: 'hi' }] } });
+        assert.strictEqual(rs.status, 200, '流式应 200，实际 ' + rs.status + ' ' + rs.text.slice(0, 200));
+        assert.ok(!/event: error/.test(rs.text), '不应被误判成截断（流式出现了 error 事件）：' + rs.text.slice(0, 200));
+        assert.ok(/message_stop/.test(rs.text), '应正常收尾（缺 message_stop）');
+        // 非流式：关键 —— 不能因为误判触发 failover 变成 503
+        const rn = await call({ port: g.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+        assert.strictEqual(rn.status, 200, '非流式应 200（误判会 failover 成 503），实际 ' + rn.status + ' ' + rn.text.slice(0, 200));
+        assert.ok(!/"type":"error"/.test(rn.text), '非流式不应回错误：' + rn.text.slice(0, 200));
+      } finally {
+        upstream.tailMode = null;
+        try { g.proc.kill(); } catch { /* 忽略 */ }
+      }
+    });
+  }
+
+  t('网关：上游真被腰斩（无任何结束信号）→ 明确报错，不再静默', async () => {
+    const g = await startTailGateway();
+    if (!g) { console.log('    [SKIP] 独立网关未就绪'); return; }
+    upstream.tailMode = 'truncated';
+    try {
+      // 流式：必须出现 error 事件（否则客户端以为答完了 —— 这正是用户报的"静默终止"）
+      const rs = await call({ port: g.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, stream: true, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.ok(/event: error/.test(rs.text), '流式应报错，实际：' + rs.text.slice(0, 300));
+      assert.ok(/被中断|不完整/.test(rs.text), '错误文案应说明回复不完整');
+      // 非流式：应回 502 且**不是** 503（503 会误导成"所有上游不可用"）
+      const rn = await call({ port: g.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(rn.status, 502, '非流式应回 502（而非 503），实际 ' + rn.status + ' ' + rn.text.slice(0, 200));
+      assert.ok(!/all providers/.test(rn.text), '不应变成"所有上游不可用"：' + rn.text.slice(0, 200));
+    } finally {
+      upstream.tailMode = null;
+      try { g.proc.kill(); } catch { /* 忽略 */ }
+    }
+  });
+
+  t('网关：缓存字段必须传给 Anthropic 客户端（否则命中率恒为 0%）', async () => {
+    // 上游在 usage 里报 `prompt_tokens_details.cached_tokens`，客户端读的是
+    // Anthropic 的 `cache_read_input_tokens` —— 不翻译就等于把缓存信息抹平，
+    // 客户端算出的命中率恒为 0%（用户实测报过）。
+    const g = await startTailGateway();
+    if (!g) { console.log('    [SKIP] 独立网关未就绪'); return; }
+    try {
+      const r = await call({ port: g.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '应 200，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      // 假上游的收尾帧带 cached_tokens:64（见 server 里 chat 分支）
+      assert.ok(/cache_read_input_tokens/.test(r.text),
+        '非流式 usage 应含 cache_read_input_tokens，实际：' + r.text.slice(0, 300));
+      assert.ok(/"cache_read_input_tokens":64/.test(r.text),
+        '缓存命中数应原样传出（64），实际：' + r.text.slice(0, 300));
+      // 流式也要带（message_delta 里）
+      const rs = await call({ port: g.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, stream: true, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.ok(/cache_read_input_tokens/.test(rs.text),
+        '流式 message_delta 也应含 cache_read_input_tokens，实际：' + rs.text.slice(0, 400));
+    } finally {
+      try { g.proc.kill(); } catch { /* 忽略 */ }
+    }
   });
 
   // ---- 7) write-dsh 的 YAML 定位（P1-7）----

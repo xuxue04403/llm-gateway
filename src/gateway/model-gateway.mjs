@@ -5997,6 +5997,13 @@ async function pumpMatrixStream({ res, upstream, upstreamWire, clientWire, model
         if (e.t === 'stop') sawStop = true;
         else if (e.t === 'end') sawEnd = true;
       }
+      // ⚠ `choices: []` + `usage` 的收尾帧是 **OpenAI 规范的合法终止标记**。
+      //
+      // 开了 `stream_options: {include_usage: true}` 时 OpenAI 的最后一帧就是它；
+      // 不少上游/中转**只发这一帧、不发 `[DONE]`**，也**不给 `finish_reason`**。
+      // 漏掉这个形态会把一条**完全正常**的回复判成"上游被腰斩"
+      //（审计实测：非流式还会因此触发 failover，变成 503）。
+      if (json && json.usage && !(Array.isArray(json.choices) && json.choices.length)) sawStop = true;
       encoder.emit(evs);
     }
   };
@@ -6484,6 +6491,18 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
   const handleChunk = (json) => {
     ensureStart();
     if (json && json.usage && (json.usage.prompt_tokens || json.usage.completion_tokens)) usage = json.usage;
+    // ⚠ `choices: []` + `usage` 的收尾帧是 **OpenAI 规范的合法终止标记**。
+    //
+    // 客户端开 `stream_options: {include_usage: true}` 时，OpenAI 的最后一帧就是
+    // `{"choices":[],"usage":{...}}`；不少上游/中转**只发这一帧、不发 `[DONE]`**，
+    // 也**不给 `finish_reason`**。
+    //
+    // 我第一版截断检测漏了这个形态，后果很重：一条**完全正常**的回复被判成"上游被腰斩"，
+    // 流式发出 `event: error`、非流式更糟 —— 因为那时 `res.headersSent` 还是假，
+    // `{ok:false}` 会触发 **failover**，把一次正常请求变成
+    // `503 all providers for model … are unavailable`（审计实测复现）。
+    // 所以这里必须把它算作"上游说完了"。
+    if (json && json.usage && !(Array.isArray(json.choices) && json.choices.length)) finished = true;
     const choice = (Array.isArray(json.choices) ? json.choices[0] : null) || {};
     const delta = choice.delta || {};
     // D5：兼容 reasoning_content / reasoning / reasoning_details（旧实现只认第一个）
@@ -6597,11 +6616,11 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
   // 这正是用户报的"任务会不时的自动终止，但是不会报任何错误"（2026-10-09）。
   // 日志侧的印证：`stream-broken: 0`、`status=fail: 0` —— 这种截断从未被记录过。
   if (!finished) {
-    log(`流翻译：上游流被截断（未收到 finish_reason 或 [DONE]）`
+    log(`流翻译：上游流被截断（未收到 finish_reason / [DONE] / usage 收尾帧）`
       + `—— 已产出 ${outText.length} 字符；明确告知客户端"回复不完整"`);
+    ensureStart();
+    closeBlock();
     if (!aggregateOnly) {
-      ensureStart();
-      closeBlock();
       sseWrite(res, 'error', {
         type: 'error',
         error: { type: 'api_error', message: '上游响应被中断（未收到结束信号）—— 这条回复不完整，请重试' },
@@ -6609,7 +6628,26 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
       sseWrite(res, 'message_stop', { type: 'message_stop' });
       try { res.end(); } catch { /* 忽略 */ }
     }
-    return { ok: false, truncated: true, usage: anthropicUsage(usage, inputTokens || 0, 0), stopReason, text: outText, thinking: outThinking, toolCalls: [] };
+    // ⚠ 返回值**不能**是 `{ok:false}`。
+    //
+    // 调用方（L6917/L6921）看到 falsy 就返回 false → 触发 **failover**：
+    //   · 流式：200 与部分内容**已经发出**，换一家上游只会把第二个回复续写进同一条响应，
+    //     客户端看到两个模型的内容拼在一起；
+    //   · 非流式：那时 `res.headersSent` 还是假，于是真的去换下一家，
+    //     全部失败后回 `503 all providers for model … are unavailable` ——
+    //     把一次"已拿到部分内容"变成"所有上游不可用"（审计实测复现）。
+    //
+    // 正确语义是"**已经处理完了，别再重试**"：`truncated: true` 既保留可观测性，
+    // `ok: true` 又阻止 failover（内容已经尽力交付，并已明确告知客户端不完整）。
+    return {
+      ok: true,
+      truncated: true,
+      usage: anthropicUsage(usage, inputTokens || 0, 0),
+      stopReason,
+      text: outText,
+      thinking: outThinking,
+      toolCalls: [...toolCalls.values()].map((t) => ({ id: t.id, name: t.name, args: t.args })),
+    };
   }
 
   ensureStart();
@@ -6918,6 +6956,21 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         }
         // 客户端要非流式（或下游是 Responses 聚合）：把流收完再回一条完整 message
         const agg = await translateOpenAIStreamToAnthropic({ res, upstream, model: body.model, inputTokens, aggregateOnly: true, headBytes });
+        // ⚠ 非流式路径下客户端**还没收到任何东西**，所以不能像流式那样"把残缺内容当成功交出去"。
+        //
+        // 这条流被上游腰斩了（`truncated`），手上只有半截内容：
+        //   · 回 200 + 半截内容 → 客户端以为答完了，**静默截断依旧存在**；
+        //   · 返回 falsy → 触发 failover（见上面的 `if (!agg.ok) return false`），
+        //     全部失败后变成 `503 all providers … are unavailable` ——
+        //     把"已拿到部分内容"说成"所有上游不可用"，更误导。
+        // 两者都不对。正解是**就地回一个明确的错误**（不是 failover），让客户端知道该重试。
+        if (agg.truncated) {
+          json(res, 502, {
+            type: 'error',
+            error: { type: 'api_error', message: '上游响应被中断（未收到结束信号）—— 这条回复不完整，请重试' },
+          });
+          return true;   // 已就地交付错误；再 failover 只会把 502 换成误导性的 503
+        }
         if (!agg.ok) return false;
         const content = [];
         if (agg.thinking) content.push({ type: 'thinking', thinking: agg.thinking, signature: '' });
