@@ -440,6 +440,12 @@ class GatewayManager extends EventEmitter {
     // 进程在跑 != 端口在监听。ready 由 _doStart 的就绪探测结果给出，
     // 界面据此判断"真的能用了"（见 main.js 的 gw:action start）。
     this.ready = false;
+    // ⚠ 启动**失败**（探测未通过 / 进程起不来）与"启动中"是两回事，托盘要能区分：
+    // icon.js 里 `COLORS.starting`（琥珀）与 `COLORS.failed`（红）早就定义了，
+    // 却在整个项目里**无人使用** —— 于是托盘图标只有"绿=好 / 灰=没运行"两种，
+    // "正在启动"与"启动失败"看起来一模一样，用户只能去翻日志。
+    // 这个标志由 _doStart 的就绪探测结果驱动（见下方 healthy 的处理）。
+    this.failed = false;
     this.stopping = false;
     this.logTail = '';
     this.port = 3091;
@@ -557,7 +563,16 @@ class GatewayManager extends EventEmitter {
     const dir = path.join(path.dirname(this.configPath), 'config-backups');
     fs.mkdirSync(dir, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    fs.copyFileSync(this.configPath, path.join(dir, `gateway.config-${stamp}.json`));
+    // ⚠ 必须加随机后缀。旧实现只用 ISO 毫秒时间戳，于是**同一毫秒内的两次保存
+    // 会写到同一个文件名**，后者直接覆盖前者 —— 而这个目录正是配置事故后唯一的安全网。
+    // 实测（渲染/宿主审计 D6，冻结 Date 并发保存 3 次）：目录里只剩 1 个文件，
+    // ORIGINAL 那份和中间态全部消失。注意 `ORIGINAL` 之所以能活下来，
+    // 是因为它不带时间戳、不参与这个覆盖竞争 —— 这正说明覆盖在悄悄吃掉备份。
+    let name = `gateway.config-${stamp}.json`;
+    for (let i = 0; i < 8 && fs.existsSync(path.join(dir, name)); i++) {
+      name = `gateway.config-${stamp}-${i}.json`;
+    }
+    fs.copyFileSync(this.configPath, path.join(dir, name));
     const olds = fs.readdirSync(dir).filter((n) => /^gateway\.config-.*\.json$/.test(n)).sort();
     for (const n of olds.slice(0, Math.max(0, olds.length - 10))) {
       try { fs.unlinkSync(path.join(dir, n)); } catch (_) { /* 忽略 */ }
@@ -799,6 +814,7 @@ class GatewayManager extends EventEmitter {
     //（首启被杀软/磁盘拖慢）时，界面弹「网关已启动」+ 状态点变绿，而每个客户端请求都失败。
     // 这正是本文件注释里说要修的那类"谎报已启动"，只是当时只覆盖了"子进程退出"那一半。
     this.ready = false;
+    this.failed = false;   // 启动中：托盘显示琥珀色（见构造函数里 failed 的说明）
     this.emit('state');
 
     const onData = (chunk) => { this.pushLog(chunk.toString('utf8')); };
@@ -837,6 +853,8 @@ class GatewayManager extends EventEmitter {
     // 只有真的探测通过才算"就绪"。子进程已经退出时不要把它标成 ready
     //（下面 this.proc !== spawned 说明期间发生了 exit/restart）。
     this.ready = healthy && this.proc === spawned;
+    // 探测未通过且子进程还在 = 启动失败（托盘据此变红，见构造函数里 failed 的说明）
+    this.failed = !this.ready && this.proc === spawned;
     this.emit('state');
   }
 
@@ -888,7 +906,7 @@ class GatewayManager extends EventEmitter {
     }
     const p = this.proc;
     this.proc = null;
-    this.running = false; this.ready = false;   // 提前返回路径也要复位，否则界面一直显示"运行中"
+    this.running = false; this.ready = false; this.failed = false;   // 提前返回路径也要复位，否则界面一直显示"运行中"
     if (!p || p.exitCode !== null) { this.emit('state'); return; }
     try {
       const r = spawnSync('taskkill', ['/pid', String(p.pid), '/T', '/F'], { windowsHide: true });

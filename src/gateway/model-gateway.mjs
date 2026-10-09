@@ -5748,7 +5748,25 @@ function makeStreamEncoder(wire, ctx) {
       start();
       if (wire === 'anthropic-messages') {
         closeAnthropicBlock();
-        sseWrite(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: usageOut } });
+        // ⚠ `message_delta` 必须把**真实**的 input_tokens 一起带上。
+        //
+        // `message_start`（L5717）发出去的时候，上游多半还没给 usage，那时只能用本地估算
+        // （ctx.inputTokens）。但整轮跑完时上游的 usage **可能已经到了**（emit 里的
+        // `usage` 事件会把 `usageIn` 换成真值，见 L5829/L5841/L5861）——
+        // 旧实现只把 `output_tokens` 放进 message_delta，于是这份真值被丢掉，
+        // 客户端（Claude Code 等）看到的就是**估算值**。
+        //
+        // 实测（引擎核心审计 D7）：上游固定 `prompt_tokens:1234` 时，
+        //   非流式 → `{"input_tokens":1234,...}`（对的）
+        //   流式   → message_start 里 `{"input_tokens":8,...}`（估算值），
+        //             message_delta 只给 `{"output_tokens":56}`
+        // 同一链路两种口径，客户端的计费/上下文显示就按那个错的数字走。
+        //
+        // 只在与起始值**不同**时附加 —— 上游没给真值时不凭空造一个字段，
+        // 保持"没数据就不声明"。
+        const deltaUsage = { output_tokens: usageOut };
+        if (usageIn !== (ctx.inputTokens || 0)) deltaUsage.input_tokens = usageIn;
+        sseWrite(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: deltaUsage });
         sseWrite(res, 'message_stop', { type: 'message_stop' });
         return;
       }
@@ -6409,11 +6427,23 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
   const outTok = usage && Number(usage.completion_tokens) > 0
     ? Number(usage.completion_tokens)
     : estimateTokens(outText + outThinking + [...toolCalls.values()].map((t) => t.args).join(''));
+  // ⚠ message_delta 要带上**真实**的 input_tokens。
+  //
+  // 下面 L6441 返回的 `usage.input_tokens` 已经优先用了上游的 `prompt_tokens`，
+  // 但 `message_delta` 只带 `output_tokens` —— 客户端（Claude Code 等）正是**只看流里的
+  // usage** 来显示上下文与计费的，于是同一轮请求：非流式看到 1234、流式看到 message_start
+  // 里的本地估算值（len/4，实测 8），两个口径自相矛盾（引擎核心审计 D7 实测）。
+  //
+  // 这里的 `ensureStart()` 已经把估算值写进 message_start 了，改不了（事件已发出），
+  // 所以在收尾帧把真值补回来 —— 客户端取"最后一次读到的 input_tokens"即为真值。
+  const realInTok = (usage && Number(usage.prompt_tokens) > 0) ? Number(usage.prompt_tokens) : null;
+  const deltaUsage = { output_tokens: outTok };
+  if (realInTok !== null) deltaUsage.input_tokens = realInTok;
   if (!aggregateOnly) {
     sseWrite(res, 'message_delta', {
       type: 'message_delta',
       delta: { stop_reason: toolCalls.size && stopReason === 'end_turn' ? 'tool_use' : stopReason, stop_sequence: null },
-      usage: { output_tokens: outTok },
+      usage: deltaUsage,
     });
     sseWrite(res, 'message_stop', { type: 'message_stop' });
     try { res.end(); } catch { /* 忽略 */ }

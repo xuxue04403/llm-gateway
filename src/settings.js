@@ -71,30 +71,68 @@ class Settings {
     for (const k of Object.keys(patch)) {
       // 只接受**已知键**。load() 会保留文件里用户手写的未知键（不替人做主），但 save() 的
       // 入参来自渲染层，放行未知键等于给它一个往设置文件里塞任意内容的入口。
+      // ⚠ 用 `hasOwnProperty` 而不是 `DEFAULTS[k] === undefined`：后者在 patch 自带
+      // `__proto__` 时不成立（`DEFAULTS['__proto__']` 取到的是继承来的 Object.prototype，
+      // 不是 undefined），于是那一条能通过白名单并把 `this.data.__proto__` 换掉
+      // （渲染/宿主审计 Q2 实测 `get('pwned') === 'yes'`）。目前没有可利用后果
+      // （调用点全用字面量键、落盘走 JSON 只序列化自有属性），但判据本身是错的。
+      // UNSAFE_KEYS 见文件头 —— 显式列出来，别把安全性建立在语言细节上。
+      if (UNSAFE_KEYS.has(k)) continue;
+      if (!Object.prototype.hasOwnProperty.call(DEFAULTS, k)) continue;
       const def = DEFAULTS[k];
-      if (def === undefined) continue;
       const v = patch[k];
       // 类型必须与默认值一致（null 也算不符——旧写法里 `v !== null` 这个例外会让
       // `{minimizeToTray: null}` 把布尔设置写成 null，之后 `!== false` 判断全部走样）。
       if (v === null || typeof v !== typeof def) continue;
       this.data[k] = v;
     }
-    this.persist();
-    return this.snapshot();
+    return { settings: this.snapshot(), ...this.persist() };
   }
 
+  /**
+   * 落盘。
+   *
+   * ⚠ 必须把成败**返回**去。旧实现 `catch { this.log(...) }` 之后静默继续，
+   *   而 `save()` 无条件返回快照、`main.js` 又无条件回 `{ ok: true }` ——
+   *   于是写盘失败（文件只读、磁盘满、路径被占成同名目录）时，
+   *   界面照样播「已保存应用设置」，勾选框也是勾上的，**重启就变回去**，
+   *   用户完全找不到原因。渲染层其实**已经写好了**失败分支（`renderer/js/settings.js:103`
+   *   的注释原话："必须看返回值…四项开关全部假成功"，并做了回滚 + 报错 toast），
+   *   但因为主进程从不回 `ok:false`，那个分支是**永远触发不了**的死代码。
+   *   实测（渲染/宿主审计 D5）：把 settings.json 换成同名目录 → 磁盘无文件、日志有 EPERM、
+   *   界面播「已保存」。这里把这条链路接上。
+   *
+   * @returns {{ok:boolean, error?:string}}
+   */
   persist() {
     try {
       fs.mkdirSync(path.dirname(this.path), { recursive: true });
       const tmp = this.path + '.tmp-' + process.pid;
       fs.writeFileSync(tmp, JSON.stringify(this.data, null, 2) + '\n', 'utf8');
       fs.renameSync(tmp, this.path);      // 原子写：半截 JSON 会让下次启动丢全部设置
+      return { ok: true };
     } catch (err) {
-      this.log('settings.json 写入失败：' + (err && err.message ? err.message : err));
+      const msg = (err && err.message) || String(err);
+      this.log('settings.json 写入失败：' + msg);
+      // 清掉半截 tmp，别在数据目录里留垃圾（实测失败后会残留 settings.json.tmp-<pid>）
+      try { fs.unlinkSync(this.path + '.tmp-' + process.pid); } catch (_) { /* 忽略 */ }
+      return { ok: false, error: msg };
     }
   }
 
   snapshot() { return clone(this.data); }
+
+  /**
+   * 把内存里的设置换回给定快照（**不落盘**）。
+   *
+   * 用途：落盘失败时回滚。`save()` 是"先改内存、再 persist"，所以 persist 失败那一刻
+   * 内存里已经是新值、磁盘上还是旧值 —— 两者分叉会让"这次会话里开关看着生效、
+   * 重启就变回去"，正是这次要修的那个现象。回滚内存，两边就一致了。
+   */
+  restore(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return;
+    this.data = clone(snapshot);
+  }
 }
 
 module.exports = { Settings, DEFAULTS };

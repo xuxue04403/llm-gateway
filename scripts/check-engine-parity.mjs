@@ -221,6 +221,7 @@ const DECLARED = [
   { name: 'accountKey', why: '无改动（附近插入新常量导致块指纹变化）' },
   { name: 'accountModelKey', why: '修（安全 V3）：model 必须截断到 128 字符。它是客户端可控的，而这个键会 ① 成为 accountPool 的键 → 512 条 × 16MB ≈ 8GB 常驻内存；② 被 accountPoolSnapshot 原样列进免鉴权的 /health。实测 4 个 20 万字符的 model 名 → GET /health 返回 801KB。条目数早有上界，漏的正是"值"这一维。三个调用点传同一个 model 值，截断后仍自洽' },
   { name: 'ACCOUNT_MODEL_KEY_MAX', why: '新增：模型级冷却键里 model 部分的长度上限（128）' },
+  { name: 'translateOpenAIStreamToAnthropic', why: '修（正确性 D7）：message_delta 必须带上**真实**的 input_tokens。紧邻的返回值里已经优先用了上游的 prompt_tokens，但收尾帧只带 output_tokens —— 客户端（Claude Code 等）只看流里的 usage，于是同一轮请求非流式看到真值、流式看到 message_start 里的本地估算（len/4），两个口径自相矛盾。实测修后 message_delta.usage = {"output_tokens":56,"input_tokens":1234}，与非流式一致' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

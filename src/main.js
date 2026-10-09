@@ -234,7 +234,15 @@ function isAppPage(url) {
     const rendererDir = path.join(__dirname, '..', 'renderer');
     const p = decodeURIComponent(u.replace(/^file:\/\/\//i, '').replace(/^file:\/\//i, ''))
       .replace(/\//g, path.sep).split('?')[0].split('#')[0];
-    return path.resolve(p).toLowerCase().startsWith(path.resolve(rendererDir).toLowerCase());
+    // ⚠ 纯 `startsWith` 比路径**缺一个分隔符边界**：`renderer-evil/x.html`、
+    // `renderer_evil/`、`rendererX/`、`renderer./` 这些**兄弟目录**都会被放行。
+    // 实测（渲染/宿主审计 D7：把函数源码原样抽出来直喂 URL，四种全部返回 true）。
+    // 当前不可利用（渲染层无 XSS、没有 `<a>`、`window.open` 一律 deny、webview deny，
+    // 要利用得先能在安装目录旁写出一个 `renderer*` 目录且能让窗口导航过去），
+    // 但判据本身是错的 —— 补上 `path.sep` 边界。
+    const base = path.resolve(rendererDir).toLowerCase();
+    const full = path.resolve(p).toLowerCase();
+    return full === base || full.startsWith(base + path.sep);
   } catch (_) { return false; }
 }
 
@@ -245,10 +253,31 @@ function showWindow() {
   win.focus();
 }
 
+/**
+ * 托盘图标的四种状态。
+ *
+ * ⚠ 旧实现两个分支都返回 `COLORS.stopped`（灰），于是"正在启动"和"启动失败"看起来
+ * 和"已停止"一模一样 —— 用户只能去翻日志才知道出了什么事。
+ * `icon.js` 里 `starting`（琥珀）/ `failed`（红）早就定义了却**全项目无人使用**。
+ * 现在四态分明：灰=没运行、琥珀=启动中、绿=就绪、红=启动失败。
+ */
 function trayIcon() {
-  const color = gateway && gateway.running && gateway.ready ? icon.COLORS.ready
-    : (gateway && gateway.running ? icon.COLORS.stopped : icon.COLORS.stopped);
+  const g = gateway;
+  const color = (g && g.ready) ? icon.COLORS.ready
+    : (g && g.running && g.failed) ? icon.COLORS.failed
+      : (g && g.running) ? icon.COLORS.starting
+        : icon.COLORS.stopped;
   try { return nativeImage.createFromDataURL(icon.iconDataURL(16, color)); } catch (_) { return appIcon(16); }
+}
+
+/** 托盘 tooltip / 菜单第一行的状态文案（与 trayIcon 的四态保持一致）。 */
+function trayStateText() {
+  const g = gateway;
+  if (!g) return { text: '已停止', running: false };
+  if (g.ready) return { text: `运行中 · 端口 ${g.port}`, running: true };
+  if (g.running && g.failed) return { text: `启动失败 · 端口 ${g.port}（见「日志」页）`, running: true };
+  if (g.running) return { text: `启动中 · 端口 ${g.port}`, running: true };
+  return { text: '已停止', running: false };
 }
 
 function refreshTray() {
@@ -260,10 +289,11 @@ function refreshTray() {
   // createTray 本来就有兜底，这里补上。
   try {
     const running = !!(gateway && gateway.running);
+    const st = trayStateText();
     tray.setImage(trayIcon());
-    tray.setToolTip(`${APP_NAME} · ${running ? '运行中 :' + gateway.port : '已停止'}`);
+    tray.setToolTip(`${APP_NAME} · ${st.text}`);
     tray.setContextMenu(Menu.buildFromTemplate([
-    { label: running ? `运行中 · 端口 ${gateway.port}` : '已停止', enabled: false },
+    { label: st.text, enabled: false },
     { type: 'separator' },
     { label: '打开面板', click: () => showWindow() },
     { label: '启动网关', enabled: !running, click: () => gateway.start().catch(() => {}) },
@@ -396,7 +426,18 @@ function registerIpc() {
 
   handle('app:save-settings', (_e, patch) => {
     const before = settings.snapshot();
-    const next = settings.save(patch || {});
+    // save() 现在把落盘成败一起带回来（{ ok, error?, settings }）—— 不能再无条件回 ok:true，
+    // 否则写盘失败时界面照样播「已保存」，勾选框也是勾上的，重启就变回去。
+    const r = settings.save(patch || {});
+    if (!r || !r.ok) {
+      // ⚠ 必须在 broadcastState() **之前**回滚，否则广播出去的正是那份没落盘的状态；
+      // 也必须在 setLoginItemSettings **之前**返回，否则登录项已经改了、设置却没存上
+      // —— 两边分叉的下一个症状就是"重启后自启状态莫名变回去"。
+      try { settings.restore(before); } catch (_) { /* 忽略 */ }
+      logger.warn('应用设置写入失败，已回滚：' + ((r && r.error) || '未知错误'));
+      return { ok: false, error: (r && r.error) || '写入失败', settings: before };
+    }
+    const next = r.settings;
     // 开机自启要走 Electron 的登录项，不能只写进 settings.json
     if (before.autoStartApp !== next.autoStartApp) {
       try { app.setLoginItemSettings({ openAtLogin: !!next.autoStartApp, args: [] }); }
