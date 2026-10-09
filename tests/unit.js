@@ -338,6 +338,32 @@ t('validateConfigText：合法配置通过', () => {
   assert.strictEqual(r.ok, true, r.error);
 });
 
+t('validateConfigText：protocol 白名单必须与引擎的 wireOfName() 逐字对齐', () => {
+  // ⚠ 这条盯的是"两个地方各写一份规则"的漂移。
+  //
+  // 实测（2026-10-09）：Codex 订阅预设填 `openai-responses` 时保存失败，报
+  // 「protocol 非法（可选：openai-chat / anthropic-messages）」——
+  // 而引擎的 `wireOfName()` **本来就认**这个拼法（还有 `responses` / `chat` / `messages`）。
+  // 也就是说：用户写出引擎完全支持的协议，却被校验器挡在门外。
+  //
+  // 这里把引擎认的**全部 9 个拼法**钉住 —— 任何一处漏掉都会让对应的配置无法保存。
+  const withProto = (proto) => {
+    const c = JSON.parse(JSON.stringify(OK_CFG));
+    c.providers[0].protocol = proto;
+    return validateConfigText(JSON.stringify(c));
+  };
+  for (const p of ['openai-chat', 'openai-completions', 'openai', 'chat',
+    'anthropic', 'anthropic-messages', 'messages', 'openai-responses', 'responses']) {
+    assert.strictEqual(withProto(p).ok, true, '引擎认的拼法 ' + p + ' 不该被校验器拒绝：' + withProto(p).error);
+  }
+  // 大小写/空白要归一（引擎用 toLowerCase().trim()）
+  assert.strictEqual(withProto('  OpenAI-Responses  ').ok, true, '大小写与空白应归一');
+  // 真不认识的仍要拒绝 —— 否则拼错协议会静默退回透传，客户端拿到形状不对的响应
+  for (const p of ['gemini', 'garbage', 'openai-response']) {
+    assert.strictEqual(withProto(p).ok, false, '不认识的协议 ' + p + ' 应被拒绝');
+  }
+});
+
 t('validateConfigText：apiKey 占位值/过短被拦（否则运行时全 401）', () => {
   const a = JSON.parse(JSON.stringify(OK_CFG)); a.apiKey = 'dsh-gateway-change-me';
   assert.strictEqual(validateConfigText(JSON.stringify(a)).ok, false);

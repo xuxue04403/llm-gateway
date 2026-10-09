@@ -352,8 +352,23 @@ function validateConfigText(text) {
       }
       if (p.protocol !== undefined) {
         const proto = String(p.protocol).trim().toLowerCase();
-        if (!['openai-chat', 'openai-completions', 'openai', 'anthropic', 'anthropic-messages'].includes(proto)) {
-          return { ok: false, error: who + ' 的 protocol 非法（可选：openai-chat / anthropic-messages）' };
+        // ⚠ 白名单必须与引擎的 `wireOfName()`（model-gateway.mjs）**逐字对齐**。
+        //
+        // 旧白名单少了 4 个引擎本来就认的拼法：`chat` / `messages` /
+        // **`openai-responses`** / **`responses`** —— 于是用户（和渠道预设）
+        // 写出引擎完全支持的协议时，被校验器挡在门外，报「protocol 非法」。
+        // 实测（2026-10-09）：Codex 订阅预设填 `openai-responses` 直接保存失败。
+        //
+        // 这是"两个地方各写一份规则"的经典漂移。渲染层的 `canonicalApiValue()`
+        // 也认同一组拼法 —— 三处必须一致。
+        if (!['openai-chat', 'openai-completions', 'openai', 'chat',
+          'anthropic', 'anthropic-messages', 'messages',
+          'openai-responses', 'responses'].includes(proto)) {
+          return {
+            ok: false,
+            error: who + ' 的 protocol 非法（可选：openai-chat / anthropic-messages / openai-responses，'
+              + '以及引擎认的简写 chat / messages / responses）',
+          };
         }
       }
       if (p.quirks !== undefined) {
