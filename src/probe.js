@@ -20,6 +20,12 @@ const tls = require('tls');
 function upstreamBase(baseURL) {
   let b = String(baseURL || '').trim().replace(/\/+$/, '');
   if (!b) return b;
+  // ⚠ Codex 订阅后端**不能**补 `/v1` —— 与引擎里的同名函数是同一条规则，
+  // 两处必须一致（这里是主进程用的副本，引擎是子进程里的另一份）。
+  // 实测：不处理时探测会拼成 `/backend-api/codex/v1/responses` → 404，
+  // 「测试」把一家**能用**的供应商报成失败。
+  // 后端很严格：/backend-api/codex/responses → 200；带 /v1 → 404。
+  if (/\/codex$/i.test(b)) return b;
   const m = b.match(/\/(v\d+)(?:\/.*)?$/i);
   if (m) return b.slice(0, b.length - m[0].length + m[1].length + 1);
   return b + '/v1';
@@ -252,6 +258,13 @@ async function probeProvider(provider, ctx) {
       verdict: 'WorkBuddy 供应商用桌面客户端凭据（authFile）鉴权，不走 API Key——请改用 /health 的账户池状态判断',
     };
   }
+  const base = upstreamBase(raw);
+  const key = String(provider.apiKey || '').trim()
+    || (Array.isArray(provider.apiKeys) ? String(provider.apiKeys[0] || '').trim() : '');
+
+  // 供应商条目可声明 proxy:false / noProxy:true → 该家直连
+  const directOnly = provider.proxy === false || provider.noProxy === true;
+
   // ⚠ Codex 订阅供应商**可以**正常探测 —— 但要先把凭据读出来。
   //
   // 它的凭据在 `$CODEX_HOME/auth.json`（或 `~/.codex/auth.json`）里，配置里没有 Key。
@@ -260,9 +273,15 @@ async function probeProvider(provider, ctx) {
   //
   // 这里只读文件、**不刷新**（刷新是引擎的职责，探测不该有副作用）——
   // 令牌过期时如实报"请先运行一次 Codex 让它刷新"，而不是伪造一个结论。
-  let codexCred = null;
+  //
+  // ⚠⚠ 这段必须放在 `base` / `directOnly` **声明之后**。
+  // 第一版放在了它们前面，直接 TDZ 崩：
+  //   `Cannot access 'directOnly' before initialization`
+  //（面板上表现为「内部错误（gw:test-providers）」）。
+  // 同一个坑本轮已经踩过第二次（另一次是引擎里的 `isSseStream`）——
+  // **在函数中间插代码时，先确认用到的每个变量都已声明。**
   if (String(provider.auth || '').toLowerCase() === 'codex') {
-    codexCred = readCodexCredForProbe();
+    const codexCred = readCodexCredForProbe();
     if (!codexCred.ok) return { id, ok: false, verdict: 'Codex 凭据不可用：' + codexCred.error };
     // Codex 后端**没有 /models 端点**（实测 GET /backend-api/codex/models → 404），
     // 所以不能走"先探目录再试生成"的常规流程 —— 直接做一次最小生成验证。
@@ -271,7 +290,7 @@ async function probeProvider(provider, ctx) {
       || (Array.isArray(provider.models) ? String(
         (typeof provider.models[0] === 'string' ? provider.models[0] : (provider.models[0] || {}).id) || '') : '');
     if (!genModel) {
-      return { id, ok: null, skipped: true, verdict: 'Codex 供应商没声明任何模型 —— 请先填模型（如 gpt-5.6-luna）再测试' };
+      return { id, ok: null, skipped: true, baseUrl: base, verdict: 'Codex 供应商没声明任何模型 —— 请先填模型（如 gpt-5.6-luna）再测试' };
     }
     const g = await probeOneKeyGen(provider, {
       key: codexCred.accessToken,
@@ -293,12 +312,7 @@ async function probeProvider(provider, ctx) {
     return { id, ok: false, ms: g.ms, status: g.status, baseUrl: base, modelCount: null, sample: [],
       verdict: `试生成被拒（HTTP ${g.status}）：${g.detail}` };
   }
-  const base = upstreamBase(raw);
-  const key = String(provider.apiKey || '').trim()
-    || (Array.isArray(provider.apiKeys) ? String(provider.apiKeys[0] || '').trim() : '');
 
-  // 供应商条目可声明 proxy:false / noProxy:true → 该家直连
-  const directOnly = provider.proxy === false || provider.noProxy === true;
   const res = await getJson(base + '/models', {
     apiKey: key,
     headers: o.headers || undefined,   // 仿真头（cline 不带 Cline 头一律 403 这类）
@@ -421,7 +435,21 @@ function genBodyFor(provider, path, model) {
     return { model, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] };
   }
   if (path === '/responses') {
-    return { model, max_output_tokens: 16, input: 'hi' };
+    // ⚠ `input` 必须是**数组**。标准 Responses API 两种都收（字符串会被当成一条用户消息），
+    // 但 **Codex 订阅后端只收数组** —— 传字符串直接
+    //   HTTP 400 {"detail":"Input must be a list"}
+    //（实测 2026-10-09：探测因此把一家能用的供应商报成失败）。
+    // 形状照 Codex 官方客户端：message + input_text 内容块。
+    // `store:false` 与 `stream:true` 都是它的硬要求（见引擎里同名注释）——
+    // 缺任一个都是 400：`Store must be set to false` / `Stream must be set to true`。
+    return {
+      model,
+      max_output_tokens: 16,
+      instructions: 'You are a helpful assistant.',
+      input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }],
+      store: false,
+      stream: true,
+    };
   }
   return { model, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] };
 }
