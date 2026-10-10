@@ -54,6 +54,17 @@ import { execFile } from 'node:child_process';
 // 因此这一行只影响"裸跑 CLI"。差异可用 `node scripts/check-engine-parity.mjs` 复核。
 const APP_DIR = path.join(process.env.APPDATA || path.join(os.homedir(), '.dsh'), 'llm-gateway');
 let CONFIG_PATH = process.env.DSH_GATEWAY_CONFIG || path.join(APP_DIR, 'gateway.config.json');
+/**
+ * 最近一次成功加载的配置（模块级引用）。
+ *
+ * 为什么要单独存：加载配置时那个 `const cfg` 是**函数内的局部变量**，
+ * 模块级的辅助函数拿不到它 —— 而客户端仿真头需要 cfg
+ * （`claudeClientHeaders(cfg)` 要用 clientVersions 覆盖版本号）。
+ * 2026-10-11 加"指纹自动仿真重试"时直接写了 `cfg`，
+ * 抛 `ReferenceError: cfg is not defined`，且异常被上层吞掉 ——
+ * 表现为"分支进了、什么都没发生、客户端拿到 400"。
+ */
+let LOADED_CFG = null;
 const MODEL_CACHE_TTL_MS = 60_000;
 // 上游请求超时（time-to-headers）。可用 DSH_GATEWAY_UPSTREAM_TIMEOUT_MS 覆盖，
 // 或按供应商用配置项 timeoutMs 单独放宽（如 x666/amd 这类慢速中转）。
@@ -342,6 +353,7 @@ function loadConfig() {
   }
   try {
     const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    LOADED_CFG = cfg;   // 供模块级辅助函数使用（见 LOADED_CFG 的说明）
     if (!Array.isArray(cfg.providers)) throw new Error('providers must be an array');
     // R25（审计修复）：port 兜底——手改配置缺/坏 port 时 listen(undefined) 会随机端口
     const p = Number(cfg.port);
@@ -677,6 +689,23 @@ let emptyToolUseDropHits = 0;
 const thinkingPassbackProviders = new Set();
 
 /**
+ * 「该家需要客户端身份仿真」的学习标记（2026-10-11）。
+ *
+ * 有些中转按**请求头指纹**做准入：只放行 AI 编码 CLI，拦掉浏览器与通用 HTTP 客户端。
+ * 实测 agentrouter（本机）：
+ *   默认 Node 头 / Chrome / curl / python → HTTP 401 `unauthorized client detected`
+ *   Claude Code 头 / Codex 头            → **HTTP 200 通过**
+ *
+ * 也就是说它拦的是**请求头**，不是 TLS —— 而本引擎早就有 claude/codex 仿真档。
+ * 旧实现遇到这种拒绝只熔断该家、并写一句"本程序运行在 Node 上无法伪装指纹，这是已知上限"，
+ * **对这类家是错的**：明明能过，只是没人替用户试一次。
+ *
+ * 现在：命中一次 → 用 Claude Code 仿真**重试一次** → 成功就记住该家，
+ * 后续请求首次就带仿真（与 thinkingPassbackProviders 同一套学习模式）。
+ * 命中即记、成功不撤销（准入规则是稳定属性）。
+ */
+const clientSimulationProviders = new Set();
+/**
  * 上游"**不支持** extended thinking"的学习标记（2026-09-17）。实测 amd/GLM-5.3-Flash 会拒收顶层
  * `thinking` 参数（客户端按模型推理档位自动带上）→ SSE 首事件报 `"thinking" is not supported`。
  * 命中一次即记住该家：后续请求**首次就剥掉** thinking，不再白失败一轮（与 thinkingPassbackProviders 对称）。
@@ -713,6 +742,38 @@ async function retryWithoutThinking(provider, upstreamPath, upstreamHeaders, bod
     });
   } catch (e) {
     log(`upstream ${provider.id} 去 thinking 重试失败: ${e.message}`);
+    return null;
+  } finally { clearTimeout(t); }
+}
+
+/**
+ * 「客户端指纹被拒」→ 换 Claude Code 身份仿真**重试一次**（2026-10-11）。
+ *
+ * 与 `retryWithoutThinking` 同一套模式：**先学习、再重试** ——
+ * 即使本次重试也失败，后续请求首次就带仿真，不再白挨一次 401。
+ *
+ * 只改**仿真身份头**，请求体原样（指纹拒绝与 body 无关）。
+ * 返回新的 Response，失败返回 null（调用方按原逻辑熔断该家）。
+ */
+async function retryWithClientSimulation(provider, upstreamPath, upstreamHeaders, body, timeoutMs, opts) {
+  clientSimulationProviders.add(provider.id);   // 先学习
+  const sim = claudeClientHeaders(LOADED_CFG || {});
+  const merged = { ...upstreamHeaders };
+  // 只覆盖仿真身份相关的头；认证头（authorization / x-api-key）保持调用方给的
+  for (const k of Object.keys(sim)) {
+    const lk = k.toLowerCase();
+    if (lk === 'authorization' || lk === 'x-api-key') continue;
+    dropHeaderCI(merged, lk);
+    merged[k] = sim[k];
+  }
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(), timeoutMs);
+  try {
+    const init = { method: (opts && opts.method) || 'POST', headers: merged, signal: c.signal };
+    if (body !== undefined && body !== null) init.body = typeof body === 'string' ? body : JSON.stringify(body);
+    return await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, init);
+  } catch (e) {
+    log(`upstream ${provider.id} 客户端仿真重试失败: ${e.message}`);
     return null;
   } finally { clearTimeout(t); }
 }
@@ -3324,6 +3385,16 @@ function codexClientHeaders(cfg) {
 function providerClientProfile(provider) {
   const declared = String((provider && provider.clientProfile) || '').trim().toLowerCase();
   if (declared) return declared;
+  // ④ **学到的**：该家曾因"客户端指纹被拒"（`unauthorized client detected`）而失败，
+  //    用 Claude Code 仿真重试后成功 → 后续请求首次就带上仿真，不再白挨一次拒绝。
+  //
+  // 实测依据（2026-10-11，agentrouter）：
+  //   默认 Node 头 / Chrome / curl / python → HTTP 401「unauthorized client detected」
+  //   Claude Code 头 / Codex 头            → **HTTP 200 通过**
+  // 也就是说它拦的是**请求头指纹**，不是 TLS —— 而本引擎早就有这些仿真档。
+  // 旧实现遇到这种拒绝只熔断该家并写"本程序无法伪装指纹，这是已知上限"，
+  // 那句话对这类家是**错的**：明明能过，只是没人替用户试一次。
+  if (clientSimulationProviders.has(String((provider && provider.id) || ''))) return 'claude';
   try {
     const host = new URL(String((provider && provider.baseURL) || '')).hostname.toLowerCase();
     if (host === 'api.cline.bot' || host.endsWith('.cline.bot')) return 'cline';
@@ -4428,6 +4499,13 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
   let upstream;
   let init = null;   // 首次请求的 fetch init（网络错原地重试用；见下方 catch）
   let firstDetail = null;   // 首次响应体（若已读取，后续分支复用，避免 body 二次消费报错）
+  // ⚠ 实际发出去的请求体（序列化后的字符串）。
+  // 为什么要单独存：`outBody` 声明在**另一个块**里（`if (!rawMode)` 内部），
+  // 在下面的 4xx 分类块里**不可见** —— 2026-10-11 加"指纹自动仿真重试"时直接引用它，
+  // 抛 `ReferenceError: outBody is not defined`，而异常被上层吞掉，
+  // 表现为"分支进了、什么都没发生、客户端拿到 400"（排查花了很久）。
+  // 教训：**行号在前 ≠ 作用域可见**；跨块复用必须提到共同的祖先作用域。
+  let lastSentBody = null;
   let needAggregate = false;   // 上游被强制流式、客户端要非流式 → 成功路径需聚合（见 applyOpenAIQuirks）
   try {
     // baseURL 允许“带 /v1”或“不带 /v1”两种写法（OpenAI SDK 惯例 / 用户习惯）：
@@ -4534,7 +4612,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     }
     // raw 模式不带 body：显式传 undefined，避免 fetch 在没有 content-length 时挂起等待请求体
     init = { method, headers: upstreamHeaders, signal: controller.signal };
-    if (!rawMode) init.body = JSON.stringify(outBody);
+    if (!rawMode) { lastSentBody = JSON.stringify(outBody); init.body = lastSentBody; }
     upstream = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, init);
     clearTimeout(timer);
     // R9c 自适应降敏：上游内容拦截（sensitive words / content-blocked）时，用降敏后的
@@ -4650,7 +4728,11 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     }
   }
   clearTimeout(timer);
-  if (!upstream.ok) {
+  // ⚠ 带标签的块：下面的"指纹被拒 → 自动仿真重试"若**重试成功**，必须 `break` 出去、
+  // 按正常 2xx 继续走 —— 否则会拿新响应的 200 继续跑完这一整块 4xx 判定，
+  // 最后落到"确定性 4xx"（200 不在 DETERMINISTIC_4XX_STATUS 里 → 兜底 400）把请求打死。
+  // 实测踩到：重试明明成功了（日志写着"HTTP 200"），客户端却拿到 400。
+  upstreamErrBlock: if (!upstream.ok) {
     // surface upstream error body if small（复用 firstDetail：body 只能读一次，
     // 之前 text() 已消费时再读会抛 "body already consumed" 丢失详情）
     let detail = firstDetail;
@@ -4668,6 +4750,57 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     // 账户池场景（opts.accountScoped）：额度耗尽 / 会话失效 / 限流属于**账户**问题，不是供应商问题 ——
     // 直接交回账户池换账户，**不计供应商熔断**（否则第一次额度耗尽就会把整家熔断 30 分钟，
     // 换账户的重试会被 breakerAcquire 挡在门外 → 客户端拿到 503，账户池形同虚设）。
+    // ⚠⚠ 2026-10-11：**指纹判定必须排在最前**，在 `accountScoped`（账户池）块之前。
+    //
+    // 实测踩坑：先把它放在后面（`!contentBlocked` 之前），**当场没生效** ——
+    // 因为 401 会被 `classifyAccountFailure()` 判成 `'session'`（裸 401/403 = 账户级），
+    // 账户池分支先 return 了，请求根本走不到指纹判定。
+    //
+    // 这与本文件另一处注释里早就写明的规则一致：
+    //   "指纹类拒绝必须排在'供应商账号/额度'判定**之前**：它长得像 403，
+    //    但处置完全相反 —— 不是这个账号有问题，而是'你这个客户端不被允许'。"
+    // 那个块遵守了，这个块漏了 —— 本轮第 9 处"同一规则两处实现、改一处漏一处"。
+    if (CLIENT_FINGERPRINT_RE.test(String(detail || ''))) {
+      //
+      // 实测（agentrouter）：它拦的是**请求头指纹**，不是 TLS ——
+      //   默认 Node / Chrome / curl / python → 401 `unauthorized client detected`
+      //   Claude Code 头 / Codex 头          → **200 通过**
+      // 而本引擎早就有这些仿真档，只是旧实现从没替用户试一次，
+      // 还写了一句"本程序无法伪装 TLS/HTTP 客户端指纹，这是已知上限" —— 对这类家是**错的**。
+      //
+      // 与 `retryWithoutThinking` 同一套学习模式：**先学习、再重试**；
+      // 重试成功 → 本次请求照常走完，且该家被记住（后续首次就带仿真，不再白挨 401）。
+      // 重试仍失败 → 落到下面的熔断（行为与旧版一致，没有变得更差）。
+      const alreadySimulated = !!providerClientProfile(provider);
+      let revived = null;
+      if (!alreadySimulated && !rawMode && lastSentBody) {
+        try {
+          // 用**实际发出去的那份 body**（字符串）原样重发 —— 指纹拒绝与请求体无关
+          revived = await retryWithClientSimulation(
+            provider, upstreamPath, upstreamHeaders, lastSentBody, timeoutMs, { method },
+          );
+        } catch (e) {
+          log(`upstream ${provider.id} 客户端仿真重试异常：${(e && e.message) || e}`);
+        }
+      }
+      if (revived && revived.ok) {
+        log(`upstream ${provider.id} 客户端指纹被拒（HTTP ${upstream.status}）`
+          + ` → 换 Claude Code 身份仿真重试成功（HTTP ${revived.status}，已记住该家需要仿真）`);
+        upstream = revived;
+        firstDetail = null;
+        detail = null;
+        break upstreamErrBlock;   // 已拿到 2xx → 跳出 4xx 判定，按正常响应继续
+      } else {
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"客户端指纹被拒" → 熔断该家并停止重试。`
+          + (alreadySimulated
+            ? '该家**已带身份仿真**仍被拒 → 说明是 TLS 层指纹或更严风控，本程序无法伪装。'
+            : `带 Claude Code 仿真重试仍失败（${revived ? 'HTTP ' + revived.status : '连接错误'}）→ 同样无解。`)
+          + '这类拒绝与账号无关（换 Key 没用）。');
+        catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
+        breakerRecordFail(provider.id, 403);
+        return rawMode ? { retryable: upstream.status } : false;
+      }
+    }
     if (opts && opts.accountScoped) {
       // ⚠ 先摘掉**与账号无关**的拒绝，再判"是不是账户级失败"。
       // 否则一个"地区受限"的模型会被 `classifyAccountFailure(403, 地区文案)` 判成 `session`
@@ -4725,9 +4858,12 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       return rawMode ? { retryable: upstream.status } : false;
     }
     if (CLIENT_FINGERPRINT_RE.test(String(detail || ''))) {
-      log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"客户端指纹被拒" → 熔断该家并停止重试。`
-        + '这类拒绝与账号无关（换 Key/重试都没用），继续请求只会加剧风控；'
-        + '本程序运行在 Node 上，无法伪装 TLS/HTTP 客户端指纹，这是已知上限。');
+      // ⚠ 本函数里指纹判定出现在**三处**（同一 regex 判三遍）—— 这是历史遗留。
+      // 真正生效的是**最前面那处**（在 accountScoped 之前），它命中就 return 了；
+      // 走到这里只可能是 `detail` 在上面被清空后又被重新读取。
+      // 2026-10-11 加"自动仿真重试"时我先把逻辑加在**最后**那处 —— 当场没生效；
+      // 这是本轮第 9 处"同一判定多处实现"。逻辑已统一到最前面那处，这里只留兜底。
+      log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"客户端指纹被拒"（兜底分支）→ 熔断该家`);
       catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
       breakerRecordFail(provider.id, 403);
       return rawMode ? { retryable: upstream.status } : false;
@@ -4786,9 +4922,12 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       // 现在：地区/套餐受限 → 归入"这家没有该模型"（不熔断该家）；
       //       真正的客户端指纹拒绝 → 长熔断该家并明确告知用户原因。
       if (CLIENT_FINGERPRINT_RE.test(detail)) {
-        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"客户端指纹被拒" → 熔断该家并停止重试。`
-          + '这类拒绝与账号无关（换 Key/重试都没用），继续请求只会加剧风控；'
-          + '本程序运行在 Node 上，无法伪装 TLS/HTTP 客户端指纹，这是已知上限。');
+        // ⚠ 这里是**第二处**指纹判定（本函数里同一 regex 判了两遍）。
+        // 上面那处（`!contentBlocked` 之前）会先命中并 return，所以这一处对本情形是**死代码**；
+        // 2026-10-11 加"自动仿真重试"时我先把逻辑加在了这里 —— **当场没生效**，
+        // 因为请求根本走不到这行。逻辑已移到上面那处，这里只保留兜底（行为与旧版一致）。
+        // 这是本轮第 8 处"同一判定两处实现"；同一个函数内也会发生。
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"客户端指纹被拒"（兜底分支）→ 熔断该家`);
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
         breakerRecordFail(provider.id, 403);
         return rawMode ? { retryable: upstream.status } : false;

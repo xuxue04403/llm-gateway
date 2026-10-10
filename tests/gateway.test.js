@@ -3826,8 +3826,12 @@ let upstreamPort = 0;
     const endIdx = rest.indexOf('\n}\n');
     assert.ok(endIdx > 0, '应能定位函数体结束');
     const fnSrc = rest.slice(0, endIdx + 3);
+    // ⚠ 该函数现在依赖模块级的 `clientSimulationProviders`（"指纹被拒→自动仿真"的学习标记），
+    // eval 出来的副本没有那个作用域 → 必须**显式传进去**，否则
+    // `ReferenceError: clientSimulationProviders is not defined`。
+    // 这里传空 Set：本用例只测"按主机名推断"，与学习标记无关。
     // eslint-disable-next-line no-new-func
-    const providerClientProfile = new Function(fnSrc + '\nreturn providerClientProfile;')();
+    const providerClientProfile = new Function('clientSimulationProviders', fnSrc + '\nreturn providerClientProfile;')(new Set());
 
     assert.strictEqual(providerClientProfile({ baseURL: 'https://api.cline.bot/api/v1' }), 'cline',
       'api.cline.bot 应推断为 cline 仿真');

@@ -247,6 +247,13 @@ const DECLARED = [
   { name: 'CODEX_REFRESH_SKEW_MS', why: '新增：提前 5 分钟算过期' },
   { name: 'codexRefreshInflight', why: '新增：刷新去重（并发请求只刷一次，避免把一次性 refresh_token 用废）' },
   { name: 'WORKBUDDY_CHANNEL_BLOCK_RE', why: '新增：WorkBuddy 软性渠道拦截识别（实测原文 HTTP 400 code:11128 "Illegal API invocation from an unapproved channel" / displayMsg.en "Request blocked. Please send it again"）。上游自己要求重发 = 瞬时风控，不是请求有错。实测 52 次成功夹 1 次（≈2%），用户侧表现为 Claude Code 任务"不时"中止。两处判定（直通路径 + 矩阵路径）都要用它 —— 第一次只改了直通那处，矩阵路径当场没生效' },
+  { name: 'CONFIG_PATH', why: '改（连带）：在同一处新增了 LOADED_CFG，块指纹变化' },
+  { name: 'thinkingPassbackProviders', why: '改（连带）：在其后新增了 clientSimulationProviders 的声明与说明，块指纹变化' },
+  { name: 'retryWithoutThinking', why: '改（连带）：新函数插在它旁边，块指纹变化' },
+  { name: 'providerClientProfile', why: '改：新增"学到的仿真"分支 —— 该家曾被指纹拒绝且仿真重试成功过 → 后续请求首次就返回 claude 仿真，不再白挨一次 401' },
+  { name: 'LOADED_CFG', why: '新增：模块级配置引用。加载配置时的 const cfg 是**函数内局部变量**，模块级辅助函数拿不到；客户端仿真头需要 cfg（claudeClientHeaders 要用 clientVersions 覆盖版本号）。直接写 cfg 会抛 ReferenceError: cfg is not defined，且异常被上层吞掉 → 表现为"分支进了、什么都没发生、客户端拿到 400"' },
+  { name: 'clientSimulationProviders', why: '新增："该家需要客户端身份仿真"的学习标记（与 thinkingPassbackProviders 同一套模式）。实测 agentrouter 按**请求头指纹**准入：默认 Node/Chrome/curl/python → 401 unauthorized client detected；Claude Code 头/Codex 头 → 200 通过。旧实现只熔断并写"无法伪装指纹，这是已知上限"—— 对这类家是错的' },
+  { name: 'retryWithClientSimulation', why: '新增：指纹被拒时换 Claude Code 身份仿真重试一次（照 retryWithoutThinking 的模式：先学习、再重试；只改仿真身份头，认证头保持）' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */
