@@ -3792,6 +3792,30 @@ const DETERMINISTIC_4XX_STATUS = { 400: 400, 404: 404, 413: 413, 422: 422 };
 const UPSTREAM_BROKEN_4XX_RE = /bad_response_status_code|bad_response|upstream\s+(?:error|request\s+failed|returned)|invalid\s+response\s+from\s+upstream|上游[^\n]{0,10}?(?:错误|失败|异常)/i;
 
 /**
+ * WorkBuddy 的**软性风控/渠道拦截** —— 上游明确说"请重发"，**不是**请求本身有错。
+ *
+ * 实测原文（2026-10-10，本机日志）：
+ *   HTTP 400 {"code":11128,
+ *             "msg":"Illegal API invocation from an unapproved channel",
+ *             "displayMsg":{"en":"Request blocked. Please send it again", ...}}
+ *
+ * ⚠ 关键在 `displayMsg`：**上游自己要求"Please send it again"** ——
+ * 这是**瞬时**拦截（渠道指纹/频率类风控），不是"你的请求参数有问题"。
+ *
+ * 实测频率：同一个模型 `claude-haiku-5-5` 在 52 次成功里夹了 1 次这个 400（≈2%），
+ * 即用户描述的"**不时**报错停止任务"。
+ *
+ * 旧行为：它落在 `classifyAccountFailure()` 的 `return null`（400 非账户级），
+ * 再落进"确定性 4xx"分支 → **终止 failover** → 客户端拿到
+ * `400 … the request itself is invalid … failover stopped on purpose`，
+ * **Claude Code 的整个任务就此中止** —— 而其实换一家（或同家重发）就能过。
+ *
+ * 判据用 `11128` 错误码 **或** 文案特征：错误码最稳（文案可能被上游改），
+ * 但中转/换皮端点可能改码不改文，所以两者都要认。
+ */
+const WORKBUDDY_CHANNEL_BLOCK_RE = /"code"\s*:\s*11128|unapproved\s+channel|illegal\s+api\s+invocation|please\s+send\s+it\s+again/i;
+
+/**
  * 「供应商侧」4xx（账号/额度/权限/套餐）——**不是**请求本身有错，而是"这家现在不能给你服务"。
  * 实测事故（2026-09-15）：b.ai 余额为 0 时回 HTTP **400** `credit insufficient balance: balance=0`，
  * 旧实现按"确定性 4xx"终止 failover → 用户明明还有可用的 chiyi-ds，却被欠费的那家直接打死
@@ -4796,6 +4820,24 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       if (UPSTREAM_BROKEN_4XX_RE.test(detail)) {
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"上游侧故障被包成 4xx"`
           + `（${maskSecrets(String(detail || '')).slice(0, 80)}）→ 继续 failover（不熔断该家）`);
+        return rawMode ? { retryable: upstream.status } : false;
+      }
+      // 2026-10-10 新增：WorkBuddy 的**软性渠道拦截**（上游明确要求"请重发"）→ 继续 failover。
+      //
+      // 实测（本机日志）：`claude-haiku-5-5` 52 次成功里夹 1 次这个 400（≈2%），
+      // 用户侧表现是 **Claude Code 任务"不时"被中止** ——
+      // 而这条回复本来完全能拿到（换一家/重发即可）。
+      //
+      // 与上面两条同一类修正：**别把"供应商此刻不想服务"当成"你的请求有问题"**。
+      // 刻意**不调 breakerRecordFail**：这是瞬时风控，按供应商粒度记失败会连坐整家
+      // （该家下一秒就正常了）。半开名额已在上方交还。
+      //
+      // ⚠ 也不能记成账户级（`classifyAccountFailure` 的 'rate'）——
+      // 它 ~2% 随机命中，冷却账户会让多把 Key 被逐个耗尽，反而更糟。
+      // 正确语义就是"这一发没中，换下一发"：交给 failover 循环。
+      if (WORKBUDDY_CHANNEL_BLOCK_RE.test(detail)) {
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"软性渠道拦截/风控"`
+          + `（上游要求重发；实测约 2% 随机命中）→ 继续 failover，不终止客户端任务`);
         return rawMode ? { retryable: upstream.status } : false;
       }
       const status = DETERMINISTIC_4XX_STATUS[upstream.status] || 400;
@@ -7228,6 +7270,23 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
           + '本程序运行在 Node 上，无法伪装 TLS/HTTP 客户端指纹，这是已知上限。');
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
         breakerRecordFail(provider.id, 403);
+        return false;
+      }
+      // ⚠⚠ 2026-10-10：WorkBuddy 软性渠道拦截 —— **本路径（矩阵/翻译）必须与直通路径同步**。
+      //
+      // 实测事故：Claude Code（Anthropic 客户端）→ 网关 → workbuddy（chat 上游）走的是**这条**
+      // 矩阵路径。同一个 400 `code:11128 "unapproved channel" / "Please send it again"`
+      // 在直通路径已按"继续 failover"处理，但这里漏了 → 仍然终止 failover →
+      // 客户端拿到 `400 … the request itself is invalid … failover stopped on purpose`
+      // → **Claude Code 整个任务中止**（用户报的"不时报错停止任务"，实测 52 次成功夹 1 次）。
+      //
+      // 这是本轮第 7 处"同一判定在两处实现、改一处漏一处"。
+      // 与直通路径一致：不熔断该家（瞬时风控，下一秒就好）、不冷却账户（~2% 随机命中，
+      // 冷却会让多把 Key 被逐个耗尽），只**继续换下一家**。
+      if (WORKBUDDY_CHANNEL_BLOCK_RE.test(String(lastDetail || ''))) {
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"软性渠道拦截/风控"`
+          + `（上游要求重发；实测约 2% 随机命中）→ 继续 failover，不终止客户端任务`);
+        breakerRecordSuccess(provider.id);   // 上游连接性是健康的 → 交还半开名额
         return false;
       }
       const acctKind = acct ? classifyAccountFailure(upstream.status, lastDetail) : null;

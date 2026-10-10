@@ -528,6 +528,86 @@ let upstreamPort = 0;
     }
   });
 
+
+  t('网关：WorkBuddy 软性渠道拦截 400 → 继续 failover（不中止客户端任务）', async () => {
+    // ⚠ 实测事故（2026-10-10，本机日志）：WorkBuddy 会**随机**（≈2%，52 次成功夹 1 次）回
+    //   HTTP 400 {"code":11128,"msg":"Illegal API invocation from an unapproved channel",
+    //             "displayMsg":{"en":"Request blocked. Please send it again"}}
+    // —— **上游自己要求"请重发"**，是瞬时风控，不是"你的请求参数有问题"。
+    //
+    // 旧行为：落进"确定性 4xx" → **终止 failover** → 客户端拿到
+    //   `400 … the request itself is invalid … failover stopped on purpose`
+    // → **Claude Code 的整个任务中止**（用户报的"不时报错停止任务"）。
+    //
+    // ⚠⚠ 这条用例特意用 **Anthropic 客户端**（Claude Code 的形态）——
+    // 因为"确定性 4xx"判定在引擎里有**两处实现**：直通路径与矩阵/翻译路径。
+    // 第一次修只改了直通那处，本用例走矩阵路径，**当场就是红的**。
+    const BLOCK = JSON.stringify({
+      code: 11128,
+      msg: 'Illegal API invocation from an unapproved channel',
+      requestId: 'a9f5xxxxe062',
+      displayMsg: { en: 'Request blocked. Please send it again', zh: '请求被拦截，请重试' },
+    });
+    let aHits = 0;
+    const A = http.createServer((q, s) => {
+      q.resume();
+      q.on('end', () => {
+        aHits++;
+        s.writeHead(400, { 'content-type': 'application/json' });
+        s.end(BLOCK);
+      });
+    });
+    await new Promise((r) => A.listen(0, '127.0.0.1', r));
+    let bHits = 0;
+    const B = http.createServer((q, s) => {
+      q.resume();
+      q.on('end', () => {
+        bHits++;
+        s.writeHead(200, { 'content-type': 'application/json' });
+        s.end(JSON.stringify({
+          id: 'c1', object: 'chat.completion', created: 1, model: 'test-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: '来自 B 家' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+        }));
+      });
+    });
+    await new Promise((r) => B.listen(0, '127.0.0.1', r));
+
+    const dir = fs.mkdtempSync(path.join(tmp, 'wbblock-'));
+    const port = await freePort();
+    fs.writeFileSync(path.join(dir, 'c.json'), JSON.stringify({
+      port, apiKey: GATEWAY_KEY,
+      providers: [
+        { id: 'wb-blocked', baseURL: 'http://127.0.0.1:' + A.address().port + '/v2', protocol: 'openai-chat',
+          models: ['test-model'], apiKey: 'sk-aaaaaaaaaaaaaaaa', priority: 1, enabled: true },
+        { id: 'wb-good', baseURL: 'http://127.0.0.1:' + B.address().port + '/v2', protocol: 'openai-chat',
+          models: ['test-model'], apiKey: 'sk-bbbbbbbbbbbbbbbb', priority: 2, enabled: true },
+      ],
+    }), 'utf8');
+
+    const proc = spawn(process.execPath,
+      [MJS, '--config', path.join(dir, 'c.json'), '--log', path.join(dir, 'g.log'), '--port', String(port)],
+      { stdio: 'ignore', windowsHide: true });
+    try {
+      const ok = await waitHealth(port, 20000);
+      if (!ok) { console.log('    [SKIP] 网关未就绪'); return; }
+      // Anthropic 客户端 → chat 上游 = 矩阵路径（Claude Code 的形态）
+      const r = await call({ port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200,
+        '软性拦截应继续 failover 拿到 B 家的 200，实际 ' + r.status + ' ' + r.text.slice(0, 220));
+      assert.ok(/来自 B 家/.test(r.text), '应拿到 B 家的正文，实际：' + r.text.slice(0, 200));
+      assert.strictEqual(bHits, 1, 'B 家应被尝试 1 次，实际 ' + bHits);
+      // 日志里必须是"软性渠道拦截"，不能是"确定性 4xx"
+      const log = fs.readFileSync(path.join(dir, 'g.log'), 'utf8');
+      assert.ok(/软性渠道拦截/.test(log), '日志应记"软性渠道拦截"，实际：' + log.slice(-400));
+      assert.ok(!/确定性 4xx/.test(log), '不该再判成"确定性 4xx"（那会终止客户端任务）');
+    } finally {
+      try { proc.kill(); } catch { /* 忽略 */ }
+      try { A.close(); } catch { /* 忽略 */ }
+      try { B.close(); } catch { /* 忽略 */ }
+    }
+  });
+
   t('网关：缓存字段必须传给 Anthropic 客户端（否则命中率恒为 0%）', async () => {
     // 上游在 usage 里报 `prompt_tokens_details.cached_tokens`，客户端读的是
     // Anthropic 的 `cache_read_input_tokens` —— 不翻译就等于把缓存信息抹平，

@@ -246,6 +246,7 @@ const DECLARED = [
   { name: 'codexAuthCache', why: '新增：凭据读缓存（按 mtime 失效）' },
   { name: 'CODEX_REFRESH_SKEW_MS', why: '新增：提前 5 分钟算过期' },
   { name: 'codexRefreshInflight', why: '新增：刷新去重（并发请求只刷一次，避免把一次性 refresh_token 用废）' },
+  { name: 'WORKBUDDY_CHANNEL_BLOCK_RE', why: '新增：WorkBuddy 软性渠道拦截识别（实测原文 HTTP 400 code:11128 "Illegal API invocation from an unapproved channel" / displayMsg.en "Request blocked. Please send it again"）。上游自己要求重发 = 瞬时风控，不是请求有错。实测 52 次成功夹 1 次（≈2%），用户侧表现为 Claude Code 任务"不时"中止。两处判定（直通路径 + 矩阵路径）都要用它 —— 第一次只改了直通那处，矩阵路径当场没生效' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */
