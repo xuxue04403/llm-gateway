@@ -263,6 +263,33 @@ t('probe.upstreamBase：与引擎 upstreamBase 规则一致（补 /v1 / 收敛�
 });
 
 
+
+t('providerProtocol 必须委托 wireOfName（不许再内联协议别名表 —— 本轮第 6 处同类漂移）', () => {
+  // ⚠ 背景：引擎里"认哪些 protocol 拼法"曾经有**两份实现**：
+  //   · wireOfName()       —— 认 9 种（含简写 chat / messages）
+  //   · providerProtocol() —— 只认 7 种，**缺 chat / messages**
+  // 而 providerProtocol 在路由里**优先级更高**（模型 api → provider.protocol → 跟随客户端）。
+  // 后果很隐蔽：用户写 protocol:"chat" 时校验器放行、wireOfName 也认，
+  // 但 providerProtocol 返回 null → 被当成"跟随客户端协议" → 可能走错协议且**不报错**。
+  //
+  // 修法是让 providerProtocol 直接委托 wireOfName（"认哪些拼法"只留一处定义）。
+  // 这条测试防止有人再把它内联回去。
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'gateway', 'model-gateway.mjs'), 'utf8');
+
+  const m = src.match(/function providerProtocol\(provider\) \{([\s\S]*?)\n\}/);
+  assert.ok(m, '应能找到 providerProtocol 函数体');
+  assert.ok(/wireOfName\(/.test(m[1]),
+    'providerProtocol 必须调用 wireOfName（否则又是一份独立的别名表）');
+
+  // 别名表只该在 wireOfName 里出现一次。
+  // ⚠ 只数**比较形态**（`=== 'openai-completions'`）——
+  // 引擎里还有一处是**写入 DSH 配置的值**（write-dsh 的 `wireApi = 'openai-completions'`），
+  // 那是合法用法，不该被算成"又内联了一份别名表"（第一版断言就是这么误报的）。
+  const cmpHits = (src.match(/=== 'openai-completions'/g) || []).length;
+  assert.strictEqual(cmpHits, 1,
+    "协议别名的**比较**在引擎里应只出现 1 次（在 wireOfName 里），实际 " + cmpHits + ' 次 —— 说明又有人内联了一份别名表');
+});
+
 t('upstreamBase：引擎与 probe 两份实现必须一致（"函数副本"是本轮反复出问题的模式）', () => {
   // ⚠ 这条盯的是**同一份逻辑存在两处实现**。
   //

@@ -1357,16 +1357,22 @@ function logicalModelSupportsVision(cfg, logical) {
  *   "quirks":   ["force-stream", "stringify-tool-choice", "prepend-system"]
  */
 
-/** 上游线协议：'openai-chat' | 'anthropic-messages' | 'openai-responses' | null（null = 跟随客户端请求路径） */
+/**
+ * 上游线协议：'openai-chat' | 'anthropic-messages' | 'openai-responses' | null（null = 跟随客户端请求路径）
+ *
+ * ⚠⚠ 这是 `wireOfName()` 的**又一份副本** —— 本轮第 6 处"同一逻辑多份实现"。
+ * 实测（2026-10-09）：这里认 7 种拼法，而 `wireOfName()` 认 9 种，**缺 `chat` / `messages`**。
+ * 后果很隐蔽：用户写 `protocol: "chat"` 时
+ *   · 配置校验器（已对齐 wireOfName）→ 放行
+ *   · `wireOfName()` → 认
+ *   · **但本函数返回 null** → 调用方当成"跟随客户端协议"
+ *   → 请求可能走错协议，且**不报错**（客户端拿到形状不对的响应）。
+ *
+ * 现在**委托给 `wireOfName()`**，让"认哪些拼法"只有一处定义。
+ * （函数声明会提升，定义在文件后面也能调用。）
+ */
 function providerProtocol(provider) {
-  const v = String((provider && provider.protocol) || '').trim().toLowerCase();
-  if (v === 'openai-chat' || v === 'openai-completions' || v === 'openai') return 'openai-chat';
-  if (v === 'anthropic' || v === 'anthropic-messages') return 'anthropic-messages';
-  // ⚠ 这一行是协议矩阵的前提：旧实现只认前两种，`protocol: 'openai-responses'` 落到
-  // `return null` → 调用方以为"跟随客户端" → **矩阵翻译根本不触发**，
-  // 客户端拿到 200 但响应体是上游的原形状（实测：chat 客户端收到 Responses 体）。
-  if (v === 'openai-responses' || v === 'responses') return 'openai-responses';
-  return null;
+  return wireOfName(provider && provider.protocol);
 }
 
 /** 兼容性开关（quirk）集合 */
