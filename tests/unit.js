@@ -364,6 +364,52 @@ t('validateConfigText：protocol 白名单必须与引擎的 wireOfName() 逐字
   }
 });
 
+
+t('auth 白名单：凭据免填的鉴权方式必须在**四处**同步（同类漂移已发生 3 次）', () => {
+  // ⚠ 这条盯的是一组"必须到处同步"的值，它们分散在四个模块里：
+  //   ① src/gateway-manager.js  KNOWN_AUTH           —— 配置校验
+  //   ② src/datadir.js          凭据判定             —— 决定配置算不算"示例"（漏了会被覆盖 = 数据丢失）
+  //   ③ src/gateway/model-gateway.mjs  providerHasCredential() —— 引擎放行
+  //   ④ renderer/js/providers.js CREDENTIAL_FREE_AUTH —— 面板不强制填 Key
+  //
+  // 实测（2026-10-09）：加 codex 时**漏了三处**，用户依次撞上：
+  //   「protocol 非法」→「请至少填一把 API Key」→「auth 非法（当前支持：workbuddy）」
+  // 每撞一次才改一处 —— 这条测试把"漏改"变成一次红灯，而不是三轮用户反馈。
+  const { validateConfigText } = require('../src/gateway-manager');
+  const datadir = require('../src/datadir');
+
+  // ① 配置校验：两个值都必须通过
+  for (const auth of ['workbuddy', 'codex']) {
+    const c = JSON.parse(JSON.stringify(OK_CFG));
+    c.providers[0].auth = auth;
+    delete c.providers[0].apiKey;          // 凭据免填 → 不该要 Key
+    delete c.providers[0].apiKeys;
+    const r = validateConfigText(JSON.stringify(c));
+    assert.strictEqual(r.ok, true, 'auth=' + auth + ' 应通过校验：' + r.error);
+  }
+  // 不认识的仍要拒绝
+  {
+    const c = JSON.parse(JSON.stringify(OK_CFG));
+    c.providers[0].auth = 'garbage';
+    assert.strictEqual(validateConfigText(JSON.stringify(c)).ok, false, '不认识的 auth 应被拒绝');
+  }
+
+  // ② datadir：这两个值都要被判为"有凭据"（否则配置会被当成示例占位而**被覆盖**）
+  //    isPlaceholderConfig 是内部函数，用它的导出入口间接验证：一个只含 codex 供应商的
+  //    配置**不该**被判为占位。
+  // ⚠ 传**字符串**（该函数的入参是 JSON 文本，不是对象 —— 传对象会被 JSON.parse 抛错、
+  // 走 catch 分支返回 true，看起来"判为占位"而其实是调用方式错了）。
+  const codexCfgText = JSON.stringify({
+    providers: [{
+      id: 'codex-sub', baseURL: 'https://chatgpt.com/backend-api/codex',
+      auth: 'codex', protocol: 'openai-responses', models: ['gpt-5.6-luna'],
+    }],
+  });
+  if (typeof datadir.isPlaceholderConfig === 'function') {
+    assert.strictEqual(datadir.isPlaceholderConfig(codexCfgText), false,
+      'codex 供应商是合法配置，不该被判为示例占位（判为占位会导致配置被覆盖）');
+  }
+});
 t('validateConfigText：apiKey 占位值/过短被拦（否则运行时全 401）', () => {
   const a = JSON.parse(JSON.stringify(OK_CFG)); a.apiKey = 'dsh-gateway-change-me';
   assert.strictEqual(validateConfigText(JSON.stringify(a)).ok, false);

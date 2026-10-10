@@ -984,8 +984,9 @@ function applyEditor() {
   } else if (keys.length > 1) {
     next.apiKey = keys[0];
     next.apiKeys = keys;
-  } else if (auth === 'workbuddy' && prev.apiKey) {
-    // workbuddy 且清空了 Key：不动原来的 apiKey（可能是占位）
+  } else if (CREDENTIAL_FREE_AUTH.includes(auth) && prev.apiKey) {
+    // 凭据免填的鉴权方式且清空了 Key：不动原来的 apiKey（可能是占位）
+    // （见上面 CREDENTIAL_FREE_AUTH 的说明：旧实现只认 workbuddy）
     next.apiKey = prev.apiKey;
     delete next.apiKeys;
   } else {

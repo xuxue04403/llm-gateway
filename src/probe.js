@@ -252,6 +252,47 @@ async function probeProvider(provider, ctx) {
       verdict: 'WorkBuddy 供应商用桌面客户端凭据（authFile）鉴权，不走 API Key——请改用 /health 的账户池状态判断',
     };
   }
+  // ⚠ Codex 订阅供应商**可以**正常探测 —— 但要先把凭据读出来。
+  //
+  // 它的凭据在 `$CODEX_HOME/auth.json`（或 `~/.codex/auth.json`）里，配置里没有 Key。
+  // 不处理的话 `provider.apiKey || apiKeys[0]` 是空串 → 带空 Bearer 打上游 → 401，
+  // 「测试」会把一家**本来能用**的供应商报成"凭据被拒"。
+  //
+  // 这里只读文件、**不刷新**（刷新是引擎的职责，探测不该有副作用）——
+  // 令牌过期时如实报"请先运行一次 Codex 让它刷新"，而不是伪造一个结论。
+  let codexCred = null;
+  if (String(provider.auth || '').toLowerCase() === 'codex') {
+    codexCred = readCodexCredForProbe();
+    if (!codexCred.ok) return { id, ok: false, verdict: 'Codex 凭据不可用：' + codexCred.error };
+    // Codex 后端**没有 /models 端点**（实测 GET /backend-api/codex/models → 404），
+    // 所以不能走"先探目录再试生成"的常规流程 —— 直接做一次最小生成验证。
+    // 判据与常规路径一致：只有真拿到 2xx 才算通过，并带出上游原文。
+    const genModel = String(o.genModel || '').trim()
+      || (Array.isArray(provider.models) ? String(
+        (typeof provider.models[0] === 'string' ? provider.models[0] : (provider.models[0] || {}).id) || '') : '');
+    if (!genModel) {
+      return { id, ok: null, skipped: true, verdict: 'Codex 供应商没声明任何模型 —— 请先填模型（如 gpt-5.6-luna）再测试' };
+    }
+    const g = await probeOneKeyGen(provider, {
+      key: codexCred.accessToken,
+      model: genModel,
+      path: '/responses',                       // Codex 的生成端点是 /responses（不带 /v1）
+      proxy: directOnly ? null : o.proxy,
+      noProxy: o.noProxy || [],
+      timeoutMs: o.genTimeoutMs || 45000,
+      headers: codexProbeHeaders(codexCred),
+    });
+    if (g.ok) {
+      return { id, ok: true, ms: g.ms, status: g.status, baseUrl: base, modelCount: null, sample: [],
+        verdict: `凭据可用于生成（试生成 ${genModel} 成功，HTTP ${g.status}，${g.ms}ms）` };
+    }
+    if (g.ok === null) {
+      return { id, ok: null, ms: g.ms, status: g.status, baseUrl: base, modelCount: null, sample: [],
+        verdict: `无法判定（${g.detail || '连接失败'}）—— 请以网关日志里的真实调用为准` };
+    }
+    return { id, ok: false, ms: g.ms, status: g.status, baseUrl: base, modelCount: null, sample: [],
+      verdict: `试生成被拒（HTTP ${g.status}）：${g.detail}` };
+  }
   const base = upstreamBase(raw);
   const key = String(provider.apiKey || '').trim()
     || (Array.isArray(provider.apiKeys) ? String(provider.apiKeys[0] || '').trim() : '');
@@ -434,4 +475,74 @@ async function probeOneKeyGen(provider, ctx) {
   return { ok: modelScoped ? null : false, status: r.status, ms: r.ms, detail, body: String(r.body || '').slice(0, 200) };
 }
 
-module.exports = { probeProvider, getJson, upstreamBase, hostInList, connectViaProxy, extractUpstreamError, genPathFor, probeOneKeyGen };
+/**
+ * 探测用的 Codex 凭据读取（**只读，不刷新**）。
+ *
+ * 与引擎里的同名逻辑同源，但这里是独立模块（主进程用它，引擎是子进程）——
+ * 所以只能各读一份。两边的**候选顺序必须一致**：`CODEX_HOME` 优先，
+ * 再退回 `~/.codex`（实测本机 CODEX_HOME 指向别处，只读后者会读到没用的文件）。
+ *
+ * 不在这里刷新令牌：探测是只读操作，不该产生副作用（引擎负责刷新并写回）。
+ */
+function readCodexCredForProbe() {
+  const os = require('node:os');
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const cands = [];
+  const envHome = String(process.env.CODEX_HOME || '').trim();
+  if (envHome) cands.push(path.join(envHome, 'auth.json'));
+  cands.push(path.join(os.homedir(), '.codex', 'auth.json'));
+  let file = '';
+  for (const c of cands) {
+    try { if (fs.statSync(c).isFile()) { file = c; break; } } catch { /* 试下一个 */ }
+  }
+  if (!file) return { ok: false, error: '未找到 auth.json（请先登录 Codex 桌面版/CLI）' };
+  let auth = null;
+  try { auth = JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (e) { return { ok: false, error: 'auth.json 不是合法 JSON：' + (e && e.message) }; }
+  const t = (auth && auth.tokens) || {};
+  if (!t.access_token) {
+    return {
+      ok: false,
+      error: String(auth && auth.auth_mode) === 'apikey'
+        ? '当前是 API Key 登录方式，不是 ChatGPT 订阅（请在 Codex 里改用 ChatGPT 账号登录）'
+        : '凭据里没有 access_token（请先登录 Codex）',
+    };
+  }
+  let accountId = String(t.account_id || '').trim();
+  if (!accountId) {
+    try {
+      const claims = JSON.parse(Buffer.from(String(t.access_token).split('.')[1], 'base64url').toString('utf8'));
+      accountId = String((claims['https://api.openai.com/auth'] || {}).chatgpt_account_id || '').trim();
+    } catch { /* 忽略 */ }
+  }
+  if (!accountId) return { ok: false, error: '推不出 chatgpt-account-id' };
+  // 过期就如实说 —— 不刷新、也不假装能用
+  let exp = 0;
+  try {
+    const claims = JSON.parse(Buffer.from(String(t.access_token).split('.')[1], 'base64url').toString('utf8'));
+    exp = Number(claims.exp) * 1000 || 0;
+  } catch { /* 忽略 */ }
+  if (exp && Date.now() >= exp) {
+    return { ok: false, error: 'access_token 已过期 —— 请运行一次 Codex（或让网关发一次请求）以触发刷新' };
+  }
+  return { ok: true, accessToken: t.access_token, accountId, file };
+}
+
+/** Codex 后端的必需请求头（探测用）。与引擎的 codexUpstreamHeaders 同源。 */
+function codexProbeHeaders(cred) {
+  const sid = require('node:crypto').randomUUID();
+  return {
+    authorization: 'Bearer ' + cred.accessToken,
+    'chatgpt-account-id': cred.accountId,
+    originator: 'codex_cli_rs',
+    'OpenAI-Beta': 'responses=experimental',
+    accept: 'text/event-stream',
+    'content-type': 'application/json',
+    'session-id': sid,
+    'x-client-request-id': sid,
+    'user-agent': 'codex_cli_rs/0.162.0 (Windows 10; x64)',
+  };
+}
+
+module.exports = { probeProvider, getJson, upstreamBase, hostInList, connectViaProxy, extractUpstreamError, genPathFor, probeOneKeyGen, readCodexCredForProbe };

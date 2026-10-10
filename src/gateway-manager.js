@@ -417,8 +417,16 @@ function validateConfigText(text) {
           if (typeof k !== 'string') return { ok: false, error: who + ' 的 apiKeys 只能包含字符串' };
         }
       }
-      if (p.auth !== undefined && !['workbuddy'].includes(String(p.auth).trim().toLowerCase())) {
-        return { ok: false, error: who + ' 的 auth 非法（当前支持：workbuddy）' };
+      // ⚠ `auth` 白名单。这些值的共同点是**凭据由本机其它程序提供、不在配置里**：
+      //   · workbuddy —— 桌面客户端凭据（authFile / 自动发现）
+      //   · codex     —— Codex 桌面版/CLI 已登录的 auth.json（含自动刷新）
+      // 引擎侧对应 `providerHasCredential()` / `accountUpstreamHeaders()` 里的分支，
+      // 渲染层对应 `CREDENTIAL_FREE_AUTH`。**四处必须同步** ——
+      // 实测（2026-10-09）这里漏了 codex，预设加进来的条目保存时报
+      // 「auth 非法（当前支持：workbuddy）」，而这已经是同一类漂移的**第三处**。
+      const KNOWN_AUTH = ['workbuddy', 'codex'];
+      if (p.auth !== undefined && !KNOWN_AUTH.includes(String(p.auth).trim().toLowerCase())) {
+        return { ok: false, error: who + ' 的 auth 非法（当前支持：' + KNOWN_AUTH.join(' / ') + '）' };
       }
     }
   }

@@ -95,7 +95,13 @@ function looksReal(p) {
   // 凭据像真的：够长，且不是示例里的占位串
   const keys = [p.apiKey].concat(Array.isArray(p.apiKeys) ? p.apiKeys : []).filter(Boolean).map(String);
   if (keys.some((k) => k.trim().length >= 16 && !/change[-_]?me|xxxx|yyyy|在此填入|your[_-]?key|placeholder/i.test(k))) return true;
-  if (String(p.auth || '').trim().toLowerCase() === 'workbuddy') return true;
+  // ⚠ 凭据由**本机其它程序**提供的鉴权方式：配置里本来就没有 Key，但这是**合法**配置。
+  // 漏掉它们 → 该供应商被当成"示例占位"，整个配置被判为占位而**被覆盖**（数据丢失）。
+  // 实测（2026-10-09）：这里只有 workbuddy，于是 codex 供应商会被误判。
+  // 与 gateway-manager.js 的 KNOWN_AUTH、引擎的 providerHasCredential()、
+  // 渲染层的 CREDENTIAL_FREE_AUTH 是同一组值 —— **四处必须同步**。
+  const credFreeAuth = String(p.auth || '').trim().toLowerCase();
+  if (credFreeAuth === 'workbuddy' || credFreeAuth === 'codex') return true;
   if (Array.isArray(p.accounts) && p.accounts.length > 0) return true;
   return false;
 }
