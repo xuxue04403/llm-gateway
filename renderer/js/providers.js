@@ -298,6 +298,7 @@ function openEditor(i) {
             <option value="">（跟随客户端请求路径）</option>
             <option value="openai-chat">openai-chat（该家只会 OpenAI chat）</option>
             <option value="anthropic-messages">anthropic-messages（该家只会 Anthropic）</option>
+            <option value="openai-responses">openai-responses（该家只会 Responses API，如 Codex 订阅）</option>
           </select>
         </div>
 
@@ -359,7 +360,20 @@ function openEditor(i) {
   `;
 
   // 协议 / 仿真的当前值（用 JS 设，避免 option 里再拼 HTML）
-  $('#edProtocol').value = p.protocol || '';
+  // ⚠ 协议下拉必须能**无损往返**，否则"打开抽屉 → 点保存"就把协议抹掉了。
+  //
+  // 这里与逐模型 `api` 下拉是**同一个坑**（那次我只修了逐模型的，漏了供应商级的）：
+  // `<select>` 只列规范值时，`select.value = 'openai-responses'` 会**静默失败**
+  // （不匹配任何 option → 值变成 ''），保存时 protocol 就丢了。
+  // 实测（2026-10-09）：Codex 预设存下来的条目**没有 protocol** ——
+  // 于是它退回"跟随客户端协议"，对 Anthropic 客户端会去请求 Codex 后端的
+  // `/messages`（该后端只有 `/responses`）→ 必然失败。
+  //
+  // 两步保证无损：
+  //   ① 别名归一（引擎认 9 种拼法，下拉只列 3 个规范值）—— 归一在引擎里无损；
+  //   ② 归一不了的原样保留（临时补一个 option），宁可留着一个不认识的字符串，
+  //      也不要静默删掉用户写的东西。
+  setSelectValueLossless($('#edProtocol'), p.protocol, canonicalApiValue);
   $('#edProfile').value = p.clientProfile || '';
   $('#edAuth').value = p.auth || '';
   // ⚠ 用了"凭据不在配置里"的鉴权方式时，**自动展开**高级字段。
@@ -425,6 +439,37 @@ function canonicalApiValue(v) {
   if (s === 'anthropic' || s === 'anthropic-messages' || s === 'messages') return 'anthropic-messages';
   if (s === 'openai-responses' || s === 'responses') return 'openai-responses';
   return null;   // 认不出来 → 保留原值
+}
+
+/**
+ * 把一个值安全地塞进 `<select>`，保证**读回来还是同一个值**。
+ *
+ * ⚠ 为什么需要它：`select.value = x` 在 x 不匹配任何 `<option>` 时**静默失败**
+ * —— 值变成空串，用户点一次「保存」就把它抹掉了（"打开抽屉再保存"是最常见的
+ * 数据丢失路径）。两种情形都要兜住：
+ *   · `norm` 能把别名归一到规范值（引擎对同一 wire 的多种拼法）→ 用规范值；
+ *   · 归一不了（用户手写的未知值）→ **临时补一个 option** 让原值能显示、能往返。
+ *
+ * @param {HTMLSelectElement} sel 目标下拉
+ * @param {*} raw 配置里的原始值
+ * @param {(v:*) => string|null} norm 归一函数；返回 null 表示"认不出来"
+ */
+function setSelectValueLossless(sel, raw, norm) {
+  if (!sel) return;
+  const original = String(raw == null ? '' : raw).trim();
+  const canonical = norm ? norm(original) : original;
+  if (canonical !== null && canonical !== undefined) {
+    sel.value = canonical;
+    // 归一后仍不匹配（下拉里没有这个规范值）→ 落到下面的兜底
+    if (sel.value === canonical || !canonical) return;
+  }
+  if (!original) { sel.value = ''; return; }
+  // 兜底：补一个临时 option，让原值能显示且往返不丢
+  const opt = document.createElement('option');
+  opt.value = original;
+  opt.textContent = original + '（未识别，原样保留）';
+  sel.appendChild(opt);
+  sel.value = original;
 }
 
 function modelRow(e) {
