@@ -1164,6 +1164,60 @@ const FREE_CHANNEL_PRESETS = [
     },
   },
   {
+    key: 'workbuddy-cn',
+    name: 'WorkBuddy 国内版（桌面客户端凭据）',
+    baseURL: 'https://copilot.tencent.com/v2',
+    apiKey: '',                       // 凭据从桌面客户端读，不需要 key
+    status: 'verified',
+    statusNote: '端点取自本机**实测可用**的配置（`copilot.tencent.com/v2`）。'
+      + '凭据是桌面 App 的 OAuth token，会过期 —— 网关自动刷新。',
+    what: '腾讯 <b>CodeBuddy / WorkBuddy 国内版</b>桌面客户端的私有接口。'
+      + '不用 API Key：网关直接读桌面 App 已登录的凭据文件，'
+      + '并按需带上身份头（X-User-Id / X-Enterprise-Id / X-Product: SaaS）与桌面形态 UA。',
+    risks: [
+      '需要本机已安装并登录 <b>WorkBuddy 国内版</b>桌面客户端'
+      + '（凭据文件 <code>workbuddy-desktop.info</code>）。没装/没登录时网关会明确报错。',
+      '这是<b>客户端私有接口</b>，不是公开 API —— 上游随时可能改。',
+      '该端点强制 <code>stream:true</code>，且要求 <code>tool_choice</code> 是字符串 —— '
+      + '本预设已自动开好这两个兼容开关（<code>force-stream</code> / <code>stringify-tool-choice</code>）。',
+      '国内端点走<b>直连</b>（网关已内置直连清单），挂代理反而容易失败。',
+      '凭据来自你登录的账号，<b>请勿分享</b>该提供商配置给别人使用。',
+    ],
+    apply: (p) => {
+      p.auth = 'workbuddy';             // ← 走桌面客户端凭据（含自动刷新）
+      p.protocol = 'openai-chat';       // ← 该接口是 OpenAI chat 线格式
+      p.quirks = ['force-stream', 'stringify-tool-choice'];
+      p.headers = { 'X-Product': 'SaaS' };
+    },
+  },
+  {
+    key: 'workbuddy-global',
+    name: 'WorkBuddy 国际版（WorkBuddy AI）',
+    baseURL: 'https://www.workbuddy.ai/v2',
+    apiKey: '',
+    status: 'verified',
+    statusNote: '端点取自本机**实测可用**的配置（`www.workbuddy.ai/v2`）。'
+      + '与国内版是**两套独立账号**，凭据文件也不同（`workbuddy-desktop-ai.info`）。',
+    what: '腾讯 <b>WorkBuddy AI 国际版</b>桌面客户端的私有接口。'
+      + '与国内版同一套适配，只是区域不同 —— 网关按凭据/主机名自动判定区域，'
+      + '并据此选对身份头里的 <code>Origin</code> / <code>Referer</code>。',
+    risks: [
+      '需要本机已安装并登录 <b>WorkBuddy 国际版</b>桌面客户端'
+      + '（凭据文件 <code>workbuddy-desktop-ai.info</code>）。',
+      '<b>与国内版不是同一个账号体系</b> —— 只登录了国内版的话，这条会报"读不到凭据"。',
+      '这是<b>客户端私有接口</b>，不是公开 API。',
+      '该端点强制 <code>stream:true</code>，且要求 <code>tool_choice</code> 是字符串 —— '
+      + '本预设已自动开好这两个兼容开关。',
+      '凭据来自你登录的账号，<b>请勿分享</b>该提供商配置给别人使用。',
+    ],
+    apply: (p) => {
+      p.auth = 'workbuddy';
+      p.protocol = 'openai-chat';
+      p.quirks = ['force-stream', 'stringify-tool-choice'];
+      p.headers = { 'X-Product': 'SaaS' };
+    },
+  },
+  {
     key: 'opencode-go',
     name: 'OpenCode Go 套餐（自带 key）',
     baseURL: 'https://opencode.ai/zen/go',
