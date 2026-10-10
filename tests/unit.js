@@ -262,6 +262,40 @@ t('probe.upstreamBase：与引擎 upstreamBase 规则一致（补 /v1 / 收敛�
   assert.strictEqual(probe.upstreamBase(''), '');
 });
 
+
+t('upstreamBase：引擎与 probe 两份实现必须一致（"函数副本"是本轮反复出问题的模式）', () => {
+  // ⚠ 这条盯的是**同一份逻辑存在两处实现**。
+  //
+  // probe.js（主进程用）与 model-gateway.mjs（引擎子进程用）各有一份 upstreamBase。
+  // 实测（2026-10-09）：给 Codex 加"不补 /v1"的规则时只改了引擎那份，
+  // 于是「测试」按钮把 URL 拼成 /backend-api/codex/v1/responses → 404，
+  // 把一家**能用**的供应商报成失败。
+  //
+  // 这已经是本轮第四次同类漂移（协议白名单 / 凭据免填判断 / auth 白名单 / 本函数）。
+  // 引擎那份没导出，无法直接对拍 —— 所以：
+  //   ① 功能上钉住 probe 的行为；
+  //   ② 源码级断言引擎那份**也**含同一条 codex 规则（防止被单独删掉）。
+  const cases = [
+    ['https://chatgpt.com/backend-api/codex', 'https://chatgpt.com/backend-api/codex'],   // ★ Codex 不补 /v1
+    ['https://a.com', 'https://a.com/v1'],
+    ['https://a.com/', 'https://a.com/v1'],
+    ['https://a.com/v1', 'https://a.com/v1'],
+    ['https://a.com/v2', 'https://a.com/v2'],
+    ['https://a.com/v1/chat/completions', 'https://a.com/v1'],
+    ['', ''],
+  ];
+  for (const [input, want] of cases) {
+    assert.strictEqual(probe.upstreamBase(input), want,
+      'upstreamBase(' + JSON.stringify(input) + ') 应为 ' + JSON.stringify(want));
+  }
+
+  // 源码级：两份都必须含 codex 规则
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'gateway', 'model-gateway.mjs'), 'utf8');
+  const pSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'probe.js'), 'utf8');
+  const GUARD = /\/\\\/codex\$\/i\.test\(b\)/;
+  assert.ok(GUARD.test(src), '引擎的 upstreamBase 应含 codex 规则（/\\/codex$/i.test(b)）');
+  assert.ok(GUARD.test(pSrc), 'probe 的 upstreamBase 应含 codex 规则');
+});
 t('probe.hostInList：裸后缀与点前缀都算命中，不误伤同后缀不同域名', () => {
   assert.strictEqual(probe.hostInList('api.cline.bot', ['cline.bot']), true);
   assert.strictEqual(probe.hostInList('api.cline.bot', ['.cline.bot']), true);
