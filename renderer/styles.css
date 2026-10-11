@@ -285,7 +285,15 @@ select.input { cursor: pointer; }
 /* ================= 抽屉 ================= */
 .drawer-mask { position: fixed; inset: 0; background: rgba(0, 0, 0, .45); z-index: 40; }
 .drawer {
-  position: fixed; top: 0; right: 0; bottom: 0; width: 560px; max-width: 92vw;
+  /* ⚠ 宽度要放得下"模型映射"那张表：上游模型ID / 映射为 / 协议 / 图片 /
+     上下文 / 最大输出 / 超时 / 删除 —— 共 8 列。
+     旧值固定 560px：实测在 2579px 宽的屏上，抽屉只占左边一小条、
+     右边大片空白，而表格里的数字输入框被挤到几乎看不见
+     （用户反馈"这些字段像是空的"—— 其实值在，只是窄到看不清）。
+     改成**随视口自适应**：小屏保底 560px，大屏放宽到 1040px 上限；
+     max-width: 92vw 仍兜住窄窗口，不会盖满整屏。 */
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: clamp(560px, 48vw, 1040px); max-width: 92vw;
   background: var(--panel); border-left: 1px solid var(--border);
   z-index: 41; display: flex; flex-direction: column; box-shadow: var(--shadow);
   animation: slideIn .16s ease;
