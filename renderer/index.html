@@ -22,6 +22,7 @@
         content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; media-src 'none'; manifest-src 'none';" />
   <title>LLM Gateway</title>
   <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="usage.css" />
 </head>
 <body>
   <!-- ============ 顶栏 ============ -->
@@ -96,6 +97,10 @@
       <button class="nav-item" data-view="settings">
         <svg viewBox="0 0 24 24"><path d="M19.14 12.94a7.5 7.5 0 0 0 .06-.94 7.5 7.5 0 0 0-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.62l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.03 7.03 0 0 0-1.63-.94l-.36-2.54a.5.5 0 0 0-.49-.42h-3.84a.5.5 0 0 0-.49.42l-.36 2.54c-.59.24-1.13.56-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L2.68 8.86a.5.5 0 0 0 .12.62l2.03 1.58c-.04.31-.06.62-.06.94s.02.63.06.94l-2.03 1.58a.5.5 0 0 0-.12.62l1.92 3.32c.13.22.39.3.6.22l2.39-.96c.5.38 1.04.7 1.63.94l.36 2.54c.04.24.25.42.49.42h3.84c.24 0 .45-.18.49-.42l.36-2.54c.59-.24 1.13-.56 1.63-.94l2.39.96c.22.08.47 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.62l-2.03-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z"/></svg>
         <span>设置</span>
+      </button>
+      <button class="nav-item" data-view="usage">
+        <svg viewBox="0 0 24 24"><path d="M4 20h16v-2H4v2zM6 16h3V9H6v7zm4.5 0h3V5h-3v11zM15 16h3v-5h-3v5z"/></svg>
+        <span>使用记录</span>
       </button>
       <button class="nav-item" data-view="logs">
         <svg viewBox="0 0 24 24"><path d="M4 4h16v16H4V4zm2 3v2h12V7H6zm0 4v2h12v-2H6zm0 4v2h8v-2H6z"/></svg>
@@ -297,6 +302,9 @@
         </div>
       </section>
 
+      <!-- ---------- 使用记录 ---------- -->
+      <section class="view" id="view-usage"></section>
+
       <!-- ---------- 日志 ---------- -->
       <section class="view" id="view-logs">
         <div class="card fill">
@@ -385,6 +393,7 @@
 
   <script src="js/core.js"></script>
   <script src="js/dashboard.js"></script>
+  <script src="js/usage.js"></script>
   <script src="js/providers.js"></script>
   <script src="js/models.js"></script>
   <script src="js/clients.js"></script>

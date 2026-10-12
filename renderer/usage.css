@@ -1,0 +1,53 @@
+/* 使用记录页（阶段 3）
+ * 只加这一页需要的类，全部用现有 CSS 变量（--panel/--border/--text…），
+ * 这样跟随主题、不引入新的配色体系。 */
+.usage-head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+.usage-range { display: flex; gap: 6px; }
+.usage-head .hint { flex: 1; }
+.usage-empty { padding: 28px; text-align: center; color: var(--muted, #94a3b8); font-size: 13px; }
+
+.usage-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin-bottom: 14px; }
+.usage-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+.usage-card-label { font-size: 12px; color: var(--muted, #94a3b8); margin-bottom: 6px; }
+.usage-card-value { font-size: 24px; font-weight: 600; line-height: 1.2; }
+.usage-card-value.good { color: #10b981; }
+.usage-card-sub { font-size: 12px; color: var(--muted, #94a3b8); margin-top: 6px; }
+
+.usage-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+.usage-panel h3 { margin: 0 0 12px; font-size: 14px; font-weight: 600; }
+
+/* 环形图 + 图例 */
+.usage-donut-wrap { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+.usage-donut { width: 160px; height: 160px; flex: none; }
+.usage-legend { flex: 1; min-width: 240px; display: flex; flex-direction: column; gap: 5px; }
+.usage-legend-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.usage-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.usage-legend-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usage-legend-val { font-variant-numeric: tabular-nums; color: var(--muted, #94a3b8); }
+.usage-legend-pct { font-variant-numeric: tabular-nums; width: 52px; text-align: right; }
+
+/* 趋势图 */
+.usage-lg-row { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; margin-bottom: 6px; }
+.usage-lg { display: inline-flex; align-items: center; gap: 6px; }
+.usage-lg i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.usage-trend { width: 100%; height: 220px; display: block; }
+.usage-axis { font-size: 10px; fill: var(--muted, #94a3b8); }
+.usage-axis-r { text-anchor: start; }
+
+/* 表格 */
+.usage-scroll { overflow-x: auto; }
+.usage-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.usage-table th { text-align: left; font-weight: 500; color: var(--muted, #94a3b8); padding: 7px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.usage-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.usage-table tr:last-child td { border-bottom: none; }
+.usage-num { text-align: right; font-variant-numeric: tabular-nums; }
+.usage-mono { font-family: ui-monospace, Consolas, monospace; }
+.usage-t { color: var(--muted, #94a3b8); }
+.usage-badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; }
+.usage-badge.ok { background: rgba(16, 185, 129, .14); color: #10b981; }
+.usage-badge.bad { background: rgba(239, 68, 68, .14); color: #ef4444; }
+
+/* 明细筛选 */
+.usage-filters { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.usage-filter { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted, #94a3b8); }
+.usage-filter .input { min-width: 130px; }
