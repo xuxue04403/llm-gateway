@@ -17,6 +17,7 @@ const os = require('os');
 const path = require('path');
 
 const { resolveDataDir, importGatewayConfig } = require('./datadir');
+const { summarize } = require('./usage');   // 使用记录聚合（阶段 2）
 const { Logger, registerSecret, scrubDeepSecrets } = require('./logger');
 const { Settings } = require('./settings');
 const { GatewayManager, validateConfigText } = require('./gateway-manager');
@@ -533,6 +534,32 @@ function registerIpc() {
   });
 
   handle('gw:validate', (_e, text) => validateConfigText(String(text == null ? '' : text)));
+
+  /**
+   * 使用记录（阶段 2）：聚合 `<data>/logs/usage/*.jsonl`。
+   *
+   * 聚合本身是**纯读 + 纯计算**（见 src/usage.js），不碰引擎、不碰网络 ——
+   * 所以网关没运行时也能看历史记录（用户排查时正需要这个）。
+   */
+  handle('gw:usage', (_e, opts) => {
+    try {
+      const o = opts && typeof opts === 'object' ? opts : {};
+      const days = Math.min(365, Math.max(1, Number(o.days) || 30));
+      return summarize(path.join(dataDir, 'logs'), {
+        days,
+        detailLimit: o.detailLimit,
+        filter: o.filter && typeof o.filter === 'object' ? o.filter : null,
+      });
+    } catch (e) {
+      // 读不到/算不出都不该让界面白屏 —— 回一个空结果 + 原因
+      return {
+        error: (e && e.message) || String(e),
+        days: 30, totalRows: 0, rows: 0,
+        totals: null, byDay: [], byModel: [], byProvider: [], byEndpoint: [],
+        detail: [], options: { models: [], providers: [], endpoints: [], statuses: [] },
+      };
+    }
+  });
 
   handle('gw:health', async () => {
     if (!gateway.running) return { ok: false, error: '网关未运行' };

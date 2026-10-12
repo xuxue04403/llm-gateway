@@ -394,6 +394,68 @@ const OK_CFG = {
   providers: [{ id: 'a', baseURL: 'https://a.com/v1', apiKey: 'k', models: ['m'] }],
 };
 
+
+t('用量聚合：范围过滤 / 各维度统计 / 缓存命中率 / 明细倒序 / 筛选', () => {
+  // ⚠ 这条盯的是「使用记录」页的数据正确性。最容易错的三个点：
+  //   ① 两种协议的 input 语义不同（引擎已归一化，聚合**不能**再判协议）；
+  //   ② 缓存命中率的分母是「总输入 = 非缓存 + 缓存读 + 缓存写」；
+  //   ③ 筛选项要用**未过滤**的全量算，否则选了一个就看不到别的了。
+  const fs2 = require('node:fs');
+  const os2 = require('node:os');
+  const path2 = require('node:path');
+  const u = require('../src/usage');
+  const tmp = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'usaget-'));
+  const dir = path2.join(tmp, 'usage');
+  fs2.mkdirSync(dir, { recursive: true });
+  const now = Date.now();
+  const day = (n) => now - n * 86400_000;
+  const rows = [
+    { ts: day(0), model: 'A', provider: 'p1', endpoint: '/messages', status: 'ok', stream: 1, durMs: 1000, ttfbMs: 500, inTok: 100, outTok: 50, cacheRead: 900, cacheWrite: 0 },
+    { ts: day(0) + 1000, model: 'A', provider: 'p1', endpoint: '/messages', status: 'ok', stream: 0, durMs: 2000, ttfbMs: 800, inTok: 200, outTok: 60, cacheRead: 800, cacheWrite: 100 },
+    { ts: day(0) + 2000, model: 'B', provider: 'p2', endpoint: '/chat/completions', status: 'fail:400', stream: 0, durMs: 50, ttfbMs: 0, inTok: 0, outTok: 0, cacheRead: 0, cacheWrite: 0 },
+    { ts: day(1), model: 'B', provider: 'p2', endpoint: '/chat/completions', status: 'ok', stream: 1, durMs: 3000, ttfbMs: 1000, inTok: 300, outTok: 70, cacheRead: 0, cacheWrite: 0 },
+    { ts: day(1) + 1000, model: 'A', provider: 'p2', endpoint: '/messages', status: 'ok', stream: 0, durMs: 4000, ttfbMs: 0, inTok: 400, outTok: 80, cacheRead: 400, cacheWrite: 0 },
+    { ts: day(40), model: 'OLD', provider: 'p9', endpoint: '/messages', status: 'ok', stream: 0, durMs: 1, ttfbMs: 1, inTok: 9999, outTok: 9999, cacheRead: 0, cacheWrite: 0 },
+  ];
+  const byFile = new Map();
+  for (const r of rows) {
+    const k = u.dayKey(r.ts);
+    if (!byFile.has(k)) byFile.set(k, []);
+    byFile.get(k).push(r);
+  }
+  for (const [k, list] of byFile) {
+    fs2.writeFileSync(path2.join(dir, k + '.jsonl'), list.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8');
+  }
+  // 半截行（引擎正在写）—— 必须被安全跳过，不能让整页算不出来
+  fs2.appendFileSync(path2.join(dir, u.dayKey(now) + '.jsonl'), '{"ts":123,"model":"HALF"', 'utf8');
+
+  const r = u.summarize(tmp, { days: 30, detailLimit: 10 });
+  assert.strictEqual(r.totalRows, 5, '40 天前的应被排除、半截行应被跳过');
+  assert.strictEqual(r.byDay.length, 2, '应分 2 天');
+  assert.strictEqual(r.totals.requests, 5);
+  assert.strictEqual(r.totals.ok, 4);
+  assert.strictEqual(r.totals.fail, 1);
+  assert.strictEqual(r.totals.inTok, 1000, '非缓存输入');
+  assert.strictEqual(r.totals.outTok, 260);
+  assert.strictEqual(r.totals.cacheRead, 2100);
+  assert.strictEqual(r.totals.cacheWrite, 100);
+  assert.strictEqual(r.totals.totalIn, 3200, '总输入 = 非缓存 + 缓存读 + 缓存写');
+  assert.strictEqual(r.totals.totalTok, 3460);
+  assert.strictEqual(r.totals.avgDurMs, 2010);
+  assert.strictEqual(r.totals.avgTtfbMs, 767, '平均 ttfb 只算有值的（0 不计入）');
+  assert.ok(Math.abs(r.totals.cacheHitRate - 2100 / 3200) < 1e-9, '缓存命中率 = 缓存读 / 总输入');
+  assert.strictEqual(r.detail.length, 5);
+  assert.strictEqual(r.detail[0].model, 'B', '明细应倒序（最近在前）');
+  assert.strictEqual(r.byProvider.length, 2, '按供应商维度（本功能额外要求）');
+  assert.strictEqual(r.byProvider.find((x) => x.provider === 'p2').fail, 1);
+
+  const r2 = u.summarize(tmp, { days: 30, filter: { provider: 'p2' } });
+  assert.strictEqual(r2.totals.requests, 3, '过滤后只算 p2');
+  assert.ok(r2.options.providers.includes('p1'), '筛选项要用未过滤全量算（否则选一个就看不到别的）');
+
+  fs2.rmSync(tmp, { recursive: true, force: true });
+});
+
 t('validateConfigText：合法配置通过', () => {
   const r = validateConfigText(JSON.stringify(OK_CFG));
   assert.strictEqual(r.ok, true, r.error);

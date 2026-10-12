@@ -4597,7 +4597,16 @@ function usageFromTail(text) {
     if ('prompt_tokens' in u) out.inTok = num(u.prompt_tokens);
     if ('completion_tokens' in u) out.outTok = num(u.completion_tokens);
     const d = u.prompt_tokens_details || u.input_tokens_details;
-    if (d && typeof d === 'object' && 'cached_tokens' in d) out.cacheRead = num(d.cached_tokens);
+    if (d && typeof d === 'object' && 'cached_tokens' in d) {
+      // ⚠ **两种协议的 input 语义不同，必须归一化**，否则统计会重复计数：
+      //   · Anthropic：`input_tokens` **不含**缓存读/写（cache_read / cache_creation 是额外的）
+      //   · OpenAI   ：`prompt_tokens` **含**缓存命中（cached_tokens 是它的子集）
+      // 统一成 Anthropic 语义（inTok = 非缓存输入），这样：
+      //   总输入 = inTok + cacheRead + cacheWrite —— 两边一致，缓存命中率也算得对。
+      const cached = num(d.cached_tokens);
+      out.cacheRead = cached;
+      out.inTok = Math.max(0, out.inTok - cached);
+    }
     if ('cache_write_tokens' in u) out.cacheWrite = num(u.cache_write_tokens);
   }
   return seen ? out : out;

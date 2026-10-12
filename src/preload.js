@@ -20,6 +20,8 @@ contextBridge.exposeInMainWorld('lgw', {
   gwSaveConfig: (text) => ipcRenderer.invoke('gw:save-config', text),
   gwValidate: (text) => ipcRenderer.invoke('gw:validate', text),
   gwHealth: () => ipcRenderer.invoke('gw:health'),
+  // 使用记录（阶段 2）：聚合用量 JSONL。纯读本地文件，网关没运行也能看历史。
+  gwUsage: (opts) => ipcRenderer.invoke('gw:usage', opts),
   gwTestProviders: (ids) => ipcRenderer.invoke('gw:test-providers', ids),
   gwFetchCatalog: (provider) => ipcRenderer.invoke('gw:fetch-catalog', provider),
   // 一键获取全部模型：连参数一起补全（上下文 / 图片 / 超时）+ 自动映射短名
