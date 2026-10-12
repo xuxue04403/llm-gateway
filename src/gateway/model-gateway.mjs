@@ -4475,6 +4475,134 @@ function writeBlockedDump(provider, status, body) {
  *                        按 status 回复客户端（旧版把 400/404 也当"可切换"，同一个错误请求被
  *                        原样重发给每一家供应商 = N 倍计费 + N 倍风控）。
  */
+/* ================= 用量记录（2026-10-12，使用记录页的数据基础） =================
+ *
+ * 背景：引擎**一直**在解析 token（45 处，为了翻译给客户端），但**用完即弃** ——
+ * `[call]` 日志只有 model/provider/状态/耗时，`[decode]` 只有输出 token 数。
+ * 于是"每日调用统计 / 按供应商统计 / 缓存命中率"一个都算不出来。
+ *
+ * 现在每次调用收尾追加一行 JSONL 到 `<logs>/usage/YYYY-MM-DD.jsonl`，按天分文件。
+ * 刻意**只记 token、不记费用**（用户选择：不算钱，省掉价格表的维护）。
+ *
+ * 两条硬约束：
+ *   ① **绝不能影响转发**：任何异常都被吞掉（统计是旁路，不是关键路径）；
+ *   ② 只记**结构化的数字**，不记请求/响应正文（体积可控，也不碰隐私）。
+ */
+const USAGE_KEEP_DAYS = 30;
+
+function usageDir() {
+  return process.env.DSH_GATEWAY_USAGE_DIR || path.join(path.dirname(LOG_PATH), 'usage');
+}
+
+/** 当天的用量文件路径（本地日期，与用户看的"每天"一致） */
+function usageFileFor(ts) {
+  const d = new Date(ts);
+  const day = d.getFullYear() + '-'
+    + String(d.getMonth() + 1).padStart(2, '0') + '-'
+    + String(d.getDate()).padStart(2, '0');
+  return path.join(usageDir(), day + '.jsonl');
+}
+
+/** 清理超过保留期的用量文件。按**文件名里的日期**判断，不依赖 mtime。 */
+function pruneUsageFiles() {
+  try {
+    const cutoff = Date.now() - USAGE_KEEP_DAYS * 86400_000;
+    for (const f of fs.readdirSync(usageDir())) {
+      const m = /^(\d{4})-(\d{2})-(\d{2})\.jsonl$/.exec(f);
+      if (!m) continue;
+      const t = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime();
+      if (t < cutoff) { try { fs.unlinkSync(path.join(usageDir(), f)); } catch { /* 忽略 */ } }
+    }
+  } catch { /* 目录不存在等：忽略 */ }
+}
+
+let usagePrunedAt = 0;
+
+/**
+ * 记一次调用。**失败绝不影响服务** —— 整个函数体在 try 里。
+ * @param {object} rec {ts, model, provider, endpoint, status, stream, durMs, ttfbMs,
+ *                      inTok, outTok, cacheRead, cacheWrite}
+ */
+function recordUsage(rec) {
+  try {
+    if (!rec || !rec.model) return;
+    const ts = rec.ts || Date.now();
+    fs.mkdirSync(usageDir(), { recursive: true });
+    // 字段顺序固定，便于人工 grep；缺省补 0，前端不用到处判 undefined
+    const row = {
+      ts,
+      model: String(rec.model),
+      provider: String(rec.provider || ''),
+      endpoint: String(rec.endpoint || ''),
+      status: String(rec.status || ''),
+      stream: rec.stream ? 1 : 0,
+      durMs: Math.max(0, Math.round(rec.durMs || 0)),
+      ttfbMs: Math.max(0, Math.round(rec.ttfbMs || 0)),
+      inTok: Math.max(0, Math.round(rec.inTok || 0)),
+      outTok: Math.max(0, Math.round(rec.outTok || 0)),
+      cacheRead: Math.max(0, Math.round(rec.cacheRead || 0)),
+      cacheWrite: Math.max(0, Math.round(rec.cacheWrite || 0)),
+    };
+    fs.appendFileSync(usageFileFor(ts), JSON.stringify(row) + '\n', 'utf8');
+    // 每天最多清一次（readdir 不该每请求都跑）
+    if (Date.now() - usagePrunedAt > 86400_000) { usagePrunedAt = Date.now(); pruneUsageFiles(); }
+  } catch { /* 旁路：统计失败不影响转发 */ }
+}
+
+/**
+ * 从**响应尾部窗口**里取用量（直通路径用）。
+ *
+ * 为什么从尾部取：SSE 的 usage 出现在**收尾帧**（anthropic 的 `message_delta`、
+ * chat 的 `choices:[] + usage`），而直通路径本来就是字节透明的、不解析整个响应 ——
+ * 但为了截断检测已经在滚一个 8KB 尾部窗口（见 `tail`），**顺带解析它零额外成本**。
+ *
+ * 取**最后一次**出现的 usage：流式里可能有多帧带 usage（前面增量、最后总计）。
+ * 两种协议形状都认。
+ */
+function usageFromTail(text) {
+  const out = { inTok: 0, outTok: 0, cacheRead: 0, cacheWrite: 0 };
+  if (!text) return out;
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  let idx = 0;
+  let seen = 0;
+  for (;;) {
+    const at = text.indexOf('"usage"', idx);
+    if (at < 0) break;
+    const open = text.indexOf('{', at);
+    if (open < 0) break;
+    // 花括号配对取出这个对象（一层深度计数，够用且便宜）
+    let depth = 0; let end = -1;
+    for (let i = open; i < text.length; i++) {
+      const c = text[i];
+      if (c === '{') depth++;
+      else if (c === '}') { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end < 0) break;                       // 尾部被截断：这一帧不完整，放弃
+    idx = end + 1;
+    let u = null;
+    try { u = JSON.parse(text.slice(open, end + 1)); } catch { continue; }
+    if (!u || typeof u !== 'object') continue;
+    seen++;
+    // ⚠ **逐字段**取"最后一次出现的值"，不是"取最后一个 usage 对象"。
+    //
+    // 实测踩到：anthropic 流式的 `input_tokens` 在**首帧** message_start、
+    // `output_tokens` 在**尾帧** message_delta —— 只取最后一个对象会把输入 token
+    // 和缓存读**全丢成 0**（单元测试当场抓到）。
+    // 判据用"键是否存在"而不是"值是否非 0"：上游明确回 0 时要如实采信。
+    if ('input_tokens' in u) out.inTok = num(u.input_tokens);
+    if ('output_tokens' in u) out.outTok = num(u.output_tokens);
+    if ('cache_read_input_tokens' in u) out.cacheRead = num(u.cache_read_input_tokens);
+    if ('cache_creation_input_tokens' in u) out.cacheWrite = num(u.cache_creation_input_tokens);
+    // OpenAI chat 形状
+    if ('prompt_tokens' in u) out.inTok = num(u.prompt_tokens);
+    if ('completion_tokens' in u) out.outTok = num(u.completion_tokens);
+    const d = u.prompt_tokens_details || u.input_tokens_details;
+    if (d && typeof d === 'object' && 'cached_tokens' in d) out.cacheRead = num(d.cached_tokens);
+    if ('cache_write_tokens' in u) out.cacheWrite = num(u.cache_write_tokens);
+  }
+  return seen ? out : out;
+}
+
 async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts) {
   const responsesMode = !!(opts && opts.responses);
   // raw 模式（Responses 资源子路由 GET/DELETE/cancel）：无请求体、不做协议翻译、方法可变，
@@ -5340,6 +5468,23 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
   try {
     res.end();
   } catch { }
+  // 用量落盘（2026-10-12）：直通路径是字节透明的、不解析整个响应，
+  // 但为了截断检测已经滚了 8KB 尾部窗口 —— 顺带把 usage 取出来记账，零额外成本。
+  // 放在 `res.end()` **之后**：记账不能挡在客户端前面。
+  try {
+    const u = usageFromTail(tail);
+    recordUsage({
+      ts: startedAt,
+      model: (body && body.model) || '',
+      provider: provider.id,
+      endpoint: upstreamPath,
+      status: truncated ? 'truncated' : 'ok',
+      stream: isSseStream(),
+      durMs: Date.now() - startedAt,
+      ttfbMs: meter && meter.firstByteAt ? meter.firstByteAt - startedAt : 0,
+      inTok: u.inTok, outTok: u.outTok, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite,
+    });
+  } catch { /* 旁路：统计失败不影响转发 */ }
   return truncated ? 'truncated' : true;
 }
 

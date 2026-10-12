@@ -254,6 +254,14 @@ const DECLARED = [
   { name: 'LOADED_CFG', why: '新增：模块级配置引用。加载配置时的 const cfg 是**函数内局部变量**，模块级辅助函数拿不到；客户端仿真头需要 cfg（claudeClientHeaders 要用 clientVersions 覆盖版本号）。直接写 cfg 会抛 ReferenceError: cfg is not defined，且异常被上层吞掉 → 表现为"分支进了、什么都没发生、客户端拿到 400"' },
   { name: 'clientSimulationProviders', why: '新增："该家需要客户端身份仿真"的学习标记（与 thinkingPassbackProviders 同一套模式）。实测 agentrouter 按**请求头指纹**准入：默认 Node/Chrome/curl/python → 401 unauthorized client detected；Claude Code 头/Codex 头 → 200 通过。旧实现只熔断并写"无法伪装指纹，这是已知上限"—— 对这类家是错的' },
   { name: 'retryWithClientSimulation', why: '新增：指纹被拒时换 Claude Code 身份仿真重试一次（照 retryWithoutThinking 的模式：先学习、再重试；只改仿真身份头，认证头保持）' },
+  { name: 'writeBlockedDump', why: '改（连带）：在其附近插入了用量记录模块，块指纹变化' },
+  { name: 'USAGE_KEEP_DAYS', why: '新增：用量文件保留 30 天（用户选择 C）。按文件名里的日期清理，不依赖 mtime' },
+  { name: 'usageDir', why: '新增：用量目录（<logs>/usage，可用 DSH_GATEWAY_USAGE_DIR 覆盖）' },
+  { name: 'usageFileFor', why: '新增：当天用量文件路径 YYYY-MM-DD.jsonl（本地日期，与用户看的"每天"一致）' },
+  { name: 'pruneUsageFiles', why: '新增：清理超期用量文件（按文件名日期判断）' },
+  { name: 'usagePrunedAt', why: '新增：清理节流（每天最多 readdir 一次，不该每请求都跑）' },
+  { name: 'recordUsage', why: '新增：每次调用收尾追加一行 JSONL。**整个函数体在 try 里** —— 统计是旁路，失败绝不影响转发。只记结构化数字，不记请求/响应正文' },
+  { name: 'usageFromTail', why: '新增：从 8KB 尾部窗口提取用量（直通路径用）。直通是字节透明的、不解析整个响应，但为截断检测已滚了尾部窗口 → 顺带解析零额外成本。⚠ 必须**逐字段**取最后一次出现的值，不能"取最后一个 usage 对象"：anthropic 的 input_tokens 在首帧 message_start、output_tokens 在尾帧 message_delta，只取最后一个会把输入 token 与缓存读全丢成 0（单元测试当场抓到）' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */
