@@ -17,7 +17,7 @@ const os = require('os');
 const path = require('path');
 
 const { resolveDataDir, importGatewayConfig } = require('./datadir');
-const { summarize } = require('./usage');   // 使用记录聚合（阶段 2）
+const { summarizeAsync } = require('./usage');   // 使用记录聚合（阶段 2，异步切片版）
 const { Logger, registerSecret, scrubDeepSecrets } = require('./logger');
 const { Settings } = require('./settings');
 const { GatewayManager, validateConfigText } = require('./gateway-manager');
@@ -540,12 +540,16 @@ function registerIpc() {
    *
    * 聚合本身是**纯读 + 纯计算**（见 src/usage.js），不碰引擎、不碰网络 ——
    * 所以网关没运行时也能看历史记录（用户排查时正需要这个）。
+   *
+   * ⚠ 用**异步切片**版（2026-10-13 审计后修）：同步版在主进程里会被长冻结
+   *（实测 150 万行 2624ms，期间窗口/托盘/菜单全部无响应）。
+   * `summarizeAsync` 与同步版共用同一个累加器，结果一致，但会定期让出事件循环。
    */
-  handle('gw:usage', (_e, opts) => {
+  handle('gw:usage', async (_e, opts) => {
     try {
       const o = opts && typeof opts === 'object' ? opts : {};
       const days = Math.min(365, Math.max(1, Number(o.days) || 30));
-      return summarize(path.join(dataDir, 'logs'), {
+      return await summarizeAsync(path.join(dataDir, 'logs'), {
         days,
         detailLimit: o.detailLimit,
         filter: o.filter && typeof o.filter === 'object' ? o.filter : null,

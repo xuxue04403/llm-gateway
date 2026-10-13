@@ -1383,4 +1383,77 @@ t('describeExitCode：把退出码翻译成可归因的结论（区分"被强杀
 });
 
 
+t('用量聚合（异步切片）：与同步结果一致 / 明细有界且按 ts 取最新 / 确实让出事件循环', async () => {
+  // 来自 2026-10-13 审计的遗留项：summarize() 是同步的，跑在主进程 IPC 里，
+  // 实测 150 万行最长停顿 1427ms（界面整个冻住）。异步切片版把它降到 ~17ms。
+  // 这条用例钉住三件事，缺一不可：
+  //   ① 两条路径结果**完全一致**（否则"界面不卡了但数字变了"更糟）；
+  //   ② 明细的**有界缓冲**取的是"最新的 N 条"（新实现边喂边压，不再留全量）；
+  //   ③ 异步版**确实**让出了事件循环 —— 数 setImmediate 次数，比计时稳定。
+  const fs2 = require('node:fs');
+  const os2 = require('node:os');
+  const path2 = require('node:path');
+  const u = require('../src/usage');
+  const tmp = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'usage-async-'));
+  const dir = path2.join(tmp, 'usage');
+  fs2.mkdirSync(dir, { recursive: true });
+
+  const now = Date.now();
+  const rows = [];
+  for (let d = 0; d < 3; d++) {
+    for (let i = 0; i < 80; i++) {
+      rows.push({
+        ts: now - d * 86400000 - i * 1000,
+        model: i % 2 ? 'A' : 'B', provider: 'p' + (i % 3), endpoint: '/messages',
+        status: i % 7 === 0 ? 'fail:400' : 'ok', stream: i & 1,
+        durMs: 10 + i, ttfbMs: i % 2 ? 5 : 0,
+        inTok: i, outTok: i * 2, cacheRead: i * 3, cacheWrite: 0,
+      });
+    }
+  }
+  // ⚠ 故意**打乱文件内的落盘顺序**：引擎的 ts 用的是请求 startAt，
+  // 长请求会"晚落盘但 ts 更早"，所以明细必须按 ts 排序、不能依赖落盘顺序。
+  const byDay = new Map();
+  for (const r of rows) { const k = u.dayKey(r.ts); if (!byDay.has(k)) byDay.set(k, []); byDay.get(k).push(r); }
+  for (const [k, list] of byDay) {
+    const shuffled = list.slice().sort(() => (Math.random() < 0.5 ? -1 : 1));
+    fs2.writeFileSync(path2.join(dir, k + '.jsonl'), shuffled.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8');
+  }
+  fs2.appendFileSync(path2.join(dir, u.dayKey(now) + '.jsonl'), '{"ts":1,"model":"HALF"', 'utf8');
+
+  const strip = (o) => { const c = JSON.parse(JSON.stringify(o)); delete c.generatedAt; return c; };
+  const opts = { days: 30, detailLimit: 25 };
+
+  // ① 等价性
+  const sync = u.summarize(tmp, opts);
+  const asyn = await u.summarizeAsync(tmp, opts);
+  assert.deepStrictEqual(strip(asyn), strip(sync), '异步切片版与同步版结果必须完全一致');
+  assert.strictEqual(sync.totalRows, rows.length, '半截行应被跳过；应统计到 ' + rows.length + ' 行');
+
+  // ② 明细：取最新的 detailLimit 条，且按 ts 倒序
+  assert.strictEqual(sync.detail.length, 25, '明细条数应等于 detailLimit');
+  for (let i = 1; i < sync.detail.length; i++) {
+    assert.ok(sync.detail[i - 1].ts >= sync.detail[i].ts, '明细必须按 ts 倒序（与落盘顺序无关）');
+  }
+  const maxTs = Math.max(...rows.map((r) => r.ts));
+  assert.strictEqual(sync.detail[0].ts, maxTs, '明细首条应是 ts 最大的那条');
+
+  // ③ 有界缓冲：把 detailLimit 压到 3（远小于行数），结果仍必须是"最新的 3 条"
+  const small = u.summarize(tmp, { days: 30, detailLimit: 3 });
+  assert.strictEqual(small.detail.length, 3);
+  assert.deepStrictEqual(small.detail.map((d) => d.ts), sync.detail.slice(0, 3).map((d) => d.ts),
+    'detailLimit 变化时应始终取"最新的那几条"（有界缓冲的压缩不能丢新数据）');
+
+  // ④ 机制证据：异步版确实多次让出事件循环
+  let yields = 0;
+  const origImmediate = global.setImmediate;
+  global.setImmediate = function patched(fn, ...rest) { yields++; return origImmediate.call(global, fn, ...rest); };
+  try {
+    await u.summarizeAsync(tmp, { days: 30, detailLimit: 5 }, 200);
+  } finally { global.setImmediate = origImmediate; }
+  assert.ok(yields >= 2, '异步版应多次让出事件循环（实际 ' + yields + ' 次）—— 没有它界面照样会冻');
+
+  fs2.rmSync(tmp, { recursive: true, force: true });
+});
+
 run();
