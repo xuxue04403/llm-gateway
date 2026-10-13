@@ -873,11 +873,13 @@ class GatewayManager extends EventEmitter {
       const sig = signal ? '，signal=' + signal : '，signal=无';
       this.log('网关已退出（退出码 ' + code + sig + '）：' + describeExitCode(code) + '；触发方=' + why);
       if (!this.stopping && !this._appQuitting) {
-        // 非预期退出时，额外记录"现场"：父进程是否还活着、是否有别的实例在抢端口。
-        // 这两条能直接分辨"整个应用被杀"与"只有引擎被杀"。
-        this.log('网关非预期退出的现场：父进程(本应用)存活=' + (process.pid > 0)
-          + '，本应用 PID=' + process.pid
-          + '，端口 ' + this.port + ' 当前占用探测=' + (await this._portBusyQuick()));
+        // 非预期退出时，额外记录"现场"。
+        // ⚠ 别在这里写"父进程是否存活"之类的判断 —— 这个回调**运行在主进程里**，
+        // 能执行到这里就说明主进程活着，写出来恒为 true，只会误导排查（审计 2026-10-13 复核修正）。
+        // 真正有用的是：本应用 PID（供用户在任务管理器里核对"整个应用是否还在"）与端口占用。
+        this.log('网关非预期退出的现场：本应用 PID=' + process.pid
+          + '，端口 ' + this.port + ' 占用探测=' + (await this._portBusyQuick())
+          + '，10 分钟内自愈次数=' + (this._healTimes ? this._healTimes.length : 0));
       }
       this.emit('state');
       if (!this.stopping) this._scheduleHeal(code);

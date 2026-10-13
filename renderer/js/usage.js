@@ -193,6 +193,13 @@
   LG.renders.usage = function renderUsage() {
     const el = document.getElementById('view-usage');
     if (!el) return;
+    // ⚠ 必须先挡"视图未激活且无数据"的情况（2026-10-13 审计发现）：
+    // core.js 的 renderAll() 会**遍历调用所有** LG.renders.*，而它在应用启动与
+    // 每次状态广播时都会跑 —— 没有这道闸，每次启动都会在主进程**同步聚合**一次用量
+    //（summarize 是纯同步实现，数据量大时会冻结界面，见 src/usage.js 的量测注释）。
+    // 这里直接 return：等用户真正切到本页时 switchView 会再调 renderUsage，
+    // 下面的自动加载逻辑照常生效 —— 恢复"按需聚合"的本来设计。
+    if (!state.data && !state.loading && !state.err && !el.classList.contains('active')) return;
     const d = state.data;
 
     // ⚠ 首次进入时**自动拉取**。

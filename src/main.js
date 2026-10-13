@@ -1205,18 +1205,24 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
  *   · 有「子进程异常退出（非网关）」→ 某个渲染/GPU/工具进程先死
  * ------------------------------------------------------------------ */
 
-// 主进程 JS 层未捕获的错误：有堆栈，能直接定位（旧实现完全没记，会静默退出）
-process.on('uncaughtException', (err) => {
+// 主进程 JS 层未捕获的错误。
+// ⚠ 注册处理器会**取代** Node 的默认行为（崩溃退出）—— 若只是 log 然后继续跑，
+// 进程可能带着损坏状态运行，比崩溃更糟（审计 2026-10-13 复核修正：旧版这里
+// 注释写"这会导致应用退出"，恰好写反了）。
+// 所以这里：记下完整堆栈 → **显式退出 1**。退出语义与旧行为一致，但多了可归因的日志；
+// process.on('exit') 会随之以 code=1 记为「非预期」，归因链完整。
+let _crashExiting = false;
+function crashAfterLog(label, err) {
+  if (_crashExiting) return;
+  _crashExiting = true;
   try {
-    logger.error('主进程捕获到未处理异常（这会导致应用退出）：' + (err && err.stack ? err.stack : String(err)));
-  } catch (_) { /* 忽略 */ }
-});
-process.on('unhandledRejection', (reason) => {
-  try {
-    logger.error('主进程捕获到未处理的 Promise 拒绝：'
-      + (reason && reason.stack ? reason.stack : String(reason)));
-  } catch (_) { /* 忽略 */ }
-});
+    logger.error(label + (err && err.stack ? err.stack : String(err)));
+  } catch (_) { /* 日志器不可用也要继续退出，不能吞掉崩溃 */ }
+  // 留 300ms 让异步日志落盘，然后按"崩溃"语义退出
+  setTimeout(() => app.exit(1), 300).unref?.();
+}
+process.on('uncaughtException', (err) => crashAfterLog('主进程未捕获异常（按崩溃处理，退出码 1）：', err));
+process.on('unhandledRejection', (reason) => crashAfterLog('主进程未处理的 Promise 拒绝（按崩溃处理，退出码 1）：', reason));
 
 // ⚠ 这是**同步**钩子：只能做同步日志，不能 await。
 // 它会在正常退出与 process.exit() 时触发；被 taskkill /F 强杀时**不会**触发 ——
@@ -1228,14 +1234,20 @@ process.on('exit', (code) => {
   } catch (_) { /* 忽略 */ }
 });
 
-// Electron 的所有子进程（渲染/GPU/工具）死亡都会到这里 —— 比只监听单个 webContents 更全
+// Electron 的所有子进程（渲染/GPU/工具）死亡都会到这里 —— 比只监听单个 webContents 更全。
+// ⚠ 正常退出时子进程也会死（reason=killed），若一律记 ERROR，每次退出都制造一串假警报
+//（审计 2026-10-13 复核修正）：退出中记 INFO，其余才 ERROR。
 app.on('child-process-gone', (_e, details) => {
   try {
     const d = details || {};
-    logger.error('子进程退出：type=' + d.type + ' reason=' + d.reason
+    const quitting = teardownStarted || allowQuit;
+    const note = d.reason === 'killed'
+      ? 'reason=killed 表示**被外部杀死**（不是崩溃，也不是内存不足）'
+      : 'reason=' + d.reason;
+    const line = '子进程退出：type=' + d.type + ' reason=' + d.reason
       + ' exitCode=' + d.exitCode + (d.serviceName ? ' service=' + d.serviceName : '')
-      + '｜' + (d.reason === 'killed'
-        ? 'reason=killed 表示**被外部杀死**（不是崩溃，也不是内存不足）'
-        : 'reason=' + d.reason));
+      + '｜' + note + (quitting ? '（应用退出中，预期内）' : '');
+    if (quitting) logger.info(line);
+    else logger.error(line);
   } catch (_) { /* 忽略 */ }
 });
