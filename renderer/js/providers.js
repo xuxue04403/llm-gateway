@@ -572,12 +572,18 @@ function openModelPicker(fetched, probeProvider) {
       <span class="mono">${esc(unknownList.slice(0, 6).join('、'))}${unknownList.length > 6 ? ' 等' : ''}</span>
       —— 这些留空由你决定，本程序不会替你编一个数字。</p>` : ''}
     <div class="row-inline" style="margin:10px 0;gap:8px;flex-wrap:wrap">
+      <input type="search" class="input search" id="mpSearch" placeholder="搜索模型名…" style="width:200px"
+        title="按「上游模型 ID」或「映射为」的名字过滤，不区分大小写" />
       <button class="btn btn-sm" data-sel="all">全选</button>
       <button class="btn btn-sm" data-sel="none">全不选</button>
       <button class="btn btn-sm" data-sel="known">只留有参数的</button>
       <span class="spacer" style="flex:1"></span>
       <span class="hint" data-count></span>
     </div>
+    <div class="hint" data-filterhint hidden style="margin:-4px 0 8px">
+      筛选生效中：上面的「全选 / 全不选 / 只留有参数的」只作用于<b>匹配的行</b>，不影响其它已勾选的行。
+    </div>
+    <div class="hint" data-empty hidden style="padding:14px 0">没有匹配的模型 —— 换个关键字，或清空搜索框。</div>
     <div class="table-wrap" style="max-height:320px">
       <table class="tbl">
         <thead><tr>
@@ -622,28 +628,71 @@ function openModelPicker(fetched, probeProvider) {
       const token = {};
       livePickerToken = token;
       const isLive = () => livePickerToken === token;
+
+      // ── 行句柄与检索（2026-10-13 加）──────────────────────────────────
+      // 行只取一次：目录可达数百条（cline 实测 464），筛选**只切 `hidden`、不重建 innerHTML** ——
+      // 勾选状态与 change 监听都挂在现有 DOM 上，重建会让它们全部丢失。
+      const allTr = $$('#modalBody tbody tr');
+      const rowOf = (tr) => rows[Number(tr.dataset.i)];
+      const searchEl = $('#modalBody #mpSearch');
+      let shownCount = allTr.length;
+      const filterActive = () => !!(searchEl && String(searchEl.value || '').trim());
+      // 筛选时"全选/全不选/只留有参数的"只作用于**可见行** ——
+      // 用户搜到 5 条然后点"全选"，期望的是"把这 5 条选上"，而不是把另外 454 条也选上。
+      const targets = () => (filterActive() ? allTr.filter((tr) => !tr.hidden) : allTr);
+
       const sync = () => {
         if (!isLive()) return;
-        const n = $$('#modalBody tbody tr').filter((tr) => tr.querySelector('[data-keep]').checked).length;
+        const n = allTr.filter((tr) => tr.querySelector('[data-keep]').checked).length;
         const cnt = $('#modalBody [data-count]');
-        if (cnt) cnt.textContent = `已选 ${n} / ${rows.length}`;
+        // 筛选中要把"匹配了多少条"一并报出来，否则显示"已选 12 / 459"却只看见 3 行，
+        // 会让人以为程序算错了。
+        if (cnt) {
+          cnt.textContent = filterActive()
+            ? `已选 ${n} / ${rows.length}（筛选出 ${shownCount} 个）`
+            : `已选 ${n} / ${rows.length}`;
+        }
       };
-      $$('#modalBody tbody tr').forEach((tr) => {
+
+      const applyFilter = () => {
+        const q = String((searchEl && searchEl.value) || '').trim().toLowerCase();
+        shownCount = 0;
+        allTr.forEach((tr) => {
+          const m = rowOf(tr);
+          const hit = !q || !!(m && (
+            String(m.id || '').toLowerCase().includes(q)
+            || String(m.as || '').toLowerCase().includes(q)
+          ));
+          tr.hidden = !hit;
+          if (hit) shownCount++;
+        });
+        const active = !!q;
+        const fh = $('#modalBody [data-filterhint]');
+        if (fh) fh.hidden = !active;
+        // 一条都没匹配时给明确反馈：表格空白否则会被当成"界面坏了"
+        const em = $('#modalBody [data-empty]');
+        if (em) em.hidden = shownCount > 0;
+        sync();
+      };
+
+      allTr.forEach((tr) => {
         tr.querySelector('[data-keep]').addEventListener('change', sync);
       });
       $('#modalBody [data-sel="all"]').addEventListener('click', () => { setAll(true); sync(); });
       $('#modalBody [data-sel="none"]').addEventListener('click', () => { setAll(false); sync(); });
       $('#modalBody [data-sel="known"]').addEventListener('click', () => {
-        $$('#modalBody tbody tr').forEach((tr) => {
-          const m = rows[Number(tr.dataset.i)];
+        targets().forEach((tr) => {
+          const m = rowOf(tr);
           if (!m) return;                       // dataset.i 越界时不要炸
           tr.querySelector('[data-keep]').checked = !!(m.contextWindow || m.maxTokens || m.vision);
         });
         sync();
       });
       function setAll(v) {
-        $$('#modalBody tbody tr').forEach((tr) => { tr.querySelector('[data-keep]').checked = v; });
+        targets().forEach((tr) => { tr.querySelector('[data-keep]').checked = v; });
       }
+      // 输入即筛。行数最多几百，直接切 hidden 的开销可忽略，不需要防抖。
+      if (searchEl) searchEl.addEventListener('input', applyFilter);
       sync();
 
       // 实测超时：只对勾选的模型做，结果直接回填到表格
