@@ -98,6 +98,31 @@ code { font-family: var(--mono); font-size: 12px; background: #0c1017; padding: 
 }
 .icon-btn:hover { background: var(--panel-2); color: var(--text); }
 
+/* 模型名旁的复制按钮（描边小方块，参考用户给的图）。
+   与 .icon-btn 的区别：**常显 1px 描边**（.icon-btn 是透明边框、只在 hover 出底色），
+   因为表格里没有悬停提示，常显边框才看得出"这里能点"。
+   尺寸取 21px 是为了与 12.5px 表格文字等高、不把行撑高。 */
+.copy-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 21px; height: 21px; padding: 0; margin-left: 6px;
+  vertical-align: -5px;                    /* 与文字基线对齐（inline-flex 默认贴底会偏下） */
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-mute);
+  cursor: pointer;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.copy-btn svg {
+  width: 12px; height: 12px;
+  fill: none; stroke: currentColor; stroke-width: 1.9;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.copy-btn:hover { color: var(--accent); border-color: var(--accent); background: rgba(59, 130, 246, .12); }
+.copy-btn:active { transform: translateY(1px); }
+/* 键盘可达性：本项目的按钮没做统一 focus 样式，这里补上（Tab 能走到才谈得上可达） */
+.copy-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 /* ================= 布局 ================= */
 .layout { display: flex; height: calc(100vh - 52px); }
 
