@@ -195,6 +195,20 @@
     if (!el) return;
     const d = state.data;
 
+    // ⚠ 首次进入时**自动拉取**。
+    //
+    // 本来 load() 要调用方显式调，但 `switchView()`（core.js）只会调
+    // `LG.renders[name]()` —— **不会**调 load。于是切到本页时 state.data 恒为 null，
+    // 页面一直显示"暂无数据"，而数据其实早在磁盘上
+    //（实测踩到：磁盘已有 9 条记录，页面却空白）。
+    // 在这里兜住：没数据、没在加载、没出错 → 自己去拉。
+    // 不会死循环：load() 立即置 loading=true（下一次 render 走"加载中…"分支），
+    // 完成后 load() 再调一次 render 出内容。
+    if (!d && !state.loading && !state.err) {
+      el.innerHTML = '<div class="usage-empty">加载中…</div>';
+      load();
+      return;
+    }
     if (state.loading && !d) { el.innerHTML = '<div class="usage-empty">加载中…</div>'; return; }
     if (state.err) { el.innerHTML = '<div class="usage-empty">读取失败：' + esc(state.err) + '</div>'; return; }
     if (!d || !d.totals) { el.innerHTML = '<div class="usage-empty">暂无数据 —— 网关产生调用后这里会自动出现记录</div>'; return; }
