@@ -4728,11 +4728,111 @@ let upstreamPort = 0;
   });
 
   // 执行
+  t('用量记账：三条路径都要记，且总输入口径一致（不重复计缓存）', async () => {
+    // 钉住 2026-10-13 审计的两个发现：
+    //   ① 矩阵/翻译路径**完全不记**用量（直通记、其余不记）；
+    //   ② 各协议 input 口径不同（Anthropic 的 input_tokens 不含缓存、OpenAI 的
+    //      prompt_tokens 含），无条件相减或干脆不减都会让「总输入」算错。
+    // 四个格子给语义等价的上游数字：
+    //   Anthropic: input_tokens=100 + cache_read=900           → 总输入 1000
+    //   OpenAI   : prompt_tokens=1000（内含 cached 900）+ out 50 → 总输入 1000
+    // 任何一格偏离 ⇒ 口径不一致。
+    const upAnth = http.createServer((q, s) => {
+      q.resume(); q.on('end', () => {
+        s.writeHead(200, { 'content-type': 'text/event-stream' });
+        s.write('event: message_start\ndata: ' + JSON.stringify({ type: 'message_start', message: { id: 'm', type: 'message', role: 'assistant', model: 'M', content: [], usage: { input_tokens: 100, output_tokens: 1, cache_read_input_tokens: 900 } } }) + '\n\n');
+        s.write('event: message_delta\ndata: ' + JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 50 } }) + '\n\n');
+        s.write('event: message_stop\ndata: ' + JSON.stringify({ type: 'message_stop' }) + '\n\n');
+        s.end();
+      });
+    });
+    const upChat = http.createServer((q, s) => {
+      q.resume(); q.on('end', () => {
+        s.writeHead(200, { 'content-type': 'text/event-stream' });
+        s.write('data: ' + JSON.stringify({ id: 'c', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { role: 'assistant', content: 'hi' } }] }) + '\n\n');
+        s.write('data: ' + JSON.stringify({ id: 'c', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 1000, completion_tokens: 50, prompt_tokens_details: { cached_tokens: 900 } } }) + '\n\n');
+        s.write('data: [DONE]\n\n');
+        s.end();
+      });
+    });
+    const upResp = http.createServer((q, s) => {
+      q.resume(); q.on('end', () => {
+        s.writeHead(200, { 'content-type': 'text/event-stream' });
+        s.write('event: response.created\ndata: ' + JSON.stringify({ type: 'response.created', response: { id: 'r', object: 'response', status: 'in_progress', model: 'M', output: [] } }) + '\n\n');
+        s.write('event: response.output_text.delta\ndata: ' + JSON.stringify({ type: 'response.output_text.delta', delta: 'hi' }) + '\n\n');
+        s.write('event: response.completed\ndata: ' + JSON.stringify({ type: 'response.completed', response: { id: 'r', object: 'response', status: 'completed', model: 'M', output: [{ id: 'o', type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'hi' }] }], usage: { input_tokens: 1000, output_tokens: 50, input_tokens_details: { cached_tokens: 900 } } } }) + '\n\n');
+        s.end();
+      });
+    });
+    await new Promise((r) => upAnth.listen(0, '127.0.0.1', r));
+    await new Promise((r) => upChat.listen(0, '127.0.0.1', r));
+    await new Promise((r) => upResp.listen(0, '127.0.0.1', r));
+
+    const dir = fs.mkdtempSync(path.join(tmp, 'usagecov-'));
+    const port = await freePort();
+    fs.writeFileSync(path.join(dir, 'c.json'), JSON.stringify({
+      port, apiKey: GATEWAY_KEY,
+      providers: [
+        { id: 'P-anth', baseURL: 'http://127.0.0.1:' + upAnth.address().port + '/v1', protocol: 'anthropic-messages', apiKey: 'sk-aaaaaaaaaaaaaaaa', models: ['m-anth'], priority: 1, enabled: true, timeoutMs: 20000 },
+        { id: 'P-chat', baseURL: 'http://127.0.0.1:' + upChat.address().port + '/v1', protocol: 'openai-chat', apiKey: 'sk-bbbbbbbbbbbbbbbb', models: ['m-chat'], priority: 1, enabled: true, timeoutMs: 20000 },
+        { id: 'P-resp', baseURL: 'http://127.0.0.1:' + upResp.address().port + '/v1', protocol: 'openai-responses', apiKey: 'sk-cccccccccccccccc', models: ['m-resp'], priority: 1, enabled: true, timeoutMs: 20000 },
+      ],
+    }), 'utf8');
+
+    const proc = spawn(process.execPath,
+      [MJS, '--config', path.join(dir, 'c.json'), '--log', path.join(dir, 'g.log'), '--port', String(port)],
+      { stdio: 'ignore', windowsHide: true });
+    try {
+      const ready = await waitHealth(port, 20000);
+      if (!ready) { console.log('    [SKIP] 用量记账用例的网关未就绪'); return; }
+
+      const readAll = () => {
+        const ud = path.join(dir, 'usage');   // 引擎默认把用量放 <log 同目录>/usage
+        if (!fs.existsSync(ud)) return [];
+        const out = [];
+        for (const f of fs.readdirSync(ud)) {
+          for (const line of fs.readFileSync(path.join(ud, f), 'utf8').split('\n')) {
+            if (line) { try { out.push(JSON.parse(line)); } catch (_) { /* 半截行 */ } }
+          }
+        }
+        return out;
+      };
+
+      const cases = [
+        ['直通 anthropic→anthropic', 'm-anth', false],
+        ['翻译 anthropic→chat（流式）', 'm-chat', true],
+        ['翻译 anthropic→chat（非流式）', 'm-chat', false],
+        ['矩阵 anthropic→responses（流式）', 'm-resp', true],
+      ];
+      for (const [label, model, stream] of cases) {
+        // eslint-disable-next-line no-await-in-loop
+        const r = await call({ port, p: '/v1/messages', body: { model, max_tokens: 32, stream, messages: [{ role: 'user', content: 'hi' }] } });
+        assert.strictEqual(r.status, 200, label + ' 应 200，实际 ' + r.status + ' ' + r.text.slice(0, 160));
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((res) => setTimeout(res, 350));
+        const rows = readAll();
+        const rec = rows[rows.length - 1];
+        assert.ok(rec, label + '：**没有落用量记录**（这正是 2026-10-13 审计发现的缺口）');
+        assert.strictEqual(rec.inTok, 100, label + '：非缓存输入应为 100，实际 ' + rec.inTok
+          + '（>100 说明缓存被重复计；<100 说明 Anthropic 语义被多减了一次）');
+        assert.strictEqual(rec.cacheRead, 900, label + '：缓存读应为 900，实际 ' + rec.cacheRead);
+        assert.strictEqual(rec.outTok, 50, label + '：输出应为 50，实际 ' + rec.outTok);
+        assert.strictEqual(rec.inTok + rec.cacheRead + rec.cacheWrite, 1000,
+          label + '：总输入应为 1000，实际 ' + (rec.inTok + rec.cacheRead + rec.cacheWrite));
+      }
+    } finally {
+      try { proc.kill(); } catch (_) { /* 忽略 */ }
+      upAnth.close(); upChat.close(); upResp.close();
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* 忽略 */ }
+    }
+  });
+
   for (const { name, fn } of __tests) {
     await fn();
     passed++;
     console.log('PASS  ' + name);
   }
+
   console.log('');
   console.log('===== ' + passed + ' passed, 0 failed =====');
   try { gwProc.kill(); } catch { }

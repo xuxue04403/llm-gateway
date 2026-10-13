@@ -4527,7 +4527,22 @@ function recordUsage(rec) {
   try {
     if (!rec || !rec.model) return;
     const ts = rec.ts || Date.now();
+    const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
     fs.mkdirSync(usageDir(), { recursive: true });
+    // ── 输入 token 的语义归一化 ──（2026-10-13 审计）
+    //
+    // 各协议的 input 口径**不一样**，而且**不能无条件相减**：
+    //   · OpenAI chat 的 `prompt_tokens`、Responses 的 `input_tokens` **包含**缓存命中
+    //     （`*.details.cached_tokens` 是它的子集）→ 要减去才是"非缓存输入"
+    //   · Anthropic 的 `input_tokens` **不含**缓存读/写 → 再减一次会变成 0
+    //     （实测踩到：直通 anthropic 路径 input_tokens:100 / cache_read:900 → 落盘 inTok=0）
+    //
+    // 所以由**调用方**声明它给的数是哪种语义（`inTokIncludesCache`），算术只在
+    // 这里做一次。落盘口径统一为 Anthropic 语义（inTok = 非缓存输入），于是聚合端恒有：
+    //       总输入 = inTok + cacheRead + cacheWrite
+    const cacheRead = Math.max(0, Math.round(num(rec.cacheRead)));
+    const rawIn = Math.max(0, Math.round(num(rec.inTok)));
+    const inTok = rec.inTokIncludesCache ? Math.max(0, rawIn - cacheRead) : rawIn;
     // 字段顺序固定，便于人工 grep；缺省补 0，前端不用到处判 undefined
     const row = {
       ts,
@@ -4538,10 +4553,10 @@ function recordUsage(rec) {
       stream: rec.stream ? 1 : 0,
       durMs: Math.max(0, Math.round(rec.durMs || 0)),
       ttfbMs: Math.max(0, Math.round(rec.ttfbMs || 0)),
-      inTok: Math.max(0, Math.round(rec.inTok || 0)),
-      outTok: Math.max(0, Math.round(rec.outTok || 0)),
-      cacheRead: Math.max(0, Math.round(rec.cacheRead || 0)),
-      cacheWrite: Math.max(0, Math.round(rec.cacheWrite || 0)),
+      inTok,
+      outTok: Math.max(0, Math.round(num(rec.outTok))),
+      cacheRead,
+      cacheWrite: Math.max(0, Math.round(num(rec.cacheWrite))),
     };
     fs.appendFileSync(usageFileFor(ts), JSON.stringify(row) + '\n', 'utf8');
     // 每天最多清一次（readdir 不该每请求都跑）
@@ -4560,9 +4575,20 @@ function recordUsage(rec) {
  * 两种协议形状都认。
  */
 function usageFromTail(text) {
-  const out = { inTok: 0, outTok: 0, cacheRead: 0, cacheWrite: 0 };
+  const out = { inTok: 0, outTok: 0, cacheRead: 0, cacheWrite: 0, inTokIncludesCache: false };
   if (!text) return out;
   const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  // 这个 inTok 是"含缓存"还是"不含缓存"？
+  //
+  // ⚠ 按**形状**判定即可，不必知道上游协议：
+  //   · 出现 `prompt_tokens`（OpenAI chat）→ 含缓存
+  //   · 出现 `input_tokens_details`（Responses）→ 含缓存
+  //   · 出现 `cache_read_input_tokens` / `cache_creation_input_tokens`（Anthropic）→ **不含**
+  // 剩下的歧义情况（裸 `input_tokens` 且无缓存字段）**无所谓**：
+  // 那时 cacheRead 必为 0，"减不减"结果一样。
+  let sawPrompt = false;
+  let sawInputDetails = false;
+  let sawAnthropicCache = false;
   let idx = 0;
   let seen = 0;
   for (;;) {
@@ -4591,24 +4617,22 @@ function usageFromTail(text) {
     // 判据用"键是否存在"而不是"值是否非 0"：上游明确回 0 时要如实采信。
     if ('input_tokens' in u) out.inTok = num(u.input_tokens);
     if ('output_tokens' in u) out.outTok = num(u.output_tokens);
-    if ('cache_read_input_tokens' in u) out.cacheRead = num(u.cache_read_input_tokens);
-    if ('cache_creation_input_tokens' in u) out.cacheWrite = num(u.cache_creation_input_tokens);
+    if ('cache_read_input_tokens' in u) { out.cacheRead = num(u.cache_read_input_tokens); sawAnthropicCache = true; }
+    if ('cache_creation_input_tokens' in u) { out.cacheWrite = num(u.cache_creation_input_tokens); sawAnthropicCache = true; }
     // OpenAI chat 形状
-    if ('prompt_tokens' in u) out.inTok = num(u.prompt_tokens);
+    if ('prompt_tokens' in u) { out.inTok = num(u.prompt_tokens); sawPrompt = true; }
     if ('completion_tokens' in u) out.outTok = num(u.completion_tokens);
     const d = u.prompt_tokens_details || u.input_tokens_details;
     if (d && typeof d === 'object' && 'cached_tokens' in d) {
-      // ⚠ **两种协议的 input 语义不同，必须归一化**，否则统计会重复计数：
-      //   · Anthropic：`input_tokens` **不含**缓存读/写（cache_read / cache_creation 是额外的）
-      //   · OpenAI   ：`prompt_tokens` **含**缓存命中（cached_tokens 是它的子集）
-      // 统一成 Anthropic 语义（inTok = 非缓存输入），这样：
-      //   总输入 = inTok + cacheRead + cacheWrite —— 两边一致，缓存命中率也算得对。
-      const cached = num(d.cached_tokens);
-      out.cacheRead = cached;
-      out.inTok = Math.max(0, out.inTok - cached);
+      out.cacheRead = num(d.cached_tokens);
+      if (u.input_tokens_details) sawInputDetails = true;
     }
     if ('cache_write_tokens' in u) out.cacheWrite = num(u.cache_write_tokens);
   }
+  // 判定"这个 inTok 含不含缓存"，交给 recordUsage 做那一次减法。
+  // Anthropic 的缓存字段一旦出现就说明是 Anthropic 语义（不含）—— 优先级最高，
+  // 因为有的中转会同时挂 prompt_tokens_details 与 cache_read_input_tokens。
+  out.inTokIncludesCache = (sawPrompt || sawInputDetails) && !sawAnthropicCache;
   return seen ? out : out;
 }
 
@@ -5270,7 +5294,35 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     const mx = opts && opts.matrix;
     if (mx && mx.upstreamWire && mx.upstreamWire !== mx.clientWire) {
       log(`[matrix] ${mx.model}: 客户端 ${mx.clientWire} ← 上游 ${mx.upstreamWire}（翻译${mx.clientStream ? '流式' : '非流式'}）`);
-      return await forwardMatrixResponse({ res, upstream, bodyStream, ctype, pendingHead, mx });
+      // 用量记账（2026-10-13 审计补）：矩阵路径此前**完全不记**，
+      // 而它正是 DSH 最常见的链路（anthropic 客户端 → chat 上游）——
+      // 实测 `_scratch/audit-usage-coverage.cjs`：直通 1 条、矩阵 0 条。
+      // 用 sink 回传而不是直接在这里记：用量要等响应翻完才知道。
+      const mxUsage = {};
+      const mxRet = await forwardMatrixResponse({ res, upstream, bodyStream, ctype, pendingHead, mx, usageSink: mxUsage });
+      try {
+        recordUsage({
+          ts: startedAt,
+          model: (mx.model || (body && body.model) || ''),
+          provider: provider.id,
+          endpoint: upstreamPath,
+          status: mxRet === false ? 'fail' : (mxRet && mxRet.stop ? 'fail:' + (mxRet.stop.status || '') : 'ok'),
+          stream: !!mx.clientStream,
+          durMs: Date.now() - startedAt,
+          ttfbMs: 0,
+          inTok: mxUsage.inTok, outTok: mxUsage.outTok,
+          cacheRead: mxUsage.cacheRead, cacheWrite: mxUsage.cacheWrite,
+          // ⚠ 这个标记必须转发！漏了它 → 上面的减法不执行 →
+          // 含缓存的 inTok 与 cacheRead 一起落盘 → 聚合端总输入重复计数。
+          //（实测：responses 矩阵路径 inTok=1000 + cacheRead=900 → 总输入 1900，虚高 90%。）
+          inTokIncludesCache: !!mxUsage.inTokIncludesCache,
+        });
+      } catch (e) {
+        // ⚠ 不要静默！第一版这里写的是 `catch {}`，于是"矩阵记账没生效"完全无声，
+        // 只能靠覆盖度测试猜。本次审计的教训：旁路失败要留痕（但不影响转发）。
+        log(`usage: 矩阵路径记账失败（不影响转发）：${(e && e.message) || e}`);
+      }
+      return mxRet;
     }
   }
   // 上游被强制流式、而客户端要非流式 → 聚合后回单条 JSON（2026-09-16：直通路径补齐 quirk 语义）
@@ -5492,6 +5544,8 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       durMs: Date.now() - startedAt,
       ttfbMs: meter && meter.firstByteAt ? meter.firstByteAt - startedAt : 0,
       inTok: u.inTok, outTok: u.outTok, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite,
+      // 由 usageFromTail 按形状判定（Anthropic 的 input_tokens 不含缓存；chat/Responses 含）
+      inTokIncludesCache: u.inTokIncludesCache,
     });
   } catch { /* 旁路：统计失败不影响转发 */ }
   return truncated ? 'truncated' : true;
@@ -6373,7 +6427,17 @@ function makeStreamDecoder(wire) {
           const r = j.response || {};
           const u = r.usage || {};
           if (u.input_tokens !== undefined || u.output_tokens !== undefined) {
-            ev.push({ t: 'usage', in: Number(u.input_tokens) || 0, out: Number(u.output_tokens) || 0 });
+            // ⚠ 缓存字段必须一起带出来（2026-10-13 审计补）。
+            // Responses 把命中数放在 `usage.input_tokens_details.cached_tokens`；
+            // 不带 → 矩阵路径（anthropic 客户端 ← responses 上游）的用量记录
+            // cacheRead 恒为 0，缓存命中率与总输入都算不对（实测抓到）。
+            ev.push({
+              t: 'usage',
+              in: Number(u.input_tokens) || 0,
+              out: Number(u.output_tokens) || 0,
+              cached: cachedTokensOf(u),
+              cacheWrite: cacheWriteTokensOf(u),
+            });
           }
           const hasCall = (Array.isArray(r.output) ? r.output : []).some((x) => x && x.type === 'function_call');
           ev.push({ t: 'stop', r: hasCall ? 'tool_calls' : (/incomplete/.test(type) ? 'length' : 'stop') });
@@ -6451,6 +6515,22 @@ function makeStreamEncoder(wire, ctx) {
   };
 
   return {
+    /**
+     * 用量快照（2026-10-13 审计补）。
+     *
+     * ⚠ 为什么必须暴露：矩阵路径（客户端协议 ≠ 上游协议）**此前完全不记用量** ——
+     * 实测（`_scratch/audit-usage-coverage.cjs`）：
+     *   anthropic 客户端 → anthropic 上游（直通）→ 用量记录 1 条 ✓
+     *   anthropic 客户端 → openai-chat 上游（矩阵）→ **用量记录 0 条** ★
+     * 于是「使用记录」页对 DSH 最常见的链路（anthropic → chat 上游）**系统性少算**。
+     * 这些数在 encoder 里本来就累积着（usageIn/Out/Cached/CacheWrite），只是没对外给。
+     */
+    usage() {
+      return {
+        inTok: usageIn || 0, outTok: usageOut || 0,
+        cacheRead: usageCached || 0, cacheWrite: usageCacheWrite || 0,
+      };
+    },
     /** 收尾：写出结束帧。**幂等** —— 上游给了结束帧、pump 收尾又调一次也不会重复写。 */
     finish() {
       if (ended) return;
@@ -6649,6 +6729,21 @@ function makeStreamEncoder(wire, ctx) {
 }
 
 /** 把上游 SSE 逐帧喂给解码器，再编码给客户端。 */
+/**
+ * 矩阵**流式**路径的用量快照（2026-10-13 审计补）。
+ *
+ * `encoder.usage()` 只有数值，缺"这个 inTok 含不含缓存"的语义 —— 而它取决于
+ * **上游** 协议（encoder 只知道客户端 wire，所以在这里补）：
+ *   · 上游 anthropic-messages → `input_tokens` 不含缓存读/写 → false
+ *   · 上游 openai-chat / openai-responses → 含（cached 是子集）→ true
+ * recordUsage 按这个标记决定要不要做那一次减法。
+ */
+function matrixUsage(encoder, upstreamWire) {
+  return Object.assign(encoder.usage(), {
+    inTokIncludesCache: upstreamWire !== 'anthropic-messages',
+  });
+}
+
 async function pumpMatrixStream({ res, upstream, upstreamWire, clientWire, model, inputTokens, headBytes }) {
   const decoder = makeStreamDecoder(upstreamWire);
   const encoder = makeStreamEncoder(clientWire, { res, model, inputTokens });
@@ -6758,12 +6853,13 @@ async function pumpMatrixStream({ res, upstream, upstreamWire, clientWire, model
     log(`[matrix] 上游流被截断（${upstreamWire} → ${clientWire}）：未收到任何结束信号`
       + `（无 [DONE]/message_stop，也无 finish_reason/stop_reason）→ 明确告知客户端"回复不完整"`);
     encoder.error('上游响应被中断（未收到结束信号）—— 这条回复不完整，请重试');
-    return { clientGone: false, truncated: true };
+    return { clientGone: false, truncated: true, usage: matrixUsage(encoder, upstreamWire) };
   }
   // 上游没有明确的结束帧时（如 Anthropic 的 message_stop 不映射成事件）也要收尾，
   // 否则客户端会一直等 message_stop / response.completed / [DONE]。
   if (!sawEnd && !clientGone) encoder.finish();
-  return { clientGone };
+  // 把用量带回去给 forward() 记账（矩阵路径此前完全不记，见 encoder.usage() 的说明）
+  return { clientGone, usage: matrixUsage(encoder, upstreamWire) };
 }
 
 /** canonical 事件 → chat 的完整响应（用于"上游流式、客户端要非流式"）。 */
@@ -6783,13 +6879,22 @@ function canonicalToChatCompletion(acc, model) {
   else if (acc.stop === 'content_filter') finish = 'content_filter';
   const inTok = acc.usageIn || 0;
   const outTok = acc.usageOut || 0;
+  // 缓存字段要一起带上（2026-10-13 审计补）：
+  // 少带它们 → 使用记录页在**聚合路径**上永远算不出缓存命中率（恒 0%）。
+  const det = {};
+  if (acc.usageCached) det.cached_tokens = acc.usageCached;
+  if (acc.usageCacheWrite) det.cache_creation_input_tokens = acc.usageCacheWrite;
   return {
     id: 'chatcmpl-' + Math.random().toString(36).slice(2, 14),
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
     model,
     choices: [{ index: 0, message: msg, finish_reason: finish }],
-    usage: { prompt_tokens: inTok, completion_tokens: outTok, total_tokens: inTok + outTok },
+    usage: {
+      prompt_tokens: inTok, completion_tokens: outTok, total_tokens: inTok + outTok,
+      ...(Object.keys(det).length ? { prompt_tokens_details: det } : {}),
+      ...(acc.usageCacheWrite ? { cache_creation_input_tokens: acc.usageCacheWrite } : {}),
+    },
   };
 }
 
@@ -6801,7 +6906,11 @@ function makeCanonicalCollector() {
   // 实测（2026-10-09 第三次审计）：客户端要 openai-chat **非流式**、上游是
   // anthropic-messages 且中途干净断开 → 回 `HTTP 200` + 半截内容 + `finish_reason:"stop"`，
   // 日志记 `status=ok`。这就是用户报的"任务静默终止"在**矩阵聚合路径**上的形态。
-  const acc = { text: '', thinking: '', tools: [], stop: 'stop', usageIn: 0, usageOut: 0, sawTerminal: false };
+  const acc = { text: '', thinking: '', tools: [], stop: 'stop', usageIn: 0, usageOut: 0,
+    // ⚠ 缓存读/写也必须收（2026-10-13 审计补）。
+    // 旧实现只记 usageIn/usageOut —— 而解码器早就把 `cached`/`cacheWrite` 放进 usage 事件了
+    //（见 cachedTokensOf 的注释），这里不接就等于**聚合路径永远算不出缓存命中率**。
+    usageCached: 0, usageCacheWrite: 0, sawTerminal: false };;
   const bySlot = new Map();
   return {
     acc,
@@ -6819,7 +6928,13 @@ function makeCanonicalCollector() {
           if (t) t.args += e.d;
         } else if (e.t === 'stop') { acc.stop = e.r; acc.sawTerminal = true; }
         else if (e.t === 'end') acc.sawTerminal = true;
-        else if (e.t === 'usage') { if (e.in) acc.usageIn = e.in; if (e.out) acc.usageOut = e.out; }
+        else if (e.t === 'usage') {
+          if (e.in) acc.usageIn = e.in;
+          if (e.out) acc.usageOut = e.out;
+          // 缓存字段单独收（2026-10-13 审计补，见 acc 声明处的说明）
+          if (e.cached) acc.usageCached = e.cached;
+          if (e.cacheWrite) acc.usageCacheWrite = e.cacheWrite;
+        }
       }
     },
     /** 上游**明说**结束了（finish_reason / stop_reason / 显式结束帧）吗？ */
@@ -6874,7 +6989,7 @@ async function drainCanonicalStream({ upstream, upstreamWire, collector, headByt
  * 调用位置很关键（在 forward 里）：**必须晚于"首事件偷看"**（那时才确认上游给的是正常流），
  * 又**必须早于任何 res.writeHead** —— 一旦写了响应头，形状就改不了了。
  */
-async function forwardMatrixResponse({ res, upstream, bodyStream, ctype, pendingHead, mx }) {
+async function forwardMatrixResponse({ res, upstream, bodyStream, ctype, pendingHead, mx, usageSink }) {
   const isSse = !!bodyStream && /event-stream/i.test(ctype);
   log(`[matrix] 进入响应翻译：upstream=${mx.upstreamWire} client=${mx.clientWire} `
     + `isSse=${isSse} clientStream=${mx.clientStream} ctype=${ctype} head=${pendingHead ? pendingHead.length : 0}B`);
@@ -6900,8 +7015,12 @@ async function forwardMatrixResponse({ res, upstream, bodyStream, ctype, pending
     // 返回 false 不会引发 failover：调用方有 headersSent 守卫（响应头已发出）。
     if (pr && pr.clientGone) {
       log('[matrix] 客户端中途断开，已取消上游读取（不记 ok）');
+      // 客户中途走了也把**已经拿到**的用量回传 —— 上游那边通常已计费，
+      // 不记就等于统计比账单少（审计 2026-10-13）。
+      if (usageSink && pr && pr.usage) Object.assign(usageSink, pr.usage);
       return false;
     }
+    if (usageSink && pr && pr.usage) Object.assign(usageSink, pr.usage);
     return true;
   }
 
@@ -6984,6 +7103,21 @@ async function forwardMatrixResponse({ res, upstream, bodyStream, ctype, pending
   }
 
   if (res.destroyed || res.writableEnded) return false;
+  // 用量回传（2026-10-13 审计补）：canon 里带着 usage（无论来自聚合还是完整 JSON），
+  // 在这里统一取出交给 forward() 记账。放在写出**之前**取，避免写出失败时丢账。
+  if (usageSink && canon && canon.usage && typeof canon.usage === 'object') {
+    const u = canon.usage;
+    const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+    const det = u.prompt_tokens_details || u.input_tokens_details || {};
+    usageSink.inTok = num(u.prompt_tokens) || num(u.input_tokens);
+    usageSink.outTok = num(u.completion_tokens) || num(u.output_tokens);
+    usageSink.cacheRead = num(det.cached_tokens) || num(u.cache_read_input_tokens);
+    usageSink.cacheWrite = num(u.cache_creation_input_tokens);
+    // 这里的 inTok 取自上游：chat 的 `prompt_tokens` / Responses 的 `input_tokens`
+    // **含**缓存命中；anthropic 的 `input_tokens` **不含**。按上游协议判定，
+    // 不能无条件 true（否则 anthropic 上游会被减成 0 —— 实测踩到过）。
+    usageSink.inTokIncludesCache = mx.upstreamWire !== 'anthropic-messages';
+  }
   // ⚠ 客户端要流式、而上游给了完整 JSON（上游不支持流式 / 我们翻译时没带上 stream）：
   // **仍然要按客户端协议合成一条 SSE 流**，不能回非流式 JSON ——
   // 流式客户端拿到 application/json 会解析失败或一直等 message_stop。
@@ -7025,7 +7159,15 @@ function chatCompletionToCanonicalEvents(json) {
   });
   const u = j.usage || {};
   if (u.prompt_tokens !== undefined || u.completion_tokens !== undefined) {
-    ev.push({ t: 'usage', in: Number(u.prompt_tokens) || 0, out: Number(u.completion_tokens) || 0 });
+    // 缓存字段一并带出（2026-10-13 审计补）：非流式 chat 响应同样会带
+    // `prompt_tokens_details.cached_tokens`，漏掉它这条路径的缓存统计就是 0。
+    ev.push({
+      t: 'usage',
+      in: Number(u.prompt_tokens) || 0,
+      out: Number(u.completion_tokens) || 0,
+      cached: cachedTokensOf(u),
+      cacheWrite: cacheWriteTokensOf(u),
+    });
   }
   ev.push({ t: 'stop', r: calls.length ? 'tool_calls' : (choice.finish_reason === 'length' ? 'length' : 'stop') });
   ev.push({ t: 'end' });
@@ -7445,6 +7587,48 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
 
   for (const acct of attemptAccounts) {
     const startedAt = Date.now();
+    /**
+     * 用量记账（2026-10-13 审计补）。
+     *
+     * ⚠ 这条路径此前**完全不记用量** —— 而它正是 DSH/Claude Code 最常用的链路
+     *（客户端 anthropic → 上游只支持 openai-chat，见 handleMessages 里的 `toOpenAI` 分流）。
+     * 实测（`_scratch/audit-usage-coverage.cjs`）：
+     *   直通（anthropic→anthropic）：1 条记录 ✓
+     *   anthropic→chat（**本函数**）：0 条记录 ★
+     * 于是「使用记录」页会系统性少算最常见的调用。
+     *
+     * 用 anthropic 形状的 usage（translateOpenAIStreamToAnthropic 已经算好了）：
+     *   input_tokens / output_tokens / cache_read_input_tokens / cache_creation_input_tokens
+     */
+    const recUsage = (u, status) => {
+      try {
+        const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+        // ⚠ 这里传的是**上游原值**，不做归一化。
+        // `input_tokens` 来自 anthropicUsage(usage, prompt_tokens, ...)，
+        // 而 OpenAI 的 prompt_tokens **包含**缓存命中 —— 归一化（减去 cacheRead）
+        // 统一由 recordUsage() 负责，避免"三个调用点各减一次、漏一个就重复计数"。
+        recordUsage({
+          ts: startedAt,
+          model: (body && body.model) || '',
+          provider: provider.id,
+          endpoint: upstreamPath,
+          status: status || 'ok',
+          stream: wantsStream,
+          durMs: Date.now() - startedAt,
+          ttfbMs: 0,
+          inTok: num(u && u.input_tokens),
+          outTok: num(u && u.output_tokens),
+          cacheRead: num(u && u.cache_read_input_tokens),
+          cacheWrite: num(u && u.cache_creation_input_tokens),
+          // `input_tokens` 来自 anthropicUsage(usage, **prompt_tokens**, ...) ——
+          // 而 OpenAI 的 prompt_tokens **含**缓存命中 → 需要减。
+          inTokIncludesCache: true,
+        });
+      } catch (e) {
+        // 旁路失败要留痕（本次审计教训：静默 catch 会让"没记账"完全看不出来）
+        log(`usage: anthropic←chat 记账失败（不影响转发）：${(e && e.message) || e}`);
+      }
+    };
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), providerTimeoutMs(provider, scopeModel));
     let headers;
@@ -7683,6 +7867,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
             'access-control-allow-origin': '*',
           });
           const r = await translateOpenAIStreamToAnthropic({ res, upstream, model: body.model, inputTokens, aggregateOnly: false, headBytes });
+          recUsage(r && r.usage, r && r.ok ? 'ok' : 'fail');
           return r.ok ? true : false;
         }
         // 客户端要非流式（或下游是 Responses 聚合）：把流收完再回一条完整 message
@@ -7718,6 +7903,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
           stop_reason: agg.stopReason, stop_sequence: null,
           usage: agg.usage,
         });
+        recUsage(agg.usage, 'ok');
         return true;
       }
       const text = await readTextWithTimeout(upstream, 30_000, 4 * 1024 * 1024);
@@ -7739,7 +7925,9 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
           },
         };
       }
-      json(res, 200, openaiToAnthropicMessage(parsed, body.model, inputTokens));
+      const msgOut = openaiToAnthropicMessage(parsed, body.model, inputTokens);
+      json(res, 200, msgOut);
+      recUsage(msgOut && msgOut.usage, 'ok');
       return true;
     } catch (e) {
       log(`anthropic→openai 响应翻译失败：${e && e.message}`);

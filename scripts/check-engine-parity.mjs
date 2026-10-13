@@ -262,6 +262,7 @@ const DECLARED = [
   { name: 'usagePrunedAt', why: '新增：清理节流（每天最多 readdir 一次，不该每请求都跑）' },
   { name: 'recordUsage', why: '新增：每次调用收尾追加一行 JSONL。**整个函数体在 try 里** —— 统计是旁路，失败绝不影响转发。只记结构化数字，不记请求/响应正文' },
   { name: 'usageFromTail', why: '新增：从 8KB 尾部窗口提取用量（直通路径用）。直通是字节透明的、不解析整个响应，但为截断检测已滚了尾部窗口 → 顺带解析零额外成本。⚠ 必须**逐字段**取最后一次出现的值，不能"取最后一个 usage 对象"：anthropic 的 input_tokens 在首帧 message_start、output_tokens 在尾帧 message_delta，只取最后一个会把输入 token 与缓存读全丢成 0（单元测试当场抓到）' },
+  { name: 'matrixUsage', why: '新增（2026-10-13 审计）：矩阵流式路径的用量快照 + 输入语义标记。encoder 只知道客户端 wire，而"inTok 含不含缓存"取决于**上游** wire（anthropic 不含、chat/responses 含），所以在这里补' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */
