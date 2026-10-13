@@ -967,8 +967,16 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up1); closeUp(up2); }
   });
 
-  t('网关：404 细分——"模型不存在"终止 failover；"路由不存在"仍换下一家', async () => {
-    // 场景 A：上游明确说模型不存在 → 确定性错误，不得重发给下一家
+  t('网关：404 细分——"模型不存在"**继续** failover（2026-10-13 修）；路由不存在同样换下一家', async () => {
+    // ⚠ 契约变更（2026-10-13）。旧契约是"模型不存在的 404 终止 failover"，
+    // 理由写的是"重发给每一家只是 N 倍计费"—— 但那个理由只在"模型全局不存在"时成立。
+    // 而配置里同一逻辑模型常常声明了多家，**其中一家写错/过期是常态**，正是 failover 的意义。
+    // 实测事故（cline 桌面版）：deepseek-v4-pro 声明了 sensenova + opencode-go 两家，
+    // sensenova 回 404 → 网关直接终止 → 客户端整轮失败，而 opencode-go 本可服务。
+    // 现在：这类 404 与"路由不存在"一样继续 failover。
+    //
+    // 另见：400 那条路径早在 2026-09-23 就这么修了（amd "not supported" 事故），
+    // 404 侧此前漏了 —— 这条用例同时钉住两条路径的行为一致。
     const a1 = await startFakeUpstream({ status: 404, errorBody: { error: { message: 'The model test-model does not exist' } } });
     const a2 = await startFakeUpstream({ status: 200 });
     const gwA = await startGatewayWith([
@@ -978,9 +986,27 @@ let upstreamPort = 0;
     try {
       assert.ok(gwA.ready, '独立网关实例应就绪');
       const r = await call({ port: gwA.port });
-      assert.strictEqual(r.status, 404, '模型不存在的 404 应映射回客户端，实际 ' + r.status + ' ' + r.text.slice(0, 160));
-      assert.strictEqual(a2.st.calls, 0, '不得把"模型不存在"的请求再发给下一家，实际 ' + a2.st.calls);
+      assert.strictEqual(r.status, 200, '"模型不存在"的 404 应继续 failover 到下一家并成功，实际 '
+        + r.status + ' ' + r.text.slice(0, 160));
+      assert.ok(a2.st.calls >= 1, '必须真的尝试下一家，实际 ' + a2.st.calls);
     } finally { killGw(gwA); closeUp(a1); closeUp(a2); }
+
+    // 场景 A2：**所有**家都说没有这个模型 → 才回 404（这时"换下一家"已无意义）
+    const c1 = await startFakeUpstream({ status: 404, errorBody: { error: { message: 'The model test-model does not exist' } } });
+    const c2 = await startFakeUpstream({ status: 404, errorBody: { error: { message: 'model test-model not found' } } });
+    const gwC = await startGatewayWith([
+      providerOf('n1', c1, { priority: 1 }),
+      providerOf('n2', c2, { priority: 2 }),
+    ], 'allmiss404');
+    try {
+      assert.ok(gwC.ready, '独立网关实例应就绪');
+      const r = await call({ port: gwC.port });
+      // 全部候选都说"没有这个模型" → 回 **503**（"没有任何可用供应商"），不是 404。
+      // 语义上 503 更准：网关**有**这些供应商，只是都不提供该模型；回 404 会让客户端
+      // 以为"模型名/URL 写错了"，排查方向直接偏掉。
+      assert.strictEqual(r.status, 503, '全部家都没有该模型时应回 503，实际 ' + r.status + ' ' + r.text.slice(0, 160));
+      assert.ok(c2.st.calls >= 1, '仍应逐家试过，而不是第一家就放弃，实际 ' + c2.st.calls);
+    } finally { killGw(gwC); closeUp(c1); closeUp(c2); }
 
     // 场景 B：通用 404（供应商没有该路由）→ 换下一家（否则 Codex 仿真用户会被首家的
     // 路由缺失直接打死）

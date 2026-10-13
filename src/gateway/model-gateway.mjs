@@ -3830,6 +3830,31 @@ const ROUTE_MISSING_RE = /invalid\s+url|not\s+implemented|unsupported\s+(method|
 const MODEL_UNSUPPORTED_BY_PROVIDER_RE = /requested\s+model[^\n]{0,120}?not\s+supported|model[^\n]{0,60}?is\s+not\s+available|model_not_found|unsupported\s+model|model\s+not\s+(?:offered|supported|found)|does\s+not\s+(?:offer|support)[^\n]{0,40}?model|is\s+not\s+available\s+in\s+your\s+(?:region|country|area|location)|not\s+available\s+in\s+your\s+(?:region|country|area|location)|(?:region|country|area)[-_\s]?(?:not\s+supported|restricted|blocked)|not\s+available\s+(?:for|on|in)\s+your\s+(?:plan|tier|subscription|account\s+level)|不提供[^\n]{0,20}?模型|模型[^\n]{0,20}?不支持|(?:地区|区域)[^\n]{0,10}?(?:不支持|不可用|受限)/i;
 
 /**
+ * 「这家不提供这个模型」的**唯一判定**（2026-10-13 收敛）。
+ *
+ * 起因：同一漏洞在本项目**复发三次** —— 2026-09-23 修 400 侧（amd 事故）、
+ * 2026-09-30 补指纹判定、2026-10-13 cline 事故（404 侧）。每次都是"改了一条路径、
+ * 另两条漏了"，代码注释里甚至留着"翻译路径当时漏了""这正是三处都要判里漏掉的第三处"。
+ * 所以收敛成**唯一判定**，五处调用点必须调它，不许各自 test 正则。
+ *
+ * 两类都算「供应商侧问题」→ 都继续 failover、都不熔断该家、都不冷却账户：
+ *   · MODEL_UNSUPPORTED_BY_PROVIDER_RE：明确的"这家不提供 / 地区套餐受限"；
+ *   · 404 + MODEL_MISSING_RE：模型不存在/不支持 —— 在**这家**的语义下同样只是
+ *     "这家没有"，不是"请求本身有错"。
+ *
+ * 为什么 404 也要继续 failover：配置里同一逻辑模型常声明多家，其中一家写错/过期
+ * 是常态，正是 failover 存在的意义。实测（cline 桌面版）：deepseek-v4-pro 声明了
+ * sensenova + opencode-go 两家，sensenova 回 404 → 旧实现直接终止 → 客户端整轮失败，
+ * 而 opencode-go 本可服务。代价只是多打一个 404（快、不计费）。
+ */
+function isModelUnavailableByProvider(status, detail) {
+  const d = String(detail || '');
+  if (!d) return false;
+  if (MODEL_UNSUPPORTED_BY_PROVIDER_RE.test(d)) return true;
+  return Number(status) === 404 && MODEL_MISSING_RE.test(d);
+}
+
+/**
  * 「**你这个客户端不被允许**」——上游在**客户端指纹**维度拒绝了这次请求。
  *
  * 与普通 401/403 的处置**完全相反**，必须单独识别：
@@ -4968,7 +4993,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       //（裸 401/403 → session 是该函数的既定规则），把该家**所有 Key** 逐个标记冷却 1 小时。
       // 连坐效果与"熔断整家"等价：实测随后请求同家另一个完全正常的模型，路由阶段就是
       // `provider p1: 2 个账户全部冷却中 → 交给下一家` —— 一个模型坏掉 = 这家对所有模型静默停用。
-      if (MODEL_UNSUPPORTED_BY_PROVIDER_RE.test(detail)) {
+      if (isModelUnavailableByProvider(upstream.status, detail)) {
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"这家不提供该模型"（含地区/套餐受限）`
           + ' → 继续 failover（**不熔断该家、不冷却账户**；该家对别的模型仍然正常。'
           + '若长期如此，请从配置的 models 里移除该映射）');
@@ -5001,7 +5026,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     //（这个函数、forwardAnthropicViaOpenAI、以及"全部账户不可用"的收尾），三处都要判，
     // 否则同一个 403 走不同路径会有不同后果 —— 这正是 2026-09-30 模型全量测试里
     // "地区受限的模型把整家 13 个正常模型一起封掉"的成因。
-    if (MODEL_UNSUPPORTED_BY_PROVIDER_RE.test(detail)) {
+    if (isModelUnavailableByProvider(upstream.status, detail)) {
       log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"这家不提供该模型"（含地区/套餐受限）`
         + ' → 继续 failover（**不熔断该家**；该家对别的模型仍然正常。若长期如此，请从配置的 models 里移除该映射）');
       // ⚠ 必须交还半开探测名额 —— 与上方"账户级失败"、下方"确定性 4xx"同一个理由：
@@ -5049,17 +5074,35 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     // 名额；否则"确定性 4xx 不记失败"会让半开名额永远被占（熔断卡死）。
     breakerRecordSuccess(provider.id);
     if (!contentBlocked) {
-      // 审计补充：404 要分两种——
-      //  · 上游**不实现该路由**（如某些供应商没有 /responses，返回通用 404/空体）：
-      //    换下一家是有意义的，否则"Codex 仿真"用户会被优先级最高的那家直接打死；
-      //  · 上游**明确说模型不存在/不支持**：这是确定性错误，重发给每一家只是 N 倍计费。
-      // 用响应体特征区分，判不出来时保守按"路由不存在"继续 failover。
-      if (upstream.status === 404 && !MODEL_MISSING_RE.test(detail)) {
+      // 404 的处置（2026-10-13 修）：
+      //  · 上游**不实现该路由**（某些供应商没有 /responses，返回通用 404/空体）：换下一家有意义；
+      //  · 上游**说这个模型不存在/不支持**：这也是**供应商侧**事实，同样要换下一家。
+      //
+      // ⚠ 旧实现把后者当"确定性错误"**终止 failover**（理由写的是"重发给每一家只是 N 倍计费"）。
+      // 那个理由**只在"模型全局不存在"时成立** —— 而配置里同一逻辑模型常常声明了多家，
+      // 其中一家配置过期/写错是**常态**，正是 failover 存在的意义。
+      // 实测事故（cline 桌面版，2026-10-13）：配置里 deepseek-v4-pro 声明了 sensenova 与
+      // opencode-go 两家，sensenova 回 404，网关**直接终止**，客户端拿到
+      // "the provider does not offer this model" 而整轮任务失败 —— 而 opencode-go 本可服务。
+      //
+      // 这与 400 那条路径（2026-09-23 已修，见下方 MODEL_UNSUPPORTED_BY_PROVIDER_RE 处）
+      // 是**同一个教训**：别把供应商侧问题当成请求侧问题。404 侧此前漏了。
+      // 代价：配置过期的供应商每次会白打一个 404（快、不耗额度），远小于整轮失败。
+      if (upstream.status === 404) {
         const routeMissing = ROUTE_MISSING_RE.test(detail);
+        // raw 模式（Responses 资源子路由 GET/DELETE/cancel）没有"模型"概念：
+        // 404 就是"这个资源/路由不存在"，保持原有契约不变。
+        if (rawMode) return { notFound: true, routeMissing };
+        if (MODEL_MISSING_RE.test(detail)) {
+          log(`upstream ${provider.id} HTTP 404 判定为"这家不提供该模型"（模型不存在/不支持）`
+            + ' → 继续 failover（不熔断该家、不冷却账户；该家对别的模型仍然正常。'
+            + '若长期如此，请从配置的 models 里移除该映射，或把它排到后面的优先级）');
+          // 刻意**不调 breakerRecordFail**：该家对别的模型完全正常，记失败会连坐整家。
+          // 半开名额已在上方交还（见本段开头的 breakerRecordSuccess）。
+          return false;
+        }
         log(`upstream ${provider.id} HTTP 404（未见"模型不存在"特征，按路由不存在处理）→ 继续 failover`);
-        // raw 模式（Responses 资源子路由）：把"整条路由没实现"与"资源不存在"的区别带回调用方，
-        // 让它能给客户端一句能照着排查的提示（实测 new-api 对 GET/DELETE/cancel 回 Invalid URL）
-        return rawMode ? { notFound: true, routeMissing } : false;
+        return false;
       }
       // 2026-09-15 实测修复：**供应商侧 4xx（账号/额度/权限/套餐）不属于"请求本身有错"**——
       // 实测 b.ai 余额为 0 时回 HTTP 400 `credit insufficient balance: balance=0`，旧实现
@@ -5101,7 +5144,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       // 记失败会连坐整家（正是上方 :2536 注释所警告的情形）。半开名额已在上方交还。
       // 2026-09-30 扩充：**地区/套餐受限**（"is not available in your region"/"for your plan"）
       // 也属这一类 —— 它同样是**模型级**事实，不该连坐整家。
-      if (MODEL_UNSUPPORTED_BY_PROVIDER_RE.test(detail)) {
+      if (isModelUnavailableByProvider(upstream.status, detail)) {
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"这家不提供该模型"`
           + `（含地区/套餐受限）→ 继续 failover（不熔断该家；若长期如此，请从配置的 models 里移除该映射）`);
         return rawMode ? { retryable: upstream.status } : false;
@@ -7718,7 +7761,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       //    （`Requested model X not supported`）永远走不到这一行，落到下面的
       //     `DETERMINISTIC_4XX_STATUS → {stop}` 直接回客户端 400。
       //     直通路径对同一种响应是继续 failover 的（2026-09-23 修过那一处），翻译路径当时漏了。
-      if (MODEL_UNSUPPORTED_BY_PROVIDER_RE.test(lastDetail)) {
+      if (isModelUnavailableByProvider(upstream.status, lastDetail)) {
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"这家不提供该模型"（含地区/套餐受限）`
           + ' → 继续 failover（**不熔断该家、不冷却账户**；该家对别的模型仍然正常。'
           + '若长期如此，请从配置的 models 里移除该映射）');
@@ -7956,7 +7999,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
   // `breakerRecordFail(provider.id, 403)` 把**整家**熔断 30 分钟，随后同家另一个完全
   // 正常的模型在路由阶段就被 `skip p1 (breaker open)` 挡掉。直通路径因为豁免在最顶层，
   // 所以只有翻译路径复现 —— 这正是"三处都要判"里漏掉的第三处。
-  if (MODEL_UNSUPPORTED_BY_PROVIDER_RE.test(String(lastDetail || ''))) {
+  if (isModelUnavailableByProvider(lastStatus, lastDetail)) {
     log(`provider ${provider.id} 的失败原因是"这家不提供该模型"（含地区/套餐受限）→ 交还半开名额，**不熔断该家**`
       + '（该家对别的模型仍然正常；若长期如此，请从配置的 models 里移除该映射）');
     breakerRecordSuccess(provider.id);

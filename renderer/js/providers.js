@@ -912,6 +912,12 @@ function wireEditor() {
       baseURL: url,
       apiKey: String($('#edKeys').value || '').split(/\r?\n/)[0].trim(),
     };
+    // ⚠ 「该家直连」必须随探测一起传下去（2026-10-13 修，Bug B）：
+    // 旧实现只抄了 id/baseURL/apiKey —— 勾选框的值要到**保存时**才写进配置，
+    // 于是探测时主进程按**全局代理**走。实测后果：无代理的机器上「一键获取全部模型」
+    // 永远失败，必须先保存一次再拉，用户会误以为是代理设置的问题。
+    // 与保存处同一语义：勾了 → proxy:false；不勾 → 不动（沿用全局）。
+    if ($('#edDirect').checked) tmp.proxy = false;
     // ⚠ catch 与 finally **都不能少**：
     //   · 没 catch → IPC 抛错时静默无反应（用户只看到按钮闪一下）
     //   · 没 finally → 抛错后按钮永久停在"拉取中…"且 disabled，点不动，只能关掉抽屉重开
