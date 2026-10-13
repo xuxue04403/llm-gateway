@@ -1513,4 +1513,36 @@ t('代理：显式关闭（enabled=false）→ 直连，且不去探测 / 使用
   assert.ok(logs.some((l) => /显式关闭/.test(l)), '应记一条"显式关闭"：' + logs.join(' | '));
 });
 
+t('代理：主进程的代理决策必须真的透出到 /health（界面靠它决定要不要告警）', async () => {
+  // 这条钉的是**桩间链路**：resolveProxy 算出的决策 → healthSnapshot 附到 /health 响应上 →
+  // 界面读 LG.health.proxyNote。少了任何一段，"配置的代理连不上"就又是只躺在日志里。
+  const http = require('http');
+  const srv = http.createServer((req, res) => {
+    if (req.url !== '/health') return res.writeHead(404).end();
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, accounts: [], proxy: { url: '', noProxy: null, envProxy: false } }));
+  });
+  const port = await new Promise((res) => srv.listen(0, '127.0.0.1', () => res(srv.address().port)));
+  const dir = fs.mkdtempSync(path.join(tmp, 'health-'));
+  const gm = new GatewayManager({ dataDir: dir, logger: { info: () => {} }, settings: null });
+  gm.port = port;
+  try {
+    // ① 还没走 resolveProxy（决策为 null）→ 字段要在、值为 null，且不能抛错
+    let h = await gm.healthSnapshot(3000);
+    assert.strictEqual(h.ok, true, '假 /health 应返回 ok:true');
+    assert.ok('proxyNote' in h, 'proxyNote 字段必须存在（界面靠它判断要不要告警）');
+    assert.strictEqual(h.proxyNote, null, '尚未决策时应为 null');
+    // ② 决策为"配置的代理不可达" → 必须原样透出（界面据此显示告警）
+    gm.proxyDecision = { mode: 'fallback', reason: 'config-unreachable', configured: 'http://127.0.0.1:7890', used: '', warn: true };
+    h = await gm.healthSnapshot(3000);
+    assert.ok(h.proxyNote && h.proxyNote.warn === true, '降级决策必须透出且带 warn：' + JSON.stringify(h.proxyNote));
+    assert.strictEqual(h.proxyNote.configured, 'http://127.0.0.1:7890');
+    // ③ engine 自己的字段不能被覆盖（proxyNote 是"附加"不是"替换"）
+    assert.ok(h.proxy && h.proxy.url === '', '引擎原有的 proxy 字段必须保留：' + JSON.stringify(h.proxy));
+  } finally {
+    srv.close();
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* 忽略 */ }
+  }
+});
+
 run();
