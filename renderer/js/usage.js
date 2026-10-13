@@ -254,7 +254,13 @@
       + '</div>'
       + detailTable(d.detail) + '</div>';
 
-    el.innerHTML = head + cards + panels + trendPanel + detailPanel;
+    // 四张图**两行两列**（用户要求）：包一层网格容器，由 CSS 排成 2×2。
+    // 明细表不进去 —— 它需要整行宽度才放得下 11 列。
+    const grid = '<div class="usage-grid">'
+      + panels + trendPanel
+      + '</div>';
+
+    el.innerHTML = head + cards + grid + detailPanel;
     bind(el);
   };
 

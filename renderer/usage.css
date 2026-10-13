@@ -16,6 +16,15 @@
 .usage-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
 .usage-panel h3 { margin: 0 0 12px; font-size: 14px; font-weight: 600; }
 
+/* 四张图两行两列（用户要求）。
+ * 用 minmax(0, 1fr) 而不是 1fr —— 否则里面的表格会把列撑破、出现横向溢出
+ * （CSS Grid 的经典坑：`1fr` 的 min-width 是 auto，内容不可压缩）。 */
+.usage-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-bottom: 14px; }
+.usage-grid .usage-panel { margin-bottom: 0; height: 100%; }
+/* 窄窗口回落单列（面板里那张表在 <560px 时已经不可读） */
+@media (max-width: 1120px) { .usage-grid { grid-template-columns: minmax(0, 1fr); } }
+
+
 /* 环形图 + 图例 */
 .usage-donut-wrap { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
 .usage-donut { width: 160px; height: 160px; flex: none; }
