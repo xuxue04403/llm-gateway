@@ -152,7 +152,7 @@ function makeSandbox() {
   };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
-  for (const f of ['core.js', 'providers.js']) {
+  for (const f of ['core.js', 'providers.js', 'dashboard.js']) {
     vm.runInContext(fs.readFileSync(path.join(RJ, f), 'utf8'), sandbox, { filename: f });
   }
   // core.js 里的 `$`/`LG`/`Modal` 是**词法常量**（const），读不到 sandbox 的属性上。
@@ -466,6 +466,49 @@ t('渲染层：双击供应商卡片打开编辑抽屉；双击卡片内的按�
   sandbox.window.getSelection = () => selWin;
   rows[1]._listeners.dblclick[0]({ target: makeEl('div'), stopPropagation() {}, preventDefault() {} });
   assert.strictEqual(opened, null, '正在选中文字时不该打开抽屉');
+});
+
+/* ================================================================
+ * 概览页：配置里写的代理连不上时**必须显示出来**
+ *
+ * 背景（用户实测）：把带 `"proxy": {"enabled": true, "url": "http://127.0.0.1:7890"}` 的配置
+ * 拷到没装代理的机器上 → 每个未标直连的供应商请求都失败，而概览页显示"运行中"、一切正常。
+ * 主进程已改成"探测不过就降级"（gateway-manager.resolveProxy），这条用例钉住**界面也要说**。
+ * ================================================================ */
+
+t('渲染层：配置的代理连不上时概览页必须写明（否则用户只看到"所有模型都调不通"）', () => {
+  const S = makeSandbox();
+  const { refs, sandbox } = S;
+  refs.LG.state = { gateway: { running: true, ready: true, port: 3091, configPath: 'C:\\x\\gateway.config.json' } };
+  refs.LG.config = { providers: [], apiKey: 'k' };
+  const el = () => sandbox.document.querySelector('#dashProxy');
+
+  // ① 正常注入代理：显示代理地址，且**不得无端告警**
+  refs.LG.health = { accounts: [], proxy: { url: 'http://127.0.0.1:7890', noProxy: 'a,b,c' }, proxyNote: { reason: 'config', warn: false } };
+  refs.LG.renders.dashboard();
+  assert.ok(/代理 http:\/\/127\.0\.0\.1:7890/.test(el().textContent), '应显示代理地址：' + el().textContent);
+  assert.ok(/3 个域名直连/.test(el().textContent), '应带上直连域名数：' + el().textContent);
+  assert.ok(!/连不上/.test(el().innerHTML), '一切正常时不该出现告警：' + el().innerHTML);
+
+  // ② 降级为直连：必须写明"配置的代理连不上"，并说明已直连
+  refs.LG.health = {
+    accounts: [], proxy: { url: '' },
+    proxyNote: { reason: 'config-unreachable', warn: true, configured: 'http://127.0.0.1:7890', used: '' },
+  };
+  refs.LG.renders.dashboard();
+  const html = el().innerHTML;
+  assert.ok(/连不上/.test(html), '必须写明代理连不上：' + html);
+  assert.ok(/7890/.test(html), '必须指出是哪个地址连不上：' + html);
+  assert.ok(/已直连/.test(html), '必须写明已降级为直连：' + html);
+  assert.ok(/tag warn/.test(html), '这类事实应当用告警样式，而不是和正常状态长得一样：' + html);
+
+  // ③ 降级到了另一个可用代理：文案要说明"改用了谁"，不能说成直连
+  refs.LG.health.proxyNote = {
+    reason: 'config-unreachable', warn: true, configured: 'http://127.0.0.1:7890', used: 'http://127.0.0.1:7897',
+  };
+  refs.LG.renders.dashboard();
+  assert.ok(/改用 http:\/\/127\.0\.0\.1:7897/.test(el().innerHTML),
+    '有替代代理时必须写明改用了谁（写成"直连"就是谎报）：' + el().innerHTML);
 });
 
 run();

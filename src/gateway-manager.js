@@ -470,6 +470,9 @@ class GatewayManager extends EventEmitter {
     // 这个标志由 _doStart 的就绪探测结果驱动（见下方 healthy 的处理）。
     this.failed = false;
     this.stopping = false;
+    // 最近一次启动的代理决策（resolveProxy 写，proxyNote() 读 → /health 透出给界面）。
+    // 存在的意义：**代理不可达导致"所有供应商都调不通"必须让用户看得见**，而不是只写进日志。
+    this.proxyDecision = null;
     this.logTail = '';
     this.port = 3091;
     this.lastActivityAt = 0;
@@ -609,19 +612,53 @@ class GatewayManager extends EventEmitter {
       const cfg = JSON.parse(this.configText() || '{}');
       if (cfg.proxy && cfg.proxy.enabled === false) {
         this.log('代理已显式关闭（proxy.enabled=false），直连。');
+        this.proxyDecision = { mode: 'direct', reason: 'config-disabled', configured: '', used: '' };
         return null;
       }
       if (cfg.proxy && cfg.proxy.enabled) {
         const u = String(cfg.proxy.url || '').trim();
         if (u) {
           const norm = u.includes('://') ? u : 'http://' + u;
-          this.log('使用配置代理 ' + norm);
-          return norm;
+          // 【2026-10-13 修复】显式配置的代理**也必须先探测可达性**。
+          // 旧实现对这条路径是**裸信**的 —— 只对"猜出来的 clash 端口"做 TCP 探测，而配置里写死的
+          // 地址直接采纳。后果：把一份带 `"proxy": {"enabled": true, "url": "http://127.0.0.1:7890"}`
+          // 的配置拷到**没装任何代理**的机器上（实测用户另一台机器就是这个形态），每个没标
+          // `"proxy": false` 的供应商都被发给一个不存在的代理 → 请求挂到超时 / ECONNREFUSED，
+          // 而界面显示"运行中、/health 正常"（自检走恒直连的回环），用户只能从"模型全都调不通"
+          // 里猜原因。本文件 probeProxyUrl 上方的注释早就把这条定为硬要求，只有这个分支漏了。
+          if (await this.probeProxyUrl(norm, 2000)) {
+            this.log('使用配置代理 ' + norm + '（TCP 探测通过）');
+            this.proxyDecision = { mode: 'proxy', reason: 'config', configured: norm, used: norm, warn: false };
+            return norm;
+          }
+          this.log('⚠ 配置的代理 ' + norm + ' 连不上（代理没启动 / 端口不对 / 地址写错）→ **不再使用它**。'
+            + '不这样做的话，一个不存在的代理会让网关"健康"但所有未标记直连的供应商请求全部失败。');
+          this.proxyDecision = { mode: 'fallback', reason: 'config-unreachable', configured: norm, used: '', warn: true };
+          // 降级不是"直接直连"，而是回到与"没配代理"时**同一套**探测流程（环境变量/系统设置/常见端口），
+          // 都不通才直连 —— 否则用户明明有可用的代理，却因为我们只认配置里那一个而全部走直连。
+          const alt = await this.detectProxy();
+          if (alt) {
+            this.proxyDecision.used = alt;
+            this.log('已改用自动探测到的代理 ' + alt + '（配置里那个连不上）。');
+          } else {
+            this.log('也没有探测到其它可用代理 → **直连**（供应商请求不经过任何代理）。'
+              + '若确实需要代理：先启动它，或到「设置 → 网络代理」改地址 / 关掉代理开关。');
+          }
+          return alt;
         }
         this.log('代理已启用但未填地址，回退自动探测…');
+        this.proxyDecision = { mode: 'auto', reason: 'enabled-without-url', configured: '', used: '', warn: false };
       }
     } catch (_) { /* 配置解析失败忽略 */ }
-    return this.detectProxy();
+    const auto = await this.detectProxy();
+    if (this.proxyDecision) this.proxyDecision.used = auto || '';
+    else this.proxyDecision = { mode: auto ? 'proxy' : 'direct', reason: auto ? 'detected' : 'none', configured: '', used: auto || '', warn: false };
+    return auto;
+  }
+
+  /** 最近一次启动的代理决策（供界面展示"配置的代理不可达、已降级"这类**必须让用户看见**的事实）。 */
+  proxyNote() {
+    return this.proxyDecision || null;
   }
 
   /**
@@ -711,8 +748,14 @@ class GatewayManager extends EventEmitter {
     });
   }
 
-  /** 探测一个代理 URL 的 host:port 是否可连。 */
-  async probeProxyUrl(url) {
+  /**
+   * 探测一个代理 URL 的 host:port 是否可连。
+   * @param {string} url 代理地址
+   * @param {number} [timeoutMs] 缺省 600ms（用于"猜出来的端口"，快速试）；**用户在配置里显式
+   *   填写的地址**请传更大的值（调用处传 2000ms）—— 那可能是台远程代理，600ms 会把好代理误判成
+   *   "不可达"然后降级直连，比不探测更糟。
+   */
+  async probeProxyUrl(url, timeoutMs) {
     let host = '';
     let port = 0;
     try {
@@ -721,7 +764,7 @@ class GatewayManager extends EventEmitter {
       port = Number(u.port) || (u.protocol === 'https:' ? 443 : 80);
     } catch (_) { return false; }
     if (!host || !port) return false;
-    return this.probeTcp(host, port, 600);
+    return this.probeTcp(host, port, timeoutMs || 600);
   }
 
   /* ---------------- 生命周期 ---------------- */
@@ -1005,7 +1048,13 @@ class GatewayManager extends EventEmitter {
         res.on('data', (c) => { if (body.length < 512 * 1024) body += c; });
         res.on('end', () => {
           if (res.statusCode !== 200) return resolve({ ok: false, error: 'HTTP ' + res.statusCode });
-          try { resolve(JSON.parse(body)); } catch (e) { resolve({ ok: false, error: '响应不是 JSON' }); }
+          try {
+            const h = JSON.parse(body);
+            // 把"进程实际怎么决定的代理"附上去：引擎只知道注入进来的环境变量，
+            // 不知道"配置里那个代理连不上、已降级"这件事。
+            if (h && typeof h === 'object') h.proxyNote = this.proxyNote();
+            resolve(h);
+          } catch (e) { resolve({ ok: false, error: '响应不是 JSON' }); }
         });
         res.on('error', (e) => resolve({ ok: false, error: String(e && e.message) }));
       });

@@ -282,6 +282,18 @@ const DECLARED = [
     { name: 'dsmlStreamFeed', why: '新增：流式过滤器。两处关键：① 未闭合的 calls 块**整段扣住**（实测踩到：分片2 是 \'<|DSML|calls> <|DSML|invoke …>\'，只扣"未闭合的 <"会因尾部含 > 而漏发整个标记），上限 8000 字符防上游永不闭合时吞正文；② 后缀保留，处理标记被切成 \'<|DSM\' / \'L|calls>\' 的最坏情况' },
     { name: 'dsmlStreamFlush', why: '新增：流结束时吐出扣住的残余（防吞正文）。⚠ 目前**未接线**到流结束点 —— 残余只可能是未闭合的标记片段，风险有限，但应在下一版补上' },
     { name: 'applyDsmlToAnthropicMessage', why: '新增：把 Anthropic message 里的 DSML 文本块换成真正的 tool_use 块并把 stop_reason 置为 tool_use。**非流式路径用它**（实测：客户端收到 text+tool_use，工具名与参数均正确）' },
+    { name: 'providerTimeoutMs', why: '改动（2026-10-13）：半开探测改为**探测超时阶梯** —— 默认仍按 BREAKER_PROBE_TIMEOUT_MS 快速放弃，但 `b.probeFull`（上一次探测是被短阈值掐掉的）时放行完整超时。旧行为"声明了 timeoutMs 的家，探测也照它来"（2026-09-22 为 amd 加的例外）会让**每一次**探测都吃满整个声明值：用户实测 h-e.top（声明 60s）冷却到点后被选中，这一次探测白等 60 秒（`dur=60009ms`）。慢家的恢复能力由阶梯第二步保住（旧用例仍绿）' },
+    { name: 'UPSTREAM_PREFLIGHT_MS', why: '新增：死家 TCP 预检的超时（默认 4s，可用 DSH_GW_UPSTREAM_PREFLIGHT_MS 覆盖）。"连都连不上"的家（端口关闭/DNS 黑洞/TCP 被丢包）旧实现要花掉整个 HTTP 超时才判定失败，而 TCP 层几毫秒就有答案' },
+    { name: 'preflightTargetOf', why: '新增：决定预检**谁** —— 走代理时检代理、否则检上游（命中 NO_PROXY 视为直连）。为什么不直接检上游：被墙的上游直连本来就必然失败，拿它当判据会把好家误判成死家（用户那台没装 Clash 的机器正是这个形态）' },
+    { name: 'tcpReachable', why: '新增：纯 TCP 握手探测（只 connect，不发任何数据），带去重结算的 settled 标志' },
+    { name: 'upstreamSuspect', why: '新增：判定"该家可疑到值得先做一次 TCP 预检"。三条判据：half-open（正在探测）→ 是；open → 否（轮不到发请求）；closed 但 `opens>0 && lastNetFailAt > lastOkAt`（开过闸且此后只有网络失败没有成功应答）→ 是。**健康家一律不检**，不引入额外拨号延迟。刻意**不**用"把待探测的家排到候选末尾"（2026-09-17 已否掉：那样首选家恢复后再也轮不到）' },
+    { name: 'upstreamPreflight', why: '新增：预检的执行体，返回 {ok, detail} 供日志写明"检的是谁、耗时多久、阈值多少"。baseURL 解析不了时放行（交给正常路径报错，不改变既有行为）' },
+    { name: 'breakerRecordFail', why: '改动（2026-10-13）：新增第 4 个参数 `timedOutByUs`（= 这次失败是**我们自己的超时**掐掉的）与两个状态位：① `lastNetFailAt`（只有网络类失败才更新，供 upstreamSuspect 判定）；② `probeFull`（探测超时阶梯：被短阈值掐掉 → 下次放完整超时；完整超时仍失败/快速失败 → 回到短阈值）' },
+    { name: 'breakerRecordSuccess', why: '改动（2026-10-13）：交还名额时同时置 `lastOkAt`（"最近一次确实应答过"）并把 `probeFull` 归零（该家已能正常应答，下次探测重新从短阈值开始）' },
+    { name: 'BREAKER_BACKOFF_MAX_MS', why: '改动（2026-10-13）：默认 30 分钟 → **120 分钟**。一个永不恢复的死家每 30 分钟就被重新放行一次探测，而"冷却到点必然放行一次探测"是必须保留的保底性质（否则恢复后永远选不上），所以只能降低频率。用户实测：h-e.top 当天 9 次超时、18 次熔断跳过。env 覆盖（DSH_GATEWAY_BREAKER_BACKOFF_MAX_MS）不变' },
+    { name: 'BREAKER_LONG_MS', why: '**仅注释**改动：上方那段说明退避阶梯的注释（90s→…→封顶值）随上限调整一起重写，常量值本身未变（仍为 30 分钟长熔断，401/403 业务拒绝用）' },
+    { name: 'forward', why: '改动（2026-10-13）：发请求前加"死家预检"分支（upstreamSuspect → upstreamPreflight，不通则记网络失败、一个 HTTP 请求都不发）；并把 `describeAbortIfOurs` 提前到 `breakerRecordFail` 之前，把"是不是我们自己的超时"传给探测超时阶梯' },
+    { name: 'forwardAnthropicViaOpenAI', why: '改动（2026-10-13）：同一条死家预检（放在选账户**之前**：账号池的冷却/轮换不该被一个死家牵动），并把 abortInfo 传给探测超时阶梯。这条路径（Anthropic 客户端 → openai-chat 上游）是 dsh/cline 走得最多的一条，只修直通路径等于没修' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

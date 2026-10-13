@@ -13,7 +13,7 @@ const util = require('../src/writers/util');
 const models = require('../src/writers/models');
 const datadir = require('../src/datadir');
 const probe = require('../src/probe');
-const { validateConfigText } = require('../src/gateway-manager');
+const { validateConfigText, GatewayManager } = require('../src/gateway-manager');
 const modelMeta = require('../src/model-meta');
 const { Settings } = require('../src/settings');
 const logger = require('../src/logger');
@@ -1454,6 +1454,63 @@ t('用量聚合（异步切片）：与同步结果一致 / 明细有界且按 t
   assert.ok(yields >= 2, '异步版应多次让出事件循环（实际 ' + yields + ' 次）—— 没有它界面照样会冻');
 
   fs2.rmSync(tmp, { recursive: true, force: true });
+});
+
+/* ==================== 代理可达性（2026-10-13） ====================
+ * 背景（用户实测）：配置里写着 `"proxy": {"enabled": true, "url": "http://127.0.0.1:7890"}`，
+ * 把这份配置拿到**没装任何代理**的机器上，每个没标 `"proxy": false` 的供应商请求都被发给一个
+ * **不存在的代理** → 全部挂到超时 / ECONNREFUSED，而界面显示"运行中、/health 正常"
+ *（自检走恒直连的回环），用户只能从"模型全都调不通"里猜原因。
+ * 根因：detectProxy() 的三个分支（环境变量 / 注册表 / 常见 clash 端口）**都做了 TCP 探测**，
+ * 唯独"用户显式配置"这条分支是**裸信**的。下面三条用例把这条分支钉死。
+ */
+async function proxyCase(cfgProxy) {
+  const dir = fs.mkdtempSync(path.join(tmp, 'proxy-'));
+  const logs = [];
+  const gm = new GatewayManager({ dataDir: dir, logger: { info: (m) => logs.push(String(m)) }, settings: null });
+  fs.writeFileSync(gm.configPath, JSON.stringify({ port: 3099, apiKey: 'k', proxy: cfgProxy, providers: [] }), 'utf8');
+  const resolved = await gm.resolveProxy();
+  return { gm, resolved, logs };
+}
+
+const freeTcpPort = () => new Promise((res) => {
+  const s = require('net').createServer();
+  s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); });
+});
+
+t('代理：配置里写的代理**连不上**时不再裸信 —— 降级 + 明确日志 + 标 warn 给界面', async () => {
+  const deadPort = await freeTcpPort();
+  const dead = 'http://127.0.0.1:' + deadPort;
+  const { gm, resolved, logs } = await proxyCase({ enabled: true, url: dead });
+  assert.notStrictEqual(resolved, dead,
+    '连不上的代理绝不能被采纳（旧实现直接返回它 → 所有未标直连的供应商请求全部失败）');
+  const note = gm.proxyNote();
+  assert.strictEqual(note.reason, 'config-unreachable', '应记为"配置的代理不可达"：' + JSON.stringify(note));
+  assert.strictEqual(note.configured, dead);
+  assert.strictEqual(note.warn, true, '必须标 warn —— 这件事要在界面上显示给用户，不能只写日志');
+  assert.ok(logs.some((l) => /连不上/.test(l) && /不再使用它/.test(l)),
+    '日志必须写明降级原因：' + logs.join(' | '));
+  if (resolved) assert.strictEqual(note.used, resolved, '降级后实际走的是谁要能查到');
+});
+
+t('代理：配置里写的代理**能连上**时照常使用（别把好代理误判成不可达）', async () => {
+  const srv = require('net').createServer(() => { /* 只接受连接，不做代理协议 */ });
+  const port = await new Promise((res) => srv.listen(0, '127.0.0.1', () => res(srv.address().port)));
+  const good = 'http://127.0.0.1:' + port;
+  try {
+    const { gm, resolved, logs } = await proxyCase({ enabled: true, url: good });
+    assert.strictEqual(resolved, good, '可达的代理必须原样使用（误判成"不可达"比不探测更糟）');
+    assert.strictEqual(gm.proxyNote().reason, 'config');
+    assert.strictEqual(gm.proxyNote().warn, false);
+    assert.ok(logs.some((l) => /TCP 探测通过/.test(l)), '日志应写明探测通过：' + logs.join(' | '));
+  } finally { srv.close(); }
+});
+
+t('代理：显式关闭（enabled=false）→ 直连，且不去探测 / 使用任何代理', async () => {
+  const { gm, resolved, logs } = await proxyCase({ enabled: false, url: 'http://127.0.0.1:7890' });
+  assert.strictEqual(resolved, null, 'enabled=false → 必须直连');
+  assert.strictEqual(gm.proxyNote().reason, 'config-disabled');
+  assert.ok(logs.some((l) => /显式关闭/.test(l)), '应记一条"显式关闭"：' + logs.join(' | '));
 });
 
 run();

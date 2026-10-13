@@ -74,13 +74,18 @@ const UPSTREAM_TIMEOUT_MS = (() => {
 })();
 /** 供应商级超时：provider.timeoutMs > 全局默认；**半开探测**用短超时（见 BREAKER_PROBE_TIMEOUT_MS）。
  *
- * 例外（2026-09-22 实测事故：amd 的 DeepSeek-V4.1-Flash 永远选不上）：
- * 供应商**显式声明** `timeoutMs` 时，半开探测也照它来，不再压到 10 秒。
- * 旧实现用 `Math.min(base, PROBE)` 一刀切，于是"首字节稳定 >10s"的家**探测必然超时**
- * → 熔断重新 open → 退避 2m→3m→6m→12m→30m → 再探测又超时，**永远无法恢复**；
- * 实测 amd 该模型首字节 13.7–15.5s（同家 DeepSeek-V4-Flash 只要 0.7–1.1s），
- * 结果每个请求都 `skip amd (breaker open)` 落到 workbuddy——配了 timeoutMs 也没用。
- * 未声明 timeoutMs 的家仍走 10 秒探测上限（探测是在替全家人试错，不该占满用户 60 秒）。 */
+ * 历史（2026-09-22 实测事故：amd 的 DeepSeek-V4.1-Flash 永远选不上）：
+ * 曾用 `Math.min(base, PROBE)` 一刀切压探测超时，于是"首字节稳定 >10s"的家**探测必然超时**
+ * → 熔断重新 open → 退避递增 → **永远无法恢复**（实测 amd 该模型首字节 13.7–15.5s，
+ * 同家 DeepSeek-V4-Flash 只要 0.7–1.1s，结果每个请求都 `skip amd (breaker open)` 落到 workbuddy）。
+ * 当时的修法是"显式声明了 timeoutMs 的家，探测也照它来"。
+ *
+ * 2026-10-13 改成**探测超时阶梯**（两侧的坑都躲开，状态位见 `b.probeFull`）：
+ *   · 默认仍按 PROBE 快速放弃（探测是在替全家人试错，不该占满用户 60 秒）；
+ *   · 但**上一次探测是被这个短阈值掐掉的**时，本次放行完整超时 → 慢家仍能恢复（amd 那个坑）；
+ *   · 完整超时的探测也失败 → 回到短阈值 → 死家不再每次都吃满完整超时。
+ * 为什么必须改：声明了 `timeoutMs: 60000` 的家一旦真的连不上，旧行为会让**每一次**探测
+ * 都白等 60 秒（用户 2026-10-13 实测日志 `[call] … dur=60009ms` 即此形态，见 upstreamSuspect 注释）。 */
 /**
  * **逐模型**超时：模型条目上的 `timeoutMs` 优先。
  *
@@ -118,7 +123,9 @@ function providerTimeoutMs(provider, model) {
   try {
     const b = breaker.get(String((provider && provider.id) || ''));
     if (b && b.state === 'half-open') {
-      return declared ? base : Math.min(base, BREAKER_PROBE_TIMEOUT_MS);
+      // 探测超时阶梯（见上方注释）：上一次探测被短阈值掐掉 → 本次放行完整超时，让慢家能恢复；
+      // 否则一律按 PROBE 快速放弃（声明没声明 timeoutMs 一视同仁）。
+      return b.probeFull ? base : Math.min(base, BREAKER_PROBE_TIMEOUT_MS);
     }
   } catch (_) { /* 模块初始化早期（const 尚未就绪）→ 退回常规超时 */ }
   return base;
@@ -644,12 +651,16 @@ const BREAKER_SHORT_MS = envMs('DSH_GATEWAY_BREAKER_SHORT_MS', 90_000);      // 
                                                 // 全部 404/503，用户以为网关坏了）
 const BREAKER_LONG_MS = envMs('DSH_GATEWAY_BREAKER_LONG_MS', 30 * 60_000);  // 长熔断 30 分钟（401/403 业务拒绝）
 // 2026-09-17 优化（实测事故：坏家长期霸占候选首位）：
-//  ① 短熔断按"连续开闸次数"指数退避 90s→3m→6m→12m→24m→30m（封顶 30 分钟）。
+//  ① 短熔断按"连续开闸次数"指数退避 90s→3m→6m→12m→24m→…（封顶见 BACKOFF_MAX）。
 //     旧实现固定 90 秒：windhub 当天被放了 28 次探测、x666 12 次，每次都在用户请求路径上白等。
 //  ② 半开探测用**短超时**（默认 10 秒，而不是 60 秒）：冷却到点后的那一次请求是在替全家人
 //     试错，不该占满用户 60 秒（实测 14:35:05 探 x666 → 14:36:05 放弃 = 正好 60s → 再转
 //     agentrouter 18s → 该请求 78.5s；同模型正常只要 14–26s）。
-const BREAKER_BACKOFF_MAX_MS = envMs('DSH_GATEWAY_BREAKER_BACKOFF_MAX_MS', 30 * 60_000);
+// 2026-10-13：上限 30 分钟 → 120 分钟。理由：一个**永不恢复**的死家每 30 分钟就被重新放行
+// 一次探测，而"放行"是保底性质（必须保留，否则恢复后永远选不上），所以只能降低频率。
+// 用户实测：h-e.top（priority=1）当天 9 次超时、18 次熔断跳过，20:34 冷却到点后又被选中，
+// 这一次探测白等 60 秒（`dur=60009ms`）。提高上限后同一死家的探测频率降为 1/4。
+const BREAKER_BACKOFF_MAX_MS = envMs('DSH_GATEWAY_BREAKER_BACKOFF_MAX_MS', 120 * 60_000);
 const BREAKER_PROBE_TIMEOUT_MS = envMs('DSH_GATEWAY_BREAKER_PROBE_TIMEOUT_MS', 10_000);
 
 /* 2026-09-23（审计 D1 修复）：半开探测名额的**兜底回收期**。
@@ -812,9 +823,18 @@ function breakerAcquire(providerId) {
   return true;
 }
 
-function breakerRecordFail(providerId, httpStatus, serverRetryMs) {
+function breakerRecordFail(providerId, httpStatus, serverRetryMs, timedOutByUs) {
   const b = breaker.get(providerId) || { state: 'closed', fails: 0, openUntil: 0, opens: 0 };
   b.fails += 1;
+  // 「最近一次连不上」的时间戳（只有网络类失败才更新：httpStatus 为空 = 根本没能拿到响应）。
+  // 它是 upstreamSuspect() 的判据之一 —— 开过闸、且此后只有网络失败没有成功应答的家，
+  // 下一次发请求前值得先做一次 TCP 预检。
+  if (!httpStatus) b.lastNetFailAt = Date.now();
+  // 探测超时阶梯的状态推进（详见 providerTimeoutMs 上方注释）：
+  //   被短阈值掐掉的探测 → 下一次放行完整超时（否则"首字节 >PROBE 的慢家"永远无法恢复）；
+  //   完整超时的探测仍失败 / 快速失败（连接被拒等）→ 回到短阈值（死家不再每次吃满完整超时）。
+  const wasProbe = b.state === 'half-open';
+  if (wasProbe) b.probeFull = (!!timedOutByUs && !b.probeFull);
   // V2b：401/403 业务性拒绝（鉴权失败/需充值/禁用）不会自愈——首次出现即长熔断 30 分钟，
   // 不必等连续 3 次（避免固定失败模式被风控画像）；网络错/5xx 仍按 3 次阈值短熔断
   const immediate = (httpStatus === 401 || httpStatus === 403);
@@ -851,6 +871,75 @@ function breakerRecordSuccess(providerId) {
   b.state = 'closed';
   b.openUntil = 0;
   b.probeAt = 0;
+  b.probeFull = false;      // 探测超时阶梯归零：该家已经能正常应答，下次探测从短阈值重新开始
+  b.lastOkAt = Date.now();  // "最近一次确实应答过" —— upstreamSuspect() 靠它与 lastNetFailAt 比较
+}
+
+/* ---------------- 死家前置连通性检查（2026-10-13） ----------------
+ * 现象（用户实测日志）：priority=1 的 h-e.top 连续 3 次超时 → 熔断 → 冷却到点后又排在首位，
+ * 这一次半开探测把用户请求白等了 60 秒（`[call] … dur=60009ms`），最后 3.6 秒由备选服务。
+ * 根因不是熔断阈值，而是**探测的成本全部落在用户请求路径上**：上游若是"连都连不上"的死家
+ * （DNS 黑洞 / TCP 被丢包 / 端口关闭），我们却先花掉整个 HTTP 超时才判定失败 ——
+ * 而 TCP 层几毫秒就能给出答案。
+ *
+ * 做法：只对**已知可疑**的家先做一次 TCP 预检，连不上就不发 HTTP 请求：
+ *   · half-open（正在探测）→ 一定做；
+ *   · 开过闸、且此后只有网络失败没有成功应答 → 做（覆盖"刚重启就撞上死家"的第一次请求）；
+ *   · 其它（健康家）→ **不做**，绝不引入额外一次拨号延迟。
+ *
+ * 走代理时必须预检**代理**而不是上游：被墙的上游直连本来就必然失败，拿它当判据会把好家误判成
+ * 死家（用户那台没装 Clash 的机器正是这个形态，见 gateway-manager.resolveProxy 的姊妹修复）。
+ */
+const UPSTREAM_PREFLIGHT_MS = envMs('DSH_GW_UPSTREAM_PREFLIGHT_MS', 4000);
+
+/** 预检目标：走代理就检代理，否则检上游（命中 NO_PROXY 视为直连）。 */
+function preflightTargetOf(baseURL) {
+  let url = null;
+  try { url = new URL(upstreamBase(baseURL)); } catch (_) { return null; }
+  const st = proxyStatus();
+  if (st.url && st.envProxy && !hostInNoProxy(url.hostname, st.noProxy)) {
+    try {
+      const p = new URL(st.url);
+      return { host: p.hostname, port: Number(p.port) || (p.protocol === 'https:' ? 443 : 80), via: '代理 ' + st.url };
+    } catch (_) { return null; }
+  }
+  return { host: url.hostname, port: Number(url.port) || (url.protocol === 'https:' ? 443 : 80), via: '直连' };
+}
+
+/** TCP 连通探测（只握手，不发任何数据；true = 端口可连）。 */
+function tcpReachable(host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let sock = null;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      try { if (sock) sock.destroy(); } catch (_) { /* 忽略 */ }
+      resolve(ok);
+    };
+    try { sock = net.connect({ host, port }); } catch (_) { done(false); return; }
+    sock.setTimeout(timeoutMs, () => done(false));
+    sock.on('connect', () => done(true));
+    sock.on('error', () => done(false));
+  });
+}
+
+/** 该家是否"可疑到值得先做一次 TCP 预检"。纯读、无副作用，可被同一请求多次调用。 */
+function upstreamSuspect(provider) {
+  const b = breaker.get(String((provider && provider.id) || ''));
+  if (!b) return false;
+  if (b.state === 'half-open') return true;      // 正在探测：先确认连得上，别白等整个超时
+  if (b.state !== 'closed') return false;        // open：根本轮不到发请求
+  return (b.opens || 0) > 0 && (b.lastNetFailAt || 0) > (b.lastOkAt || 0);
+}
+
+/** 可疑家的发请求前预检。返回 { ok, detail }；baseURL 解析不了时放行（交给正常路径报错）。 */
+async function upstreamPreflight(provider) {
+  const t = preflightTargetOf(provider && provider.baseURL);
+  if (!t) return { ok: true, detail: '' };
+  const t0 = Date.now();
+  const ok = await tcpReachable(t.host, t.port, UPSTREAM_PREFLIGHT_MS);
+  return { ok, detail: `${t.host}:${t.port}（${t.via}，${Date.now() - t0}ms，阈值 ${UPSTREAM_PREFLIGHT_MS}ms）` };
 }
 
 /** 熔断冷却剩余秒数（客户端重试提示用）。 */
@@ -872,9 +961,16 @@ function breakerCooldownSecs(providers) {
  * 曾实现过"待探测的家排到最后"，但那样只要备选一直可用，**首选家恢复后也不会再被用到**——
  * 等于静默改变优先级语义（用户把 x666 放第一是有意的）。因此只做两件事：
  *   ① 探测超时单独设短（BREAKER_PROBE_TIMEOUT_MS，默认 10s，而不是 60s）；
- *   ② 网络类熔断按连续开闸次数指数退避（90s→3m→6m→12m→24m→30m）。
- * 合起来：用户最多为探测多等 10 秒，且第 5 次之后基本每 30 分钟才会撞上一次。
- *（若要进一步做到"零用户代价"，需要后台恢复探测 + 只缩短冷却不直接解除熔断，属后续可选优化。）
+ *   ② 网络类熔断按连续开闸次数指数退避（90s→3m→6m→12m→24m→2h）。
+ * 合起来：用户最多为探测多等 10 秒，且第 5 次之后基本每 2 小时才会撞上一次。
+ *
+ * 2026-10-13 补充（用户报"死家每半小时白等 60 秒"）——三条措施，都**不动候选顺序**：
+ *   ① `probeFull` 探测超时阶梯：声明了 timeoutMs 的家不再每次探测都吃满整个超时；
+ *   ② `upstreamSuspect` + TCP 预检：连都连不上的家直接跳过，一次 HTTP 请求都不发；
+ *   ③ 退避上限 30 分钟 → 120 分钟（降低死家的探测频率）。
+ * **仍然不做"待探测的家排到最后"**：那正是上面 2026-09-17 否掉的做法，理由不变。
+ * 剩下的已知代价：一个"TCP 连得上但永不回响应"的家，探测仍会等满一次超时（阶梯决定是短还是完整）；
+ * 要彻底消除只能后台恢复探测（需额外的上游请求或 /models 探测，后者被不少中转拒绝），属后续可选项。
  */
 
 
@@ -4895,8 +4991,21 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     log(`skip ${provider.id} (breaker: cooldown or half-open probe already in flight)`);
     return false;
   }
-  const startedAt = Date.now();   // 网络错"够快才重试"的判定基准
   const timeoutMs = providerTimeoutMs(provider, body && body.model);
+  // 死家前置预检（2026-10-13，详见 upstreamSuspect 上方注释）：可疑的家先在 TCP 层确认连得上，
+  // 连不上就**一个 HTTP 请求都不发** —— 否则要白等到整个 HTTP 超时才判定失败（用户实测 60 秒）。
+  if (upstreamSuspect(provider)) {
+    const pre = await upstreamPreflight(provider);
+    if (!pre.ok) {
+      log(`upstream ${provider.id} 预检连不通（${pre.detail}）→ 不发请求，直接记为网络失败并换下一家`
+        + `（省掉本次最多 ${timeoutMs}ms 的上游等待）`);
+      catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
+      breakerRecordFail(provider.id, 0);
+      return rawMode ? { retryable: 0 } : false;
+    }
+    log(`upstream ${provider.id} 预检通过（${pre.detail}），继续转发`);
+  }
+  const startedAt = Date.now();   // 网络错"够快才重试"的判定基准
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let upstream;
@@ -5119,10 +5228,12 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     if (!upstream) {
       // R3 防封：失败冷却而非立即删缓存（防每个请求都重试上游形成风暴）
       catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-      breakerRecordFail(provider.id, 0);   // V2：网络错误 → 短熔断
       // 区分"我们超时放弃"与"上游/代理把连接掐了" —— 两者的 message 同形
       //（都是 This operation was aborted），处置却完全相反：前者要调阈值，后者不用。
+      // 先算 abortInfo 再记熔断：第 4 个参数（timedOutByUs）驱动探测超时阶梯 ——
+      // "被短阈值掐掉"的探测下一次要放行完整超时，慢家才恢复得回来。
       const abortInfo = describeAbortIfOurs(e, { signal: controller.signal, timeoutMs, elapsedMs: Date.now() - startedAt });
+      breakerRecordFail(provider.id, 0, 0, !!abortInfo);   // V2：网络错误 → 短熔断
       const why = abortInfo
         ? `上游无响应，${abortInfo.text}`
         : `${e.message}${causeText ? ' (' + causeText + ')' : ''}${proxyHintFor(upstreamUrl, causeText)}`;
@@ -7849,6 +7960,20 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
   const wantsStream = !!body.stream;
   // 限流冷却的作用域用**上游模型 ID**（body 已由 bodyForProvider 映射），与直通路径一致
   const scopeModel = (body && typeof body.model === 'string') ? body.model : '';
+  // 死家前置预检：与直通路径同一判据（详见 upstreamSuspect 上方注释）。这条路径
+  //（Anthropic 客户端 → openai-chat 上游）是 dsh/cline 走得最多的一条，不能只修直通那条。
+  // 放在选账户**之前**：账号池的冷却/轮换不该被一个死家牵动，且预检是供应商粒度、只需一次。
+  if (upstreamSuspect(provider)) {
+    const pre = await upstreamPreflight(provider);
+    if (!pre.ok) {
+      log(`upstream ${provider.id} 预检连不通（${pre.detail}）→ 不发请求，直接记为网络失败并换下一家`
+        + `（省掉本次最多 ${providerTimeoutMs(provider, scopeModel)}ms 的上游等待）`);
+      catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
+      breakerRecordFail(provider.id, 0);
+      return false;
+    }
+    log(`upstream ${provider.id} 预检通过（${pre.detail}），继续转发`);
+  }
   const picked = pickAccount(provider, scopeModel);
   if (picked.acct === null && picked.cooling > 0) {
     log(`provider ${provider.id}: ${picked.cooling} 个账户全部冷却中 → 交给下一家`);
@@ -7980,7 +8105,8 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
           : `${e.message}${causeText ? ' (' + causeText + ')' : ''}${proxyHintFor(upstreamUrl, causeText)}`;
         log(`upstream ${provider.id} request error: ${why}`);
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-        breakerRecordFail(provider.id, 0);
+        // 第 4 个参数驱动探测超时阶梯：被短阈值掐掉的探测下次放行完整超时（详见 providerTimeoutMs）
+        breakerRecordFail(provider.id, 0, 0, !!abortInfo);
         return false;
       }
     }

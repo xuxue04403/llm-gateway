@@ -41,9 +41,19 @@ LG.renders.dashboard = function renderDashboard() {
         + (cool > 0 ? ` <span class="tag warn">${cool} 个冷却中</span>` : ' <span class="tag ok">全部可用</span>');
     }
     const px = (LG.health && LG.health.proxy) || {};
-    $('#dashProxy').textContent = px.url
+    const pn = (LG.health && LG.health.proxyNote) || {};
+    const proxyText = px.url
       ? ('代理 ' + px.url + (px.noProxy ? ' · ' + px.noProxy.split(',').length + ' 个域名直连' : ''))
       : '直连（未注入代理）';
+    // 配置里写的代理连不上时**必须让用户看见**：那种情况下所有未标直连的供应商请求都会失败，
+    // 而这一页原本显示一切正常（用户实测就是这么被误导的）。主进程的决策见 gateway-manager.proxyNote()。
+    if (pn.warn) {
+      $('#dashProxy').innerHTML = esc(proxyText)
+        + ' <span class="tag warn">配置的代理 ' + esc(pn.configured || '')
+        + ' 连不上，已' + (pn.used ? '改用 ' + esc(pn.used) : '直连') + '</span>';
+    } else {
+      $('#dashProxy').textContent = proxyText;
+    }
   }
 
   /* --- 接入信息 --- */

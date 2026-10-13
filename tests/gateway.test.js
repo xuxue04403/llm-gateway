@@ -4853,6 +4853,82 @@ let upstreamPort = 0;
     }
   });
 
+  // ============ 2026-10-13：死家"每次探测都吃满整个超时"（用户实测 dur=60009ms）============
+
+  t('探测超时阶梯①：声明了 timeoutMs 的家，半开探测**第一次**按短阈值快速放弃（不再每次白等整个超时）', async () => {
+    // 用户实测形态：h-e.top（priority=1、声明 60s 超时）连不上，冷却到点后又被选中，
+    // 这一次半开探测白等 60 秒才轮到备选。旧实现里"声明了 timeoutMs 的家，探测也照它来"
+    //（2026-09-22 为 amd 加的例外）会让**每一次**探测都吃满整个声明值。
+    const up = await startFakeUpstream({ status: 500 });
+    const gw = await startGatewayWith([providerOf('stall', up, { priority: 1, timeoutMs: 8000 })], 'probelad1', {
+      DSH_GATEWAY_BREAKER_SHORT_MS: '300', DSH_GATEWAY_BREAKER_PROBE_TIMEOUT_MS: '400',
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      for (let i = 0; i < 3; i++) await call({ port: gw.port });   // 3 连败 → 开闸
+      // 冷却到点后让上游"不再响应"：这一次请求会走半开探测
+      up.st.status = 200;
+      up.st.delayMs = 60_000;
+      await sleep(500);
+      const t0 = Date.now();
+      const r = await call({ port: gw.port });
+      const dur = Date.now() - t0;
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/breaker HALF-OPEN: stall/.test(logText), '应确实走了半开探测：' + logText.slice(-400));
+      assert.ok(/阈值 400ms/.test(logText),
+        '这一次探测必须按短阈值（400ms）掐掉，而不是声明的 8000ms：' + logText.slice(-500));
+      assert.ok(dur < 3000, '探测不该让用户白等声明的 8000ms；实际 ' + dur + 'ms');
+      assert.strictEqual(r.status, 503, '唯一候选不可用 → 503，实际 ' + r.status);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('死家预检：可疑的家先做 TCP 连通性检查，连不上就**一个 HTTP 请求都不发**', async () => {
+    // 背景：上游若是"连都连不上"的死家（端口关闭 / DNS 黑洞 / TCP 被丢包），
+    // 旧实现要花掉整个 HTTP 超时才判定失败 —— 而 TCP 层几毫秒就能给出答案。
+    // 这里让引擎**声明 8 秒超时**（旧行为下必然等满 8 秒），再让端口彻底关闭。
+    const up = await startFakeUpstream({ status: 500 });
+    const gw = await startGatewayWith([providerOf('gone', up, { priority: 1, timeoutMs: 8000 })], 'preflight', {
+      DSH_GATEWAY_BREAKER_SHORT_MS: '300', DSH_GATEWAY_BREAKER_PROBE_TIMEOUT_MS: '8000',
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      for (let i = 0; i < 3; i++) await call({ port: gw.port });   // 3 连败 → 开闸
+      // 彻底关掉上游：**必须 closeAllConnections**，否则 undici 的连接池会复用那条
+      // 已建立的长连接（listener 关闭不会杀掉已建立的连接），端口看起来"还活着"。
+      up.server.closeAllConnections();
+      await new Promise((res) => up.server.close(res));
+      await sleep(500);   // 等熔断冷却到点 → 下一次请求走"半开探测"
+      const t0 = Date.now();
+      const r = await call({ port: gw.port });
+      const dur = Date.now() - t0;
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/预检连不通/.test(logText),
+        '应先做 TCP 预检并明确记下"连不通"：' + logText.slice(-500));
+      assert.ok(!/request error/.test(logText.slice(logText.indexOf('breaker OPEN'))),
+        '预检不通过时**不应再发 HTTP 请求**（发了才会出现 request error）：' + logText.slice(-500));
+      assert.ok(dur < 3000, '预检应在毫秒级给出结论，而不是等满 8 秒 HTTP 超时；实际 ' + dur + 'ms');
+      assert.strictEqual(r.status, 503, '唯一候选不可用 → 503，实际 ' + r.status);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网络类熔断退避上限默认 120 分钟（死家不再每 30 分钟就被重新放行一次探测）', async () => {
+    // 用户实测：h-e.top 当天 9 次超时 / 18 次熔断跳过，而"冷却到点必然放行一次探测"是
+    // **必须保留**的保底性质（否则恢复后永远选不上）。所以只能降低频率：上限 30m → 120m。
+    // 这条用例钉住**默认值**（不设 env 覆盖），并断言日志里报出的上限与之一致。
+    const up = await startFakeUpstream({ status: 500 });
+    const gw = await startGatewayWith([providerOf('slowdeath', up, { priority: 1 })], 'backoffcap', {
+      DSH_GATEWAY_BREAKER_SHORT_MS: '300',
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      for (let i = 0; i < 3; i++) await call({ port: gw.port });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/breaker OPEN: slowdeath/.test(logText), '应先开闸：' + logText.slice(-400));
+      assert.ok(/上限 120 分钟/.test(logText),
+        '网络类熔断的退避上限应为 120 分钟（旧值 30 分钟 → 死家每半小时被重新探测一次）：' + logText.slice(-500));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
   for (const { name, fn } of __tests) {
     await fn();
     passed++;
