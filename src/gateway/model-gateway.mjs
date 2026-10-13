@@ -3889,6 +3889,162 @@ function noteDsmlFromMessage(msg, providerId, where) {
   } catch (_) { /* 忽略 */ }
 }
 
+
+/* ── DSML 解析（2026-10-13）────────────────────────────────────────────────
+ *
+ * 背景：DeepSeek 系模型在**未拿到结构化 tools 定义**（或上游中转没做解析）时，
+ * 会把工具调用写成自己原生的文本标记回给上游：
+ *
+ *   <|DSML|calls>
+ *   <|DSML|invoke name="run_shell">
+ *   <|DSML|parameter name="cmd">rm -rf x</|DSML|parameter>
+ *   </|DSML|invoke>
+ *   </|DSML|calls>
+ *
+ * 实测（用户报"输出被截断"）：上游把这段当 **content 纯文本**返回，网关原样转发，
+ * 客户端把标记当正文显示成乱码 —— 工具也不会执行。
+ *
+ * 这里做两件事：
+ *   · 非流式：把完整标记**转成真正的 tool_use 块**（工具能正常执行）；
+ *   · 流式  ：至少把标记**从正文里剔除**（不再显示乱码）并大声记日志。
+ *     流式不构造 tool_use 是**已知限制**：需要在跨分片缓冲里重建块索引与
+ *     toolCallSlot 状态机，风险高于收益，留待单独一版。
+ *
+ * ⚠ 标记两侧可能是半角 | 或全角 ｜，标记内可能有空白（不同上游清洗程度不同），
+ * 所以正则一律容忍空白。解析失败时**原样返回**（宁可显示乱码，也不能吞掉正文）。
+ */
+const DSML_ANY_RE = /<\s*[|｜]\s*DSML\s*[|｜]/i;
+const DSML_CALLS_RE = /<\s*[|｜]\s*DSML\s*[|｜]\s*calls\s*>([\s\S]*?)<\s*\/\s*[|｜]\s*DSML\s*[|｜]\s*calls\s*>/gi;
+const DSML_INVOKE_RE = /<\s*[|｜]\s*DSML\s*[|｜]\s*invoke\s+name\s*=\s*"([^"]*)"\s*>([\s\S]*?)<\s*\/\s*[|｜]\s*DSML\s*[|｜]\s*invoke\s*>/gi;
+const DSML_PARAM_RE = /<\s*[|｜]\s*DSML\s*[|｜]\s*parameter\s+name\s*=\s*"([^"]*)"\s*>([\s\S]*?)<\s*\/\s*[|｜]\s*DSML\s*[|｜]\s*parameter\s*>/gi;
+
+/** 从一段（可能含多个 invoke 的）DSML 正文里解析出调用列表 */
+function parseDsmlInvokes(body) {
+  const calls = [];
+  DSML_INVOKE_RE.lastIndex = 0;
+  let m;
+  while ((m = DSML_INVOKE_RE.exec(body)) !== null) {
+    const name = String(m[1] || '').trim();
+    if (!name) continue;                       // 无名调用无法执行，跳过
+    const args = {};
+    DSML_PARAM_RE.lastIndex = 0;
+    let p;
+    while ((p = DSML_PARAM_RE.exec(m[2] || '')) !== null) {
+      const k = String(p[1] || '').trim();
+      if (!k) continue;
+      args[k] = String(p[2] || '');
+    }
+    calls.push({ name, args });
+  }
+  return calls;
+}
+
+/**
+ * 解析文本里的**完整** DSML 调用块。
+ * @returns {{ text: string, calls: Array<{name:string,args:object}> }}
+ *   text = 去掉标记后的剩余正文；calls = 解析出的调用（无完整块时为空数组）
+ */
+function parseDsmlToolCalls(text) {
+  const src = String(text == null ? '' : text);
+  if (!DSML_ANY_RE.test(src)) return { text: src, calls: [] };
+  const calls = [];
+  const cleaned = src.replace(DSML_CALLS_RE, (_all, body) => {
+    for (const c of parseDsmlInvokes(body)) calls.push(c);
+    return '';
+  });
+  if (!calls.length) return { text: src, calls: [] };   // 没解析出调用 → 原样返回，别吞正文
+  return { text: cleaned.trim(), calls };
+}
+
+/**
+ * 流式过滤器：跨分片处理 DSML。
+ *
+ * 关键点是**后缀保留**：一个标记可能被切成 '<|DSM' / 'L|calls>' 两片，
+ * 若第一片直接发给客户端，标记就会漏出去。所以遇到"未闭合的 '<…' 尾巴"时先扣住不发，
+ * 等下一片到来再判断（最多扣 40 字符，不会无限缓冲）。
+ */
+const dsmlStreamState = new WeakMap();
+function dsmlStreamFeed(res, chunk) {
+  let st = dsmlStreamState.get(res);
+  if (!st) { st = { buf: '' }; dsmlStreamState.set(res, st); }
+  st.buf += String(chunk == null ? '' : chunk);
+
+  const out = { text: '', calls: [] };
+  // 反复处理：缓冲里可能有多个完整块
+  for (;;) {
+    const parsed = parseDsmlToolCalls(st.buf);
+    if (parsed.calls.length) {
+      for (const c of parsed.calls) out.calls.push(c);
+      st.buf = parsed.text;
+      continue;
+    }
+    break;
+  }
+  // ① 未闭合的 calls 块 → **整段扣住**（2026-10-13 实测修）：
+  // 分片 2 是 '<|DSML|calls> <|DSML|invoke name="run_shell">' —— 块开了、还没闭合。
+  // 旧实现只扣"未闭合的 <"，而这段尾部含 '>' → 判定可发出 → 整个标记漏给客户端。
+  // ⚠ 必须设上限：上游若永不闭合，无上限扣留会把后面的正文一起吞掉。
+  const openM = st.buf.search(/<\s*[|｜]\s*DSML\s*[|｜]\s*calls\s*>/i);
+  if (openM >= 0) {
+    const closed = /<\s*\/\s*[|｜]\s*DSML\s*[|｜]\s*calls\s*>/i.test(st.buf.slice(openM));
+    if (!closed && st.buf.length - openM <= 8000) {
+      out.text = st.buf.slice(0, openM);
+      st.buf = st.buf.slice(openM);
+      return out;
+    }
+  }
+  // ② 后缀保留：扣"看起来还没闭合的 <"尾巴（标记可能被切成 '<|DSM' / 'L|calls>'），其余全部发出
+  const lt = st.buf.lastIndexOf('<');
+  if (lt >= 0 && st.buf.length - lt <= 40 && !st.buf.slice(lt).includes('>')) {
+    out.text = st.buf.slice(0, lt);
+    st.buf = st.buf.slice(lt);
+  } else {
+    out.text = st.buf;
+    st.buf = '';
+  }
+  return out;
+}
+
+/** 流结束时把扣住的残余吐出来（不能吞正文） */
+function dsmlStreamFlush(res) {
+  const st = dsmlStreamState.get(res);
+  if (!st || !st.buf) return '';
+  const rest = st.buf;
+  st.buf = '';
+  return rest;
+}
+
+/** 把 Anthropic message 里的 DSML 文本块换成真正的 tool_use 块；返回转换个数 */
+function applyDsmlToAnthropicMessage(msg) {
+  try {
+    if (!msg || !Array.isArray(msg.content)) return 0;
+    let converted = 0;
+    const next = [];
+    for (const b of msg.content) {
+      if (!b || b.type !== 'text' || typeof b.text !== 'string' || !DSML_ANY_RE.test(b.text)) {
+        next.push(b);
+        continue;
+      }
+      const parsed = parseDsmlToolCalls(b.text);
+      if (!parsed.calls.length) { next.push(b); continue; }
+      if (parsed.text) next.push({ type: 'text', text: parsed.text });
+      for (const c of parsed.calls) {
+        converted++;
+        next.push({
+          type: 'tool_use',
+          id: 'toolu_dsml_' + Math.random().toString(36).slice(2, 12),
+          name: c.name,
+          input: c.args,
+        });
+      }
+    }
+    if (!converted) return 0;
+    msg.content = next;
+    msg.stop_reason = 'tool_use';
+    return converted;
+  } catch (_) { return 0; }
+}
+
 /**
  * 「这家不提供这个模型」的**唯一判定**（2026-10-13 收敛）。
  *
@@ -7482,10 +7638,23 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
       try {
         noteDsml(delta.content, (typeof provider !== 'undefined' && provider && provider.id) || '?', 'chat 流式增量');
       } catch (_) { /* 观测绝不影响转发 */ }
-      if (openKind !== 'text') { closeBlock(); startBlock('text', { type: 'text', text: '' }); }
-      outText += delta.content;
-      if (!aggregateOnly) {
-        sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: delta.content } });
+      // DSML 过滤：扣住未闭合的标记尾巴，完整块则解析出来（见 dsmlStreamFeed 注释）
+      let dsmlOut = { text: delta.content, calls: [] };
+      try { dsmlOut = dsmlStreamFeed(res, delta.content); } catch (_) { dsmlOut = { text: delta.content, calls: [] }; }
+      if (dsmlOut.calls.length) {
+        try {
+          log('[DSML] 流式：上游用原生工具标记回了 ' + dsmlOut.calls.length + ' 个调用（'
+            + dsmlOut.calls.map((c) => c.name).join(', ') + '）；已从正文剔除以免客户端显示乱码，'
+            + '但**流式路径暂不构造 tool_use**，这些工具不会被执行（已知限制）。');
+        } catch (_) { /* 忽略 */ }
+      }
+      const dsmlVisible = dsmlOut.text;
+      if (dsmlVisible) {
+        if (openKind !== 'text') { closeBlock(); startBlock('text', { type: 'text', text: '' }); }
+        outText += dsmlVisible;
+        if (!aggregateOnly) {
+          sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: dsmlVisible } });
+        }
       }
     }
     for (const call of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
@@ -8039,6 +8208,10 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       }
       const msgOut = openaiToAnthropicMessage(parsed, body.model, inputTokens);
       noteDsmlFromMessage(msgOut, provider.id, 'chat 非流式');
+      try {
+        const nDsml = applyDsmlToAnthropicMessage(msgOut);
+        if (nDsml > 0) log('[DSML] ' + provider.id + '：上游用原生工具标记回了 ' + nDsml + ' 个调用，已转换成 tool_use 块（客户端可正常执行）');
+      } catch (_) { /* 转换失败不影响转发 */ }
       json(res, 200, msgOut);
       recUsage(msgOut && msgOut.usage, 'ok');
       return true;

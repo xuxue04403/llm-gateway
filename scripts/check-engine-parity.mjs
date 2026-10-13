@@ -271,6 +271,17 @@ const DECLARED = [
     { name: 'noteToolFingerprint', why: '新增（可观测性）：记录向上游声明的工具数量与名字（30s 限频）。用于分辨"网关有没有把 tools 传下去"。' },
     { name: 'dsmlReportedAt', why: '新增：DSML 上报限频表（provider → 上次上报时间）。' },
     { name: 'toolReportedAt', why: '新增：工具指纹上报限频表（provider → 上次上报时间）。' },
+    // —— 2026-10-13：DSML 解析（把原生工具标记转成结构化 tool_use）——
+    { name: 'DSML_ANY_RE', why: '新增：DSML 解析（2026-10-13）：上游把 DeepSeek 原生工具标记当纯文本回，网关此前原样转发，客户端显示乱码且工具不执行。本正则只做"有没有标记"的快速判断。容忍半角 | 与全角 ｜ 及标记内空白（不同上游清洗程度不同）' },
+    { name: 'DSML_CALLS_RE', why: '新增：匹配**完整**的 <|DSML|calls>…</|DSML|calls> 块。必须要求闭合 —— 流式下未闭合的块要扣住不能发' },
+    { name: 'DSML_INVOKE_RE', why: '新增：从 calls 块里取出每个 invoke 的 name 与体' },
+    { name: 'DSML_PARAM_RE', why: '新增：从 invoke 体里取出 parameter name/value' },
+    { name: 'parseDsmlInvokes', why: '新增：解析出 {name, args} 列表；无名调用跳过（无法执行）' },
+    { name: 'parseDsmlToolCalls', why: '新增：解析完整块并返回 {剩余正文, calls}。**解析不出调用时原样返回** —— 宁可显示乱码也不能吞掉用户正文' },
+    { name: 'dsmlStreamState', why: '新增：按 res 存的流式过滤状态（WeakMap，随响应释放，不跨请求串味）' },
+    { name: 'dsmlStreamFeed', why: '新增：流式过滤器。两处关键：① 未闭合的 calls 块**整段扣住**（实测踩到：分片2 是 \'<|DSML|calls> <|DSML|invoke …>\'，只扣"未闭合的 <"会因尾部含 > 而漏发整个标记），上限 8000 字符防上游永不闭合时吞正文；② 后缀保留，处理标记被切成 \'<|DSM\' / \'L|calls>\' 的最坏情况' },
+    { name: 'dsmlStreamFlush', why: '新增：流结束时吐出扣住的残余（防吞正文）。⚠ 目前**未接线**到流结束点 —— 残余只可能是未闭合的标记片段，风险有限，但应在下一版补上' },
+    { name: 'applyDsmlToAnthropicMessage', why: '新增：把 Anthropic message 里的 DSML 文本块换成真正的 tool_use 块并把 stop_reason 置为 tool_use。**非流式路径用它**（实测：客户端收到 text+tool_use，工具名与参数均正确）' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */
