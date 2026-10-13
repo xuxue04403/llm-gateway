@@ -263,6 +263,14 @@ const DECLARED = [
   { name: 'recordUsage', why: '新增：每次调用收尾追加一行 JSONL。**整个函数体在 try 里** —— 统计是旁路，失败绝不影响转发。只记结构化数字，不记请求/响应正文' },
   { name: 'usageFromTail', why: '新增：从 8KB 尾部窗口提取用量（直通路径用）。直通是字节透明的、不解析整个响应，但为截断检测已滚了尾部窗口 → 顺带解析零额外成本。⚠ 必须**逐字段**取最后一次出现的值，不能"取最后一个 usage 对象"：anthropic 的 input_tokens 在首帧 message_start、output_tokens 在尾帧 message_delta，只取最后一个会把输入 token 与缓存读全丢成 0（单元测试当场抓到）' },
   { name: 'matrixUsage', why: '新增（2026-10-13 审计）：矩阵流式路径的用量快照 + 输入语义标记。encoder 只知道客户端 wire，而"inTok 含不含缓存"取决于**上游** wire（anthropic 不含、chat/responses 含），所以在这里补' },
+    // —— 2026-10-13：404 failover 收敛 + 工具调用可观测性 ——
+    { name: 'isModelUnavailableByProvider', why: '新增：把"这家不提供这个模型"收敛成**唯一判定**（5 处调用点共用）。同一漏洞此前复发三次（09-23 修 400 侧、09-30 补指纹、10-13 cline 事故才补 404 侧），注释里留着"翻译路径当时漏了""三处都要判里漏掉的第三处"。判据 = 窄正则命中 或 (404 且宽正则命中)：后者是本次关键 —— cline 走翻译路径时 sensenova 回 404"模型不存在"，旧实现掉进确定性分支**终止 failover**，而 opencode-go 本可服务。' },
+    { name: 'DSML_MARKER_RE', why: '新增（可观测性）：识别 DeepSeek 原生工具标记。用户报"输出被截断"，实为上游把 DSML 当纯文本返回、网关原样转发，客户端当正文显示。引擎此前**完全没有** DSML 相关处理。' },
+    { name: 'noteDsml', why: '新增（可观测性）：响应正文出现 DSML 标记时留痕（每家 30s 限频，避免一个流几十个分片刷屏）。这是"上游没解析"与"网关丢了 tools"两种原因的**唯一区分手段** —— 此前日志里 tool_calls/tool_use 零命中。' },
+    { name: 'noteDsmlFromMessage', why: '新增（可观测性）：从 Anthropic 形状 message 的 text 块里查 DSML（非流式翻译路径用）。' },
+    { name: 'noteToolFingerprint', why: '新增（可观测性）：记录向上游声明的工具数量与名字（30s 限频）。用于分辨"网关有没有把 tools 传下去"。' },
+    { name: 'dsmlReportedAt', why: '新增：DSML 上报限频表（provider → 上次上报时间）。' },
+    { name: 'toolReportedAt', why: '新增：工具指纹上报限频表（provider → 上次上报时间）。' },
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

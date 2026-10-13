@@ -3830,6 +3830,66 @@ const ROUTE_MISSING_RE = /invalid\s+url|not\s+implemented|unsupported\s+(method|
 const MODEL_UNSUPPORTED_BY_PROVIDER_RE = /requested\s+model[^\n]{0,120}?not\s+supported|model[^\n]{0,60}?is\s+not\s+available|model_not_found|unsupported\s+model|model\s+not\s+(?:offered|supported|found)|does\s+not\s+(?:offer|support)[^\n]{0,40}?model|is\s+not\s+available\s+in\s+your\s+(?:region|country|area|location)|not\s+available\s+in\s+your\s+(?:region|country|area|location)|(?:region|country|area)[-_\s]?(?:not\s+supported|restricted|blocked)|not\s+available\s+(?:for|on|in)\s+your\s+(?:plan|tier|subscription|account\s+level)|不提供[^\n]{0,20}?模型|模型[^\n]{0,20}?不支持|(?:地区|区域)[^\n]{0,10}?(?:不支持|不可用|受限)/i;
 
 /**
+ * ── 工具调用可观测性（2026-10-13 加）─────────────────────────────────────
+ *
+ * 起因：用户报"调用 API 时输出被截断"，截图里客户端把 DeepSeek 的**原生工具标记**
+ * 当正文显示出来了（`<|DSML|invoke name="">…`）。而排查时发现：
+ *   · 引擎里**完全没有** DSML 相关处理；
+ *   · 日志里 `tool_calls` / `tool_use` / `arguments` **零命中** ——
+ *     成功响应的 body 不落盘，工具翻译过程一行都不记。
+ * 于是"上游没给结构化 tool_calls"与"网关把 tools 丢了"这两种**修法完全不同**的原因
+ * 在日志上无法区分。这里补上最小可观测集：**发了几个工具**、**响应里有没有 DSML 标记**。
+ */
+const DSML_MARKER_RE = /<\s*\|\s*DSML\s*\|/i;
+
+/** 每个供应商最多每 30 秒报一次 DSML，避免刷屏（一个流里可能有几十个分片命中） */
+const dsmlReportedAt = new Map();
+/** 工具指纹同样限频 */
+const toolReportedAt = new Map();
+
+/** 记录本次请求向上游声明的工具（数量 + 名字），便于分辨"网关有没有把 tools 传下去" */
+function noteToolFingerprint(providerId, body) {
+  try {
+    const tools = body && Array.isArray(body.tools) ? body.tools : null;
+    if (!tools || !tools.length) return;
+    const now = Date.now();
+    if (now - (toolReportedAt.get(providerId) || 0) < 30000) return;
+    toolReportedAt.set(providerId, now);
+    const names = tools.slice(0, 12).map((t) => (t && (t.name || (t.function && t.function.name))) || '?');
+    log(`[tools] ${providerId}: 向上游声明 ${tools.length} 个工具`
+      + `（${names.join(', ')}${tools.length > 12 ? ' …' : ''}）`);
+  } catch (_) { /* 观测失败绝不影响转发 */ }
+}
+
+/**
+ * 检测文本里是否出现 DSML 标记 —— 出现即说明**上游没有把它解析成结构化 tool_calls**，
+ * 而是当纯文本回了。这不是网关能"翻译"的东西（网关只能原样转发），但**必须留痕**，
+ * 否则用户看到的就是一段乱码正文，而日志里什么都没有。
+ */
+function noteDsml(text, providerId, where) {
+  try {
+    if (typeof text !== 'string' || !text) return;
+    if (!DSML_MARKER_RE.test(text)) return;
+    const now = Date.now();
+    if (now - (dsmlReportedAt.get(providerId) || 0) < 30000) return;
+    dsmlReportedAt.set(providerId, now);
+    const i = text.search(DSML_MARKER_RE);
+    log(`[DSML] ${providerId}（${where}）：响应正文里出现 DeepSeek 原生工具标记`
+      + ` —— 上游**没有**把它解析成结构化 tool_calls，客户端会把它当正文显示。`
+      + ` 片段：${maskSecrets(text.slice(Math.max(0, i - 20), i + 80))}`);
+  } catch (_) { /* 忽略 */ }
+}
+
+/** 从 Anthropic 形状的 message 里取出所有 text 块，逐个查 DSML */
+function noteDsmlFromMessage(msg, providerId, where) {
+  try {
+    const blocks = msg && Array.isArray(msg.content) ? msg.content : null;
+    if (!blocks) return;
+    for (const b of blocks) if (b && b.type === 'text') noteDsml(b.text, providerId, where);
+  } catch (_) { /* 忽略 */ }
+}
+
+/**
  * 「这家不提供这个模型」的**唯一判定**（2026-10-13 收敛）。
  *
  * 起因：同一漏洞在本项目**复发三次** —— 2026-09-23 修 400 侧（amd 事故）、
@@ -4662,6 +4722,7 @@ function usageFromTail(text) {
 }
 
 async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts) {
+  noteToolFingerprint(provider.id, body);
   const responsesMode = !!(opts && opts.responses);
   // raw 模式（Responses 资源子路由 GET/DELETE/cancel）：无请求体、不做协议翻译、方法可变，
   // 只把上游响应原样流回。有 body 的转发一律走 POST + 翻译路径。
@@ -7414,6 +7475,13 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
       }
     }
     if (typeof delta.content === 'string' && delta.content) {
+      // ⚠ 必须用 typeof 探测 provider：本作用域内**没有** provider 变量，
+      // 直接写 `provider.id` 会在 noteDsml 的 try/catch **之外**求值并抛错，把流打断
+      //（实测：注入后流式响应被截断，gateway.test.js 的 text_delta 断言失败）。
+      // `typeof` 对未声明的标识符也安全，这是唯一不会连累转发的写法。
+      try {
+        noteDsml(delta.content, (typeof provider !== 'undefined' && provider && provider.id) || '?', 'chat 流式增量');
+      } catch (_) { /* 观测绝不影响转发 */ }
       if (openKind !== 'text') { closeBlock(); startBlock('text', { type: 'text', text: '' }); }
       outText += delta.content;
       if (!aggregateOnly) {
@@ -7603,6 +7671,7 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
  * 账户池：额度耗尽 / 会话失效 / 限流 → 换**同供应商的下一个账户**；全部不可用才交给下一家供应商。
  */
 async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, res, opts) {
+  noteToolFingerprint(provider.id, body);
   if (!breakerAcquire(provider.id)) {
     log(`skip ${provider.id} (breaker: cooldown or half-open probe already in flight)`);
     return false;
@@ -7969,6 +8038,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         };
       }
       const msgOut = openaiToAnthropicMessage(parsed, body.model, inputTokens);
+      noteDsmlFromMessage(msgOut, provider.id, 'chat 非流式');
       json(res, 200, msgOut);
       recUsage(msgOut && msgOut.usage, 'ok');
       return true;
