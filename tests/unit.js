@@ -1347,4 +1347,40 @@ t('tomlValidate：大文件不得出现平方级退化（实测曾让主进程�
       + '接近平方级特征 —— 检查 tomlLexMemo 与 forEachCodeLine 的 starting-line 参数是否还在');
 });
 
+t('describeExitCode：把退出码翻译成可归因的结论（区分"被强杀"与"真崩溃"）', () => {
+  // 这条用例来自一次真实的排查困境：用户报"网关不时自动退出"，
+  // 而日志只有一句「网关已退出（退出码 1）」—— 完全无法区分
+  // "被 taskkill /F 强杀"、"引擎自己 exit(1)"、"访问冲突崩溃"。
+  // 解码错了会把排查引向完全错误的方向，所以逐个钉死。
+  const { describeExitCode } = require('../src/gateway-manager');
+
+  // ① 常规退出码
+  assert.ok(/正常退出/.test(describeExitCode(0)), 'exit 0 应判为正常');
+  assert.ok(/exit 1/.test(describeExitCode(1)), 'exit 1 要提到"自身报错或被强杀"两种可能');
+  assert.ok(/配置错误/.test(describeExitCode(2)), 'exit 2 是配置/命令行错误');
+
+  // ② 强制终止（DBG_TERMINATE_PROCESS）—— 实测遇到过的真实值
+  assert.ok(/强制终止|DBG_TERMINATE/.test(describeExitCode(1073807364)),
+    '0x40010004 应判为外部强制终止');
+
+  // ③ 真崩溃（NTSTATUS，最高位为 1）—— 必须与"被强杀"区分开
+  assert.ok(/访问冲突/.test(describeExitCode(3221225477)), '0xC0000005 是访问冲突');
+  assert.ok(/栈溢出/.test(describeExitCode(3221225725)), '0xC00000FD 是栈溢出');
+  assert.ok(/崩溃|异常终止/.test(describeExitCode(0xC0000374)), '堆损坏应判为崩溃');
+
+  // ④ 未知的 NTSTATUS（>= 0x80000000 且不在表里）也要按崩溃处理，不能当常规码
+  assert.ok(/NTSTATUS|崩溃/.test(describeExitCode(0xC0001234)), '未知 NTSTATUS 应按崩溃归类');
+
+  // ⑤ 无退出码（被信号终止）
+  assert.ok(/信号/.test(describeExitCode(null)), 'null 应判为被信号终止');
+
+  // ⑥ 有符号负数也要正确（Windows 有些路径会给负值）：-1073741819 = 0xC0000005
+  assert.ok(/访问冲突/.test(describeExitCode(-1073741819)),
+    '有符号形式的 0xC0000005 也应识别为访问冲突');
+
+  // ⑦ 非常规码不能崩，要给出可读信息
+  assert.ok(/999/.test(describeExitCode(999)), '非常规码要原样回显');
+});
+
+
 run();

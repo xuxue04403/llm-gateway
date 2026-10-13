@@ -1164,6 +1164,10 @@ app.on('before-quit', (e) => {
   if (!gateway) { allowQuit = true; return; }
   e.preventDefault();
   teardownStarted = true;
+  // 告诉网关管理器"这次退出是预期的"（2026-10-13 加）：
+  // 它在子进程 exit 时据此区分「用户/应用主动停止」与「**非预期**被杀」，
+  // 后者会额外记录现场，便于归因"不时自动退出"。
+  try { gateway._appQuitting = true; } catch (_) { /* 忽略 */ }
   (async () => {
     try { await gateway.stop(); } catch (err) {
       try { logger.error('退出时停止网关失败：' + (err && err.message ? err.message : err)); } catch (_) { /* 忽略 */ }
@@ -1181,8 +1185,57 @@ app.on('before-quit', (e) => {
 // 这类信号下 Electron 未必走 before-quit，但至少别让引擎继续占端口。
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
+    try { if (logger) logger.info('收到系统信号 ' + sig + '，开始收尾（这是**外部**要求退出）。'); } catch (_) { /* 忽略 */ }
     allowQuit = true;
     try { if (gateway) gateway.stop(); } catch (_) { /* 忽略 */ }
     setTimeout(() => app.exit(0), 1500);
   });
 }
+
+/* ------------------------------------------------------------------ *
+ * 主进程级诊断（2026-10-13 加）
+ *
+ * 起因：用户报"网关不时自动退出"，但日志里**一条异常都没有**、Windows 也没有崩溃事件。
+ * 那说明「应用整体被外部终止」的可能性最大 —— 而这种情况此前**完全没有痕迹**：
+ * 主进程被 taskkill /F 时不会走 before-quit，也不会有任何日志。
+ *
+ * 所以这里把主进程自己的生命周期也记下来。判读方法：
+ *   · 看到「主进程正在退出」但没有「已退出。」→ 主进程是被**外部**终止的
+ *   · 有「捕获到未处理异常」→ 是主进程 JS 报错（真 bug，堆栈就在下面）
+ *   · 有「子进程异常退出（非网关）」→ 某个渲染/GPU/工具进程先死
+ * ------------------------------------------------------------------ */
+
+// 主进程 JS 层未捕获的错误：有堆栈，能直接定位（旧实现完全没记，会静默退出）
+process.on('uncaughtException', (err) => {
+  try {
+    logger.error('主进程捕获到未处理异常（这会导致应用退出）：' + (err && err.stack ? err.stack : String(err)));
+  } catch (_) { /* 忽略 */ }
+});
+process.on('unhandledRejection', (reason) => {
+  try {
+    logger.error('主进程捕获到未处理的 Promise 拒绝：'
+      + (reason && reason.stack ? reason.stack : String(reason)));
+  } catch (_) { /* 忽略 */ }
+});
+
+// ⚠ 这是**同步**钩子：只能做同步日志，不能 await。
+// 它会在正常退出与 process.exit() 时触发；被 taskkill /F 强杀时**不会**触发 ——
+// 所以"缺少这一行"本身就是"被强杀"的证据。
+process.on('exit', (code) => {
+  try {
+    const why = teardownStarted || allowQuit ? '（预期内）' : '（**非预期** —— 应用是被外部终止或崩溃的）';
+    logger.info('主进程正在退出，退出码 ' + code + ' ' + why);
+  } catch (_) { /* 忽略 */ }
+});
+
+// Electron 的所有子进程（渲染/GPU/工具）死亡都会到这里 —— 比只监听单个 webContents 更全
+app.on('child-process-gone', (_e, details) => {
+  try {
+    const d = details || {};
+    logger.error('子进程退出：type=' + d.type + ' reason=' + d.reason
+      + ' exitCode=' + d.exitCode + (d.serviceName ? ' service=' + d.serviceName : '')
+      + '｜' + (d.reason === 'killed'
+        ? 'reason=killed 表示**被外部杀死**（不是崩溃，也不是内存不足）'
+        : 'reason=' + d.reason));
+  } catch (_) { /* 忽略 */ }
+});

@@ -854,11 +854,31 @@ class GatewayManager extends EventEmitter {
       this.emit('state');
       this._scheduleHeal();
     });
-    this.proc.on('exit', (code) => {
+    this.proc.on('exit', async (code, signal) => {
       if (this.proc !== spawned) return;
       this.proc = null;
       this.running = false;
-      this.log('网关已退出（退出码 ' + code + '）');
+      // ── 退出归因（2026-10-13 加）────────────────────────────────────
+      //
+      // 起因：用户报"网关不时自动退出"，而旧日志只写一句「网关已退出（退出码 1）」——
+      // 完全无法区分下面这些**后果完全不同**的情形：
+      //   · 被外部强杀（taskkill / 杀软 / 任务管理器）
+      //   · 引擎自己 exit(1)（自杀/配置错）
+      //   · 真崩溃（访问冲突/栈溢出 → NTSTATUS 高位为 1）
+      //   · 用户主动停止（预期内）
+      // 排查时只能靠猜。所以这里把**全部可用证据**一次记全。
+      const why = this.stopping
+        ? '用户主动停止（预期内）'
+        : (this._appQuitting ? '应用正在退出（预期内）' : '**非预期**');
+      const sig = signal ? '，signal=' + signal : '，signal=无';
+      this.log('网关已退出（退出码 ' + code + sig + '）：' + describeExitCode(code) + '；触发方=' + why);
+      if (!this.stopping && !this._appQuitting) {
+        // 非预期退出时，额外记录"现场"：父进程是否还活着、是否有别的实例在抢端口。
+        // 这两条能直接分辨"整个应用被杀"与"只有引擎被杀"。
+        this.log('网关非预期退出的现场：父进程(本应用)存活=' + (process.pid > 0)
+          + '，本应用 PID=' + process.pid
+          + '，端口 ' + this.port + ' 当前占用探测=' + (await this._portBusyQuick()));
+      }
       this.emit('state');
       if (!this.stopping) this._scheduleHeal(code);
     });
@@ -915,7 +935,14 @@ class GatewayManager extends EventEmitter {
         try { await this._starting; } catch (_) { /* 忽略：下面的判断才是关键 */ }
       }
       if (this.stopping || this.proc) return;
-      this.start().catch((e) => this.log('网关自愈重启失败：' + (e && e.message ? e.message : e)));
+      // 自愈的**结果**也要记（2026-10-13 加）。
+      // 旧实现只写"3 秒后自动重启"，然后就没有下文 —— 于是"自愈到底成没成"
+      // 在日志里查不到，用户看到的是"它又退出了"但不知道有没有被拉起来。
+      this.start()
+        .then(() => {
+          this.log('网关自愈重启' + (this.running ? '成功（已就绪）' : '已执行但未就绪') + '。');
+        })
+        .catch((e) => this.log('网关自愈重启失败：' + (e && e.message ? e.message : e)));
     }, 3000);
   }
 
@@ -1033,6 +1060,47 @@ class GatewayManager extends EventEmitter {
     this.logTail = '';
     this.emit('log');
   }
+
+  /**
+   * 端口是否被占用（快速探测，供退出归因时记录现场用）。
+   * 复用已有的 probeTcp，不引入新依赖。
+   */
+  _portBusyQuick() {
+    return this.probeTcp('127.0.0.1', this.port, 600).then((busy) => (busy ? '被占用（可能是重启窗口期的自身残留）' : '空闲'));
+  }
+}
+
+/**
+ * 把进程退出码翻译成人能读的结论（2026-10-13 加）。
+ *
+ * 起因：用户报"网关不时自动退出"，而旧日志只写「网关已退出（退出码 1）」——
+ * 完全无法区分下面这些**后果完全不同**的情形：
+ *   · 被外部强杀（taskkill /F / 杀软 / 任务管理器）
+ *   · 引擎自己 exit(1)（自杀或配置错）
+ *   · 真崩溃（访问冲突 / 栈溢出 → NTSTATUS，最高位为 1）
+ *
+ * 判据：>= 0x80000000 的按 NTSTATUS 解读，否则按常规退出码。
+ */
+function describeExitCode(code) {
+  if (code === null || code === undefined) return '进程被信号终止（无退出码）';
+  const n = Number(code) >>> 0;
+  const NT = {
+    0x40010004: '调试器/外部强制终止（DBG_TERMINATE_PROCESS）—— 典型是 taskkill /F 或杀软',
+    0xC0000005: '访问冲突（内存越界/空指针）—— 真崩溃',
+    0xC00000FD: '栈溢出 —— 真崩溃',
+    0xC000013A: '被 Ctrl+C / 控制台关闭终止',
+    0xC0000409: '栈缓冲区溢出/快速失败（__fastfail）—— 真崩溃',
+    0xC0000094: '整数除零 —— 真崩溃',
+    0xC0000374: '堆损坏 —— 真崩溃',
+    0xC0000602: 'fail-fast 异常 —— Chromium 的 CHECK 失败',
+  };
+  if (NT[n]) return NT[n];
+  if (n >= 0x80000000) return 'NTSTATUS 0x' + n.toString(16).toUpperCase() + ' —— 按崩溃/异常终止处理';
+  if (n === 0) return '正常退出（exit 0）';
+  if (n === 1) return '非零退出（exit 1）—— 引擎自身报错退出，或被强制终止（taskkill /F 也是 1）';
+  if (n === 2) return '命令行/配置错误（引擎的 exit 2）';
+  if (n === 3) return '内部错误（exit 3）';
+  return '非常规退出码 ' + n;
 }
 
 module.exports = {
@@ -1044,4 +1112,5 @@ module.exports = {
   pickProxyFromRegistry,
   LOOPBACK_NO_PROXY,
   BUILTIN_DIRECT_HOSTS,
+  describeExitCode,
 };
