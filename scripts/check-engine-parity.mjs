@@ -311,7 +311,10 @@ const DECLARED = [
     { name: 'probeSlotStale', why: '块边界变化：其后紧接着是改写的两级状态机' },
     { name: 'slotIsOpen', why: '新增：**两级共用**的状态判定（原 breakerIsOpen 的纯读逻辑抽出来）。抽出来的理由：模型级与供应商级的转移逻辑完全一样，写两份必然漂移' },
     { name: 'slotAcquire', why: '新增：两级共用的半开探测放行（原 breakerAcquire 的核心），多一个 threshold 参数（两级阈值不同）' },
-    { name: 'slotRecordSuccess', why: '新增：两级共用的名额交还/清零（"保留 opens 让退避阶梯继续爬"的既有契约不变）' },
+    { name: 'slotRecordSuccess', why: '新增：两级共用的名额交还/清零（保留 opens 让退避阶梯继续爬的契约不变），并更新 lastOkAt（"确实正常应答过"的证据，upstreamSuspect 靠它）' },
+    { name: 'slotRelease', why: '新增（2026-10-14）：**只**清 state/probeAt/fails/probeFull，**不动 lastOkAt**。区别只有一条但是要害：breakerRecordSuccess 会刷新 lastOkAt，等于替"从没成功过的家"伪造了一次成功应答 → 死家预检判据永远为假。配套见 breakerReleaseSlot' },
+    { name: 'breakerReleaseSlot', why: '新增（2026-10-14）："交还半开探测名额"的正确入口。十几个"这家没坏、只是这一发不算数"的早退分支（不提供该模型 / 账户级失败 / 上游侧故障被包成 4xx / 软性渠道拦截）原来都调 breakerRecordSuccess —— 它会**清零 fails**，与超时/网络失败记的模型级失败**交替清零** → 永远攒不到阈值。现场证据：amd 当天 7 次失败（4×429 + 3×超时）、0 次成功、0 次熔断，每个请求白等它 12 秒' },
+    { name: 'isOpaqueProvider4xx', why: '新增（2026-10-14）：判定"上游回了一个不带任何错误说明的 4xx"（400/422 且响应体里没有任何 error/message/detail/code/… 字样）。实测 opencode-go 回 `400 {"model":"deepseek-v4.1-flash"}` 绕过了全部豁免正则，直落"确定性 4xx → 终止 failover"，客户端整轮任务拿到 400 而死；而同一家同一模型 30 分钟后连续两次成功（请求侧毫无问题）。判据刻意保守：有 message 的 400 仍然终止' },
     { name: 'isProviderWideFailure', why: '新增（规则2 的核心判据，用户确认）：鉴权/欠费/权限（401/402/403）+ "连接根本没建立"（网络层失败**且不是我们自己的超时**）→ 冷却整家；其余（超时、上游 4xx/5xx/429）→ 只冷却该模型。把"我们自己的超时"排除在整家之外，正是用户要的"别让一个慢模型拖垮整家"（实测事故：amd 慢模型把同家快模型一起熔断）' },
     { name: 'fmtMs', why: '新增：人读时长的统一格式（日志与测试断言共用一份，避免"1500ms / 2 分钟"两种写法在三处各写一遍）' },
     { name: 'breakerIsOpen', why: '改写：签名加 model，**两级任一开着就跳过**（规则2 之前只看供应商级）' },
@@ -358,7 +361,16 @@ if (!baselinePath) {
   console.log('       可设 DSH_GATEWAY_ENGINE_BASELINE 指向基线文件后重跑。');
   console.log('       候选位置：');
   for (const p of BASELINE_CANDIDATES) console.log('         ' + p);
-  process.exit(0);
+  // ⚠ 2026-10-14 修正：原来这里是 exit(0)。**退出码 0 会被 CI / 构建脚本当成"通过"**，
+  // 而这个脚本的全部价值就是那句断言 ——「除 DECLARED 外引擎没有别的块被改动」。
+  // 一个块都没比就报通过，是最坏的一种假阳性：它让"没比"看起来像"比过了"。
+  // 找不到基线 = 没验证；显式承认"跳过"要走 --allow-skip，不能混进"通过"里。
+  if (process.argv.includes('--allow-skip')) {
+    console.log('[SKIP] 已用 --allow-skip 显式接受：本次不做差异校验。');
+    process.exit(0);
+  }
+  console.log('[FAIL] 没有基线 = 没有校验。确认要跳过请加 --allow-skip。');
+  process.exit(2);
 }
 
 const a = blocks(readFileSync(baselinePath, 'utf8'));

@@ -953,6 +953,22 @@ function slotRecordSuccess(b) {
 }
 
 /**
+ * 只交还探测名额：清 state/probeAt/probeFull，**既不动 lastOkAt 也不清 fails**。
+ * 用于"这次失败不算该家的账，但也不能说它正常应答过"的早退分支（详见 breakerReleaseSlot）。
+ *
+ * ⚠ 绝不能清 fails：紧接着调用方往往还要 `breakerRecordFail(...)` 记这一次失败（规则 2 的
+ * 模型级冷却），若这里先把 fails 抹回 0，计数就在每次"释放+记录"之间反复归零 → 攒不到阈值
+ * （实测 ratetrap 用例：429 走了 4 次，模型级闸一次没开）。
+ */
+function slotRelease(b) {
+  if (!b) return;
+  b.state = 'closed';
+  b.openUntil = 0;
+  b.probeAt = 0;
+  b.probeFull = false;
+}
+
+/**
  * 这次失败是否"与模型无关"（→ 应冷却**整家**）。判据（2026-10-14 用户确认）：
  *   · 鉴权/欠费/权限（401/402/403）——Key 坏、欠费、被封，换模型也一样；
  *   · **连接根本没建立**（网络层失败，且**不是我们自己的超时**）。
@@ -1097,11 +1113,32 @@ function breakerRecordFail(providerId, httpStatus, serverRetryMs, timedOutByUs, 
   providerBreakerRecordFail(providerId, httpStatus, serverRetryMs, timedOutByUs);
 }
 
-/** 上游确认正常 → 两级都清零（供应商级 + 该模型级）。 */
+/** 上游确认正常 → 两级都清零（供应商级 + 该模型级）。**只有真正拿到正常响应时才该调它**。 */
 function breakerRecordSuccess(providerId, model) {
   slotRecordSuccess(breaker.get(providerId));
   const key = modelBreakerKey(providerId, model);
   if (key) slotRecordSuccess(modelBreaker.get(key));
+}
+
+/**
+ * 交还半开探测名额（**只清状态与失败计数，不更新 lastOkAt**）。
+ *
+ * 与 breakerRecordSuccess 的区别就一条，但是要害：`lastOkAt` 是
+ * "这家**确实正常应答过**"的证据，upstreamSuspect() 靠它判断"开过闸、此后只有网络失败没有成功应答
+ * → 下次发请求前先做 TCP 预检"。
+ *
+ * 2026-10-14 实测事故（用户报"deepseek-v4.1-flash 多次报错终止任务"）：
+ * 十几个"这家没坏、只是这一发不算数"的早退分支（不提供该模型 / 账户级失败 / 上游侧故障被包成 4xx /
+ * 软性渠道拦截…）全都调了 breakerRecordSuccess。它不只是"交还名额"，还会把
+ * **`fails` 清零 + `lastOkAt` 设为现在**。后者导致预检判据永远为假（死家不再被预检）；
+ * 前者更要命 —— 与**供应商级/模型级失败计数被交替清零**叠加后，一个真坏的家永远攒不到阈值。
+ * 现场证据：amd 当天 **7 次失败（4×429 + 3×超时）、0 次成功、0 次熔断**，
+ * 而每次请求都要先白等它 12 秒超时。
+ */
+function breakerReleaseSlot(providerId, model) {
+  slotRelease(breaker.get(providerId));
+  const key = modelBreakerKey(providerId, model);
+  if (key) slotRelease(modelBreaker.get(key));
 }
 
 /* ---------------- 死家前置连通性检查（2026-10-13） ----------------
@@ -4485,6 +4522,37 @@ function isModelUnavailableByProvider(status, detail) {
 }
 
 /**
+ * 「**这一发没成，但请求本身没问题**」——上游回了一个**不带任何错误说明**的 4xx。
+ *
+ * 2026-10-14 实测事故（用户报"调用 deepseek-v4.1-flash 多次报错终止任务"）：
+ * opencode-go 回 `400 {"model":"deepseek-v4.1-flash"}` —— 响应体**只有回显的模型名，
+ * 没有任何 error/message**。它绕过了全部豁免正则（UPSTREAM_BROKEN_4XX_RE 要
+ * "upstream error" 之类字样、MODEL_MISSING_RE 要 "not found/unsupported" 之类字样、
+ * PROVIDER_SIDE_4XX_RE 要欠费/额度字样），于是直落"确定性 4xx → 终止 failover"，
+ * 客户端整轮任务拿到 400 而死。**同一家同一模型 30 分钟后连续两次成功**（10:08 19.7s、
+ * 10:09 5.2s），证明请求侧没有任何问题 —— 这是上游瞬时抽风。
+ *
+ * 判据刻意保守：**只有"体里没有任何能说明问题的信息"时才算**。也就是说
+ * 有 message 的 400 仍然按"确定性 4xx"终止（那才是"你的请求有问题"的可靠信号）。
+ * 代价：真·请求有错但上游懒得不给说明时，会多打几家（每家都快、基本不计费）——
+ * 远小于"整轮任务被一个上游的抽风打死"。
+ *
+ * @param {number|string} status 上游 HTTP 状态码
+ * @param {string} detail 已脱敏的响应体
+ */
+function isOpaqueProvider4xx(status, detail) {
+  const s = Number(status);
+  if (s !== 400 && s !== 422) return false;             // 404 已有专门的模型缺失判据，不在此列
+  const d = String(detail || '').trim();
+  if (!d) return true;                                   // 空体 4xx
+  // 体里有任何"能说明问题"的字段/字样 → 交给既有判据处理，不在这里放行
+  if (/error|message|detail|reason|code|invalid|unsupported|not\s+found|exceed|limit|denied|forbidden|missing|required|too\s+(?:long|large)|content|policy|safety/i.test(d)) {
+    return false;
+  }
+  return true;
+}
+
+/**
  * 「**你这个客户端不被允许**」——上游在**客户端指纹**维度拒绝了这次请求。
  *
  * 与普通 401/403 的处置**完全相反**，必须单独识别：
@@ -5661,16 +5729,35 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         // 紧接着就是 `account acctgeo#key1 标记为 session（冷却 3600s）`，
         // 然后 2 个 Key 全冷却 → healthy-model 直接被"全部冷却中"挡掉。
         if (opts.failureSink) opts.failureSink.modelScopeOnly = true;
-        breakerRecordSuccess(provider.id, bModel);
+        // "这家不提供该模型"不是"该家正常应答过"→ 只交还名额，不清失败计数（breakerReleaseSlot）
+        breakerReleaseSlot(provider.id, bModel);
         return rawMode ? { retryable: upstream.status } : false;
       }
       const acctKind = classifyAccountFailure(upstream.status, detail);
       if (acctKind) {
-        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为账户级失败（${acctKind}）→ 交回账户池处理（不计供应商熔断）`);
-        // D1（审计修复）：账户级失败说明"这家上游是健康的、只是这个账户不行"，**不计供应商失败**，
-        // 因此必须把刚占用的半开探测名额交还。旧实现直接 return 不释放 → 该家永久卡在
-        // half-open（breakerIsOpen 恒真）再也不会被选中，直到进程重启。
-        breakerRecordSuccess(provider.id, bModel);
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为账户级失败（${acctKind}）→ 交回账户池处理（但**仍计该模型一次失败**）`);
+        // D1（审计修复）：账户级失败说明"这家上游是健康的、只是这个账户不行"，因此必须把刚占用的
+        // 半开探测名额交还。旧实现直接 return 不释放 → 该家永久卡在 half-open
+        //（breakerIsOpen 恒真）再也不会被选中，直到进程重启。
+        //
+        // ⚠ 2026-10-14 修正（用户报"deepseek-v4.1-flash 多次报错终止任务"）：
+        // 这里原来调 breakerRecordSuccess —— 那不只是"交还名额"，还会 **fails 清零 + lastOkAt 置现在**。
+        // 与断网/超时路径（记模型级失败）交替出现时，计数被反复清零 → **永远攒不到阈值**。
+        // 现场证据：amd 当天 7 次失败（4×429 + 3×超时）、0 次成功、**0 次熔断**，
+        // 而每个请求都要先白等它 12 秒超时；同时 lastOkAt 被刷新 → 死家预检也不再触发。
+        // 现在的分工：释放名额（不动 lastOkAt）+ **rate 类照记一次模型级失败**。
+        //
+        // ⚠⚠ 2026-10-14 二次修正（多账户池回归）：这里**不能**碰 `failureSink.modelScopeOnly`
+        // （那是"这家不提供该模型"分支的语义，会告诉账户池"别按账户失败处理"→ 账户轮换失效，
+        // 实测 wb-pool3 用例 503）。也**不能**记供应商级失败：`credit`/`rate` 都是"这一把 Key
+        // 的事实"，账户池马上要换下一把；此时整家熔断会让多账户白配（nvidia 4 把 Key 全废的旧坑）。
+        //
+        // 只记 **模型级** 的 rate（429 并发超限）：实测 amd「Model 'X' is at its concurrency
+        // limit (16)」4 次/天、单账户形态，账户池换不了 Key，就该让这个模型冷却一会儿。
+        breakerReleaseSlot(provider.id, bModel);
+        if (acctKind === 'rate') {
+          breakerRecordFail(provider.id, upstream.status, retryAfterMs(upstream), false, bModel);
+        }
         return rawMode ? { retryable: upstream.status } : false;
       }
     }
@@ -5697,7 +5784,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       // `all providers for model "m2" are temporarily in breaker cooldown`，
       //  而上游命中 0 次；对照组把这次换成 422（会走结算）时 m2 = 200）。
       // 这正是上方 :4377 注释所警告的"连坐"。
-      breakerRecordSuccess(provider.id, bModel);
+      breakerReleaseSlot(provider.id, bModel);
       return rawMode ? { retryable: upstream.status } : false;
     }
     if (CLIENT_FINGERPRINT_RE.test(String(detail || ''))) {
@@ -5729,7 +5816,13 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     // R9c 降敏重试可能成功，继续 failover（见上方的降敏重试）。
     // 这两种 4xx 都说明上游**能正常应答**（策略性拒绝，连接性是健康的）→ 释放熔断半开探测
     // 名额；否则"确定性 4xx 不记失败"会让半开名额永远被占（熔断卡死）。
-    breakerRecordSuccess(provider.id, bModel);
+    //
+    // ⚠ 2026-10-14：这里原调 breakerRecordSuccess，会**清零 fails**。而紧接着下面的
+    // PROVIDER_SIDE_4XX_RE 分支要记一次失败（临时额度类落模型级、攒够 3 次才冷却）。
+    // 清零与记录交替 → 计数永远停在 1，**永远开不了闸**（审计实测：25 次请求 0 次熔断，
+    // 而日志每次都写"冷却该家"）。改成 breakerReleaseSlot：只交还半开名额，
+    // 不动失败计数与 lastOkAt —— "这不是该家的错"≠"它刚才正常应答过"。
+    breakerReleaseSlot(provider.id, bModel);
     if (!contentBlocked) {
       // 404 的处置（2026-10-13 修）：
       //  · 上游**不实现该路由**（某些供应商没有 /responses，返回通用 404/空体）：换下一家有意义；
@@ -5769,9 +5862,16 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       if (PROVIDER_SIDE_4XX_RE.test(detail)) {
         const persistent = PERSISTENT_ACCOUNT_RE.test(detail);
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"供应商账号/额度/权限"类错误`
-          + `（${persistent ? '长期状态' : '临时'}）→ 冷却该家并继续 failover`);
+          + `（${persistent ? '长期状态 → 冷却整家' : '临时状态 → 仅冷却该模型'}）并继续 failover`);
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-        breakerRecordFail(provider.id, persistent ? 403 : 0, 0, false, bModel);   // 403 → 长熔断（30 分钟）；0 → 短熔断
+        // ⚠ 2026-10-14 修正（审计实测：25 次请求 → 0 次熔断，日志却每次说"冷却该家"）：
+        // 旧写法是 `persistent ? 403 : 0`。**`0` 是"网络层失败"的哨兵值**，被
+        // isProviderWideFailure 判成"整家级"，却没有 immediate（401/403 那种一次就开闸的），
+        // 于是每次只把 fails 加到 1 —— 而上面几行刚调过 breakerRecordSuccess（清零），
+        // 计数永远停在 1 → **永远开不了闸**，而日志每次都宣称"冷却该家"。行为与日志相反。
+        // 现在按规则 2 的分工：长期（充值前不会自愈）→ 403 整家长熔断；
+        // 临时（如 `insufficient resources`）→ 传真实 4xx，落模型级、攒够 3 次冷却该模型。
+        breakerRecordFail(provider.id, persistent ? 403 : upstream.status, 0, false, bModel);
         return rawMode ? { retryable: upstream.status } : false;
       }
       // ⚠ 指纹类拒绝必须排在"供应商账号/额度"判定**之前**：它长得像 403（也会被
@@ -5838,6 +5938,17 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       if (WORKBUDDY_CHANNEL_BLOCK_RE.test(detail)) {
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"软性渠道拦截/风控"`
           + `（上游要求重发；实测约 2% 随机命中）→ 继续 failover，不终止客户端任务`);
+        return rawMode ? { retryable: upstream.status } : false;
+      }
+      // 2026-10-14 新增（实测：opencode-go 的 `400 {"model":"deepseek-v4.1-flash"}`）：
+      // 上游回了一个**不带任何错误说明**的 4xx —— 那说明不了"请求有问题"，
+      // 只说明"这一发没成"。终止 failover 会让整轮任务死在一个上游的瞬时抽风上。
+      // 详见 isOpaqueProvider4xx 的定义处。
+      if (isOpaqueProvider4xx(upstream.status, detail)) {
+        log(`upstream ${provider.id} HTTP ${upstream.status} 响应体没有任何错误说明`
+          + `（${maskSecrets(String(detail || '')).slice(0, 60) || '空体'}）→ 判定为"这一发没成、请求本身没问题"`
+          + ' → 继续 failover（不熔断该家、不冷却账户）');
+        breakerRecordSuccess(provider.id, bModel);
         return rawMode ? { retryable: upstream.status } : false;
       }
       const status = DETERMINISTIC_4XX_STATUS[upstream.status] || 400;
@@ -6137,7 +6248,10 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     const onClientClose = () => {
       if (clientGone) return;
       clientGone = true;
-      log('client closed connection, cancelling upstream stream');
+      // 2026-10-14（可观测性）：旧文案只说"取消了上游流"，从这行看不出**是谁**断的、
+      // 断了之后这次调用会被记成什么。补上"不记 ok"，让 `stream-broken status=fail`
+      // 这行在日志里能自洽（排查"任务莫名终止"时不必再猜）。
+      log('client closed connection, cancelling upstream stream（客户端先走了 → 本次不记 ok）');
       try { reader.cancel(); } catch { /* 忽略 */ }
       clearInterval(idleTimer);
     };
@@ -6193,7 +6307,21 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       try { res.removeListener('close', onClientClose); } catch { /* 忽略 */ }
       try { reader.releaseLock(); } catch { }
     }
-    if (clientGone) return false;   // 收尾阶段才发现断开 → 同样不记成功
+    // 2026-10-14（可观测性）：把"为什么没算成功"写出来。旧实现只 return false，
+    // 调用方随即打出一行 `[call] … stream-broken status=fail`，**日志里完全看不出原因** ——
+    // 排查用户报的"调用 deepseek-v4.1-flash 多次报错终止任务"时，这一行是关键分歧点：
+    // 到底是客户端先走了（用户点停止/超时），还是上游断的？没有这句就只能猜。
+    //
+    // ⚠⚠ 这里的 `if (clientGone)` 守卫是**生死线**，绝不能去掉。
+    // 读循环里 `done:true`（上游正常发完）也会落到这一行；一旦无条件 return false，
+    // 正常流就永远走不到下面的截断检测、`res.end()`、`recordUsage`，
+    // 调用方 `handleMessages` 拿到 false 又撞上 `res.headersSent` → 整条直通流式路径挂死、
+    // 日志全是 `stream-broken status=fail`、用量一条不记。（2026-10-14 本轮真的踩了这个坑：
+    // 加可观测性日志时把 return 拆出来，忘了保留守卫，子代理端到端复现"响应悬挂"才发现。）
+    if (clientGone) {
+      log('stream-broken：客户端在收尾阶段已断开（不记 ok；上游读取已取消）');
+      return false;   // 收尾阶段才发现断开 → 同样不记成功
+    }
     // ④ 解码速度：无可测窗口时**不打印**（宁可留空，也不给一个假数字 —— 曾有一条实际
     // ~40 tok/s 的车道被"整段耗时 ÷ 正文落地耗时"报成 2941 tok/s）。
     meter.endAt = Date.now();
@@ -8201,7 +8329,13 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
     try { res.removeListener('close', onClose); } catch { /* 忽略 */ }
     try { reader.releaseLock(); } catch { /* 忽略 */ }
   }
-  if (clientGone) return { ok: false };
+  if (clientGone) {
+    // 2026-10-14（可观测性）：翻译/矩阵路径原本**静默**返回，调用方随即打
+    // `[call] … stream-broken status=fail`，日志里看不出是"客户端先走了"还是"上游断了"。
+    // 排查用户报的"调用某模型多次报错终止任务"时，这正是最关键的分歧点。
+    log('[matrix] stream-broken：客户端在收尾阶段已断开（不记 ok；上游读取已取消）');
+    return { ok: false };
+  }
   // 收尾：把 dsmlStreamFeed 扣住的残余**归还**给客户端。
   // 扣留本身是为了防"标记被切成两片时泄漏"，但流结束时必须吐出来 —— 否则一个正当的尾部 '<'
   // 会被静默吞掉（dsmlStreamFlush 就是为此存在，本版才真正接上线）。
@@ -8371,8 +8505,9 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
     // 挡到 BREAKER_STALE_MS（180s）才回收，**且影响该家的所有模型**；客户端还会拿到
     // "all providers ... breaker cooldown"（把"账户全冷却"误报成"供应商熔断"）。
     // 本函数其余所有 return/continue 路径都已结算（见各分支处的 breakerRecordSuccess/
-    // breakerRecordFail），只有这一条遗漏。语义上"账户冷却"不构成供应商故障 → 交还名额。
-    breakerRecordSuccess(provider.id, bModel);
+    // breakerRecordFail），只有这一条遗漏。语义上"账户冷却"不构成供应商故障 → 交还名额
+    // （只交名额，不清失败计数：这家对该模型可能正在连续失败，不能被这次跳过抹掉证据）。
+    breakerReleaseSlot(provider.id, bModel);
     return false;
   }
   const attemptAccounts = picked.acct ? [picked.acct, ...picked.accounts.filter((a) => a !== picked.acct && accountUsable(provider.id, a, scopeModel))] : [null];
@@ -8527,7 +8662,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         // half-open 名额被永久占用 → 该家所有模型在熔断窗口内全部 503（连坐）。
         // 实测（.audit\a2-breaker-anthropic-path.js）：Anthropic 客户端 → openai-chat 上游，
         // 半开探测命中这条 early return 后，请求同家另一个正常模型也拿 503、上游命中 0。
-        breakerRecordSuccess(provider.id, bModel);
+        breakerReleaseSlot(provider.id, bModel);
         return false;
       }
       // 与直通路径同一条判据（见 UPSTREAM_BROKEN_4XX_RE 的定义处）：
@@ -8537,8 +8672,8 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       if (UPSTREAM_BROKEN_4XX_RE.test(String(lastDetail || ''))) {
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"上游侧故障被包成 4xx"`
           + `（${maskSecrets(String(lastDetail || '')).slice(0, 80)}）→ 继续 failover（不熔断该家、不冷却账户）`);
-        // 同 MODEL_UNSUPPORTED 那处：上游连接性是健康的 → 必须交还半开探测名额。
-        breakerRecordSuccess(provider.id, bModel);
+        // 同 MODEL_UNSUPPORTED 那处：上游连接性是健康的 → 必须交还半开探测名额（只交名额，不清失败计数）。
+        breakerReleaseSlot(provider.id, bModel);
         return false;
       }
       if (CLIENT_FINGERPRINT_RE.test(String(lastDetail || ''))) {
@@ -8563,7 +8698,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       if (WORKBUDDY_CHANNEL_BLOCK_RE.test(String(lastDetail || ''))) {
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"软性渠道拦截/风控"`
           + `（上游要求重发；实测约 2% 随机命中）→ 继续 failover，不终止客户端任务`);
-        breakerRecordSuccess(provider.id, bModel);   // 上游连接性是健康的 → 交还半开名额
+        breakerReleaseSlot(provider.id, bModel);   // 上游连接性是健康的 → 交还半开名额（不清失败计数）
         return false;
       }
       const acctKind = acct ? classifyAccountFailure(upstream.status, lastDetail) : null;
@@ -8571,6 +8706,15 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         // F11：把 Retry-After 一并传下去。直通路径早就传了（见 forward 里的 failureSink.retryMs），
         // 翻译路径一直漏着 —— 上游明确说"600 秒后再来"时，这里只按指数退避冷却（90s 起）。
         markAccountFailure(provider.id, acct, acctKind, lastDetail, scopeModel, retryAfterMs(upstream));
+        // 2026-10-14（与直通路径同一处修正）：**rate 类照记一次模型级失败**。
+        // 旧实现只 `continue`（换下一把 Key），一次失败都不记 —— 一条车道只有 1~2 把 Key 时，
+        // 每个请求都会把这几把 Key 的限额打满（amd 实测：Model 'DeepSeek-V4.1-Flash' is at its
+        // concurrency limit (16)，4 次/天），而路由下一轮照样先选它。
+        // 只记 rate（模型级）；credit/session 是"这一把 Key 的事实"，账户池已处理，
+        // 记供应商级会让多账户白配（nvidia 4 把 Key 全废的旧坑）。
+        if (acctKind === 'rate') {
+          breakerRecordFail(provider.id, upstream.status, retryAfterMs(upstream), false, bModel);
+        }
         continue;   // 换下一个账户（此时尚未向客户端写任何字节）
       }
       if (upstream.status === 401 || upstream.status === 403 || upstream.status === 429 || upstream.status >= 500) {
@@ -8578,13 +8722,26 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         breakerRecordFail(provider.id, upstream.status, upstream.status === 429 ? retryAfterMs(upstream) : 0, false, bModel);
         return false;
       }
-      breakerRecordSuccess(provider.id, bModel);
+      breakerReleaseSlot(provider.id, bModel);
       if (PROVIDER_SIDE_4XX_RE.test(lastDetail)) {
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-        // 账户池全部不可用 → **供应商级**（与模型无关）：显式传空模型名，
-        // 走 providerBreakerRecordFail（见注释"不能因为失败原因属于账户级就跳过，
-        // 否则坏家会被每个请求重复打点"）。
-        breakerRecordFail(provider.id, PERSISTENT_ACCOUNT_RE.test(lastDetail) ? 403 : 0, 0, false, '');
+        // ⚠ 2026-10-14 修正（与直通路径同一个坑，见该处注释）：**`0` 不能当"临时"的实参** ——
+        // 它是"网络层失败"的哨兵值，会被判成整家级却又不 immediate（没有"一次就开闸"），
+        // 于是 fails 永远停在 1、永远开不了闸；而上一行刚 breakerRecordSuccess 清零过。
+        // 长期（充值前不会自愈）→ 403 整家长熔断（传空模型名 = 整家级）；
+        // 临时 → 传真实状态码、落**模型级**，攒够 3 次才冷却这个模型。
+        breakerRecordFail(provider.id, PERSISTENT_ACCOUNT_RE.test(lastDetail) ? 403 : lastStatus, 0, false,
+          PERSISTENT_ACCOUNT_RE.test(lastDetail) ? '' : bModel);
+        return false;
+      }
+      // 2026-10-14 新增（与直通路径同一处修正，理由见 isOpaqueProvider4xx 的定义处）：
+      // `400 {"model":"deepseek-v4.1-flash"}` 这种"没有任何错误说明"的 4xx 只说明这一发没成，
+      // 不能拿来终止整轮任务。实测证据：同一家同一模型 30 分钟后连续两次成功。
+      if (isOpaqueProvider4xx(upstream.status, lastDetail)) {
+        log(`upstream ${provider.id} HTTP ${upstream.status} 响应体没有任何错误说明`
+          + `（${maskSecrets(String(lastDetail || '')).slice(0, 60) || '空体'}）→ 判定为"这一发没成、请求本身没问题"`
+          + ' → 继续 failover（不熔断该家、不冷却账户）');
+        breakerReleaseSlot(provider.id, bModel);
         return false;
       }
       const status = DETERMINISTIC_4XX_STATUS[upstream.status] || 400;
@@ -8767,7 +8924,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
   if (isModelUnavailableByProvider(lastStatus, lastDetail)) {
     log(`provider ${provider.id} 的失败原因是"这家不提供该模型"（含地区/套餐受限）→ 交还半开名额，**不熔断该家**`
       + '（该家对别的模型仍然正常；若长期如此，请从配置的 models 里移除该映射）');
-    breakerRecordSuccess(provider.id, bModel);
+    breakerReleaseSlot(provider.id, bModel);
     return false;
   }
   // 同 UPSTREAM_BROKEN_4XX_RE 的定义处：上游自己坏了却包成 4xx → 该家不算"请求有错"，
@@ -8775,7 +8932,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
   if (UPSTREAM_BROKEN_4XX_RE.test(String(lastDetail || ''))) {
     log(`provider ${provider.id} 的失败原因是"上游侧故障被包成 4xx"（${maskSecrets(String(lastDetail || '')).slice(0, 80)}）`
       + ' → 交还半开名额，**不熔断该家**，继续 failover');
-    breakerRecordSuccess(provider.id, bModel);
+    breakerReleaseSlot(provider.id, bModel);
     return false;
   }
   if (CLIENT_FINGERPRINT_RE.test(String(lastDetail || ''))) {
@@ -8790,8 +8947,9 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
     breakerRecordFail(provider.id, lastStatus, 0, false, '');
   } else {
     // 未拿到可判定的上游状态码（如凭据解析失败、账户全部处于冷却而直接跳过）：
-    // 该家这轮没被证明是坏的，但半开名额已占用 —— 交还名额，避免永久 half-open。
-    breakerRecordSuccess(provider.id, bModel);
+    // 该家这轮没被证明是坏的，但半开名额已占用 —— 交还名额，避免永久 half-open
+    // （只交名额，不清失败计数：不能因为"没拿到可判定的状态码"就把这家连续失败的记录抹掉）。
+    breakerReleaseSlot(provider.id, bModel);
   }
   return false;
 }

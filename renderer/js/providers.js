@@ -374,8 +374,21 @@ function openEditor(i) {
   //   ② 归一不了的原样保留（临时补一个 option），宁可留着一个不认识的字符串，
   //      也不要静默删掉用户写的东西。
   setSelectValueLossless($('#edProtocol'), p.protocol, canonicalApiValue);
-  $('#edProfile').value = p.clientProfile || '';
-  $('#edAuth').value = p.auth || '';
+  // ⚠ edProfile / edAuth **必须**走 setSelectValueLossless（旧版直接 `sel.value = ...`）。
+  // HTML 规范：select.value 赋一个不存在的 option 值时，会**静默变成空串** ——
+  // 而配置里 `"auth": "WorkBuddy"`（大小写不规范，但 gateway-manager 的校验用
+  // trim().toLowerCase() 比白名单，**能通过保存**）正好命中：抽屉里显示空白，
+  // 用户点「应用」→ 下一行 `delete next.auth` → 凭据来源从"桌面客户端自动发现"变成"无鉴权方式"
+  // → 下次请求直接 401，而且界面上看不出任何异常。
+  // 归一函数按小写比对规范值，认不出来就由 helper 补一个"未识别，原样保留"的 option。
+  setSelectValueLossless($('#edProfile'), p.clientProfile, (v) => {
+    const s = String(v || '').trim().toLowerCase();
+    return s || '';
+  });
+  setSelectValueLossless($('#edAuth'), p.auth, (v) => {
+    const s = String(v || '').trim().toLowerCase();
+    return s || '';
+  });
   // ⚠ 用了"凭据不在配置里"的鉴权方式时，**自动展开**高级字段。
   //
   // 「鉴权方式」下拉在折叠的 <details> 里（它平时是高级设置）。但 codex / workbuddy

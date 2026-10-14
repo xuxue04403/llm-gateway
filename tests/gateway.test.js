@@ -436,6 +436,39 @@ let upstreamPort = 0;
     }
   });
 
+  t('直通路径：上游真被腰斩（同协议透传）→ 也必须明确报错（这条曾**零覆盖**）', async () => {
+    // 为什么单列一条：上一条"上游真被腰斩"用的是 protocol:'openai-chat' 上游 → 走**翻译**路径
+    // （forwardAnthropicViaOpenAI）。而**同协议透传**（客户端 anthropic ← 上游也是 anthropic）
+    // 走的是 forward() 里另一份截断检测，那一份此前没有任何用例穿过。
+    // 后果实测（2026-10-14 变异验证）：把 `if (isSseStream() && !tailHasTerminal())` 关掉，
+    // **166 条用例全绿** —— 上游被腰斩时客户端会收到一个"语法完整、实则被截断"的回复，
+    // 还以为模型答完了（这正是用户最早报的"任务莫名终止却不报错"）。
+    const srv = http.createServer((req, res) => {
+      if (req.url === '/v1/messages') {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        // 发两帧正文，然后**干净地结束**（不带 message_stop）—— 复刻"代理掉线/对端 close"
+        res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","content":[],"model":"test-model"}}\n\n');
+        res.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"半截回复"}}\n\n');
+        res.end();     // ← 关键：没有 message_stop，也没有 [DONE]
+        return;
+      }
+      if (req.url === '/v1/models') { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"data":[{"id":"test-model"}]}'); return; }
+      res.writeHead(404).end();
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const up = { server: srv, port: srv.address().port, st: { calls: 0 } };
+    const gw = await startGatewayWith([providerOf('cut', up, { priority: 1 })], 'cutdirect');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, stream: true, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.ok(/event: error/.test(r.text),
+        '直通路径被腰斩也必须发 error 事件（否则客户端以为答完了）：' + r.text.slice(0, 400));
+      assert.ok(/不完整|被中断/.test(r.text), '错误文案应说明回复不完整：' + r.text.slice(0, 400));
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/直通路径：上游流被截断/.test(logText), '日志须写明是截断（否则无法与"客户端断开"区分）：' + logText.slice(-400));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
   t('网关：Codex 订阅后端 —— 谎报 content-type + 要求 store:false 也能用', async () => {
     // Codex 订阅后端有三个**实测发现的怪癖**，缺一条就整轮报废：
     //   ① 无论客户端要不要流式，它都返回 SSE，而 Content-Type 谎报 `application/json`
@@ -3580,9 +3613,11 @@ let upstreamPort = 0;
       const r = await call({ port: gw.port });
       assert.strictEqual(r.status, 503, '唯一候选额度耗尽 → 503，实际 ' + r.status);
       const logText = fs.readFileSync(gw.logPath, 'utf8');
-      assert.ok(/供应商账号\/额度\/权限"类错误（长期状态）/.test(logText),
+      assert.ok(/供应商账号\/额度\/权限"类错误（长期状态 → 冷却整家）/.test(logText),
         '额度耗尽必须判为长期状态（旧版判"临时"→ 每 90 秒白撞一次）：' + logText.slice(-500));
       assert.ok(/熔断 1500ms/.test(logText), '应按长熔断时长开闸：' + logText.slice(-400));
+      assert.ok(/鉴权\/欠费\/权限类：与具体模型无关 → 冷却整家/.test(logText),
+        '长期额度状态要明说"冷却整家"（临时类则是"仅该模型"，2026-10-14 把两者分开）：' + logText.slice(-500));
       assert.strictEqual(up.st.calls, 1, '应只打一次上游，实际 ' + up.st.calls);
     } finally { killGw(gw); closeUp(up); }
   });
@@ -5243,6 +5278,133 @@ let upstreamPort = 0;
       const h = JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
       assert.ok(!h.proxy.runtimeDirect, '运行期直连清单必须为空：' + JSON.stringify(h.proxy));
     } finally { killGw(gw); }
+  });
+
+  // ============ 2026-10-14：今日日志排查出的两处真实故障 ============
+
+  t('日志事故①：上游回"没有任何错误说明"的 400 → 必须继续 failover（不能打死整轮任务）', async () => {
+    // 现场（用户报"调用 deepseek-v4.1-flash 多次报错终止任务"）：
+    //   upstream opencode-go HTTP 400: {"model":"deepseek-v4.1-flash"}
+    //   → 确定性 4xx → 终止 failover → [call] status=fail:400
+    // 而同一家同一模型 30 分钟后连续两次成功（10:08 dur=19731ms、10:09 dur=5265ms）——
+    // 请求侧没有任何问题，是上游瞬时抽风。旧实现让整轮任务死在这一发上。
+    const bad = await startFakeUpstream({
+      status: 400,
+      // 关键：**只有回显的模型名**，没有任何 error/message 字段
+      errorBody: { model: 'test-model' },
+    });
+    const ok = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      providerOf('opaque', bad, { priority: 1 }),
+      providerOf('good', ok, { priority: 2 }),
+    ], 'opaque400', { DSH_GATEWAY_BREAKER_SHORT_MS: '60000' });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200,
+        '无说明的 400 之后必须换下一家并成功（旧实现回 400 打死任务），实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(ok.st.calls, 1, '请求应真的落到第二家：' + ok.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/响应体没有任何错误说明/.test(logText), '日志须写明这条判据：' + logText.slice(-500));
+      assert.ok(!/failover stopped/.test(logText), '不得终止 failover：' + logText.slice(-500));
+    } finally { killGw(gw); closeUp(bad); closeUp(ok); }
+  });
+
+  t('日志事故①负例：有明确说明的 400 仍须终止 failover（别把"请求本身有错"也放过去）', async () => {
+    // 判据必须保守：上游**说了**是什么问题时（这里 "invalid request body"），
+    // 那是"你的请求有问题"的可靠信号，重发给每一家只是 N 倍计费 + N 倍风控画像。
+    const bad = await startFakeUpstream({
+      status: 400,
+      errorBody: { error: { message: 'invalid request body: messages must not be empty', type: 'invalid_request_error' } },
+    });
+    const ok = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      providerOf('told', bad, { priority: 1 }),
+      providerOf('good2', ok, { priority: 2 }),
+    ], 'told400', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 400, '有明确说明的 400 应原样终止（回 400），实际 ' + r.status);
+      assert.strictEqual(ok.st.calls, 0, '不该把同一个坏请求重发给下一家：' + ok.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/确定性 4xx HTTP 400 → 终止 failover/.test(logText), '应走确定性 4xx 分支：' + logText.slice(-400));
+    } finally { killGw(gw); closeUp(bad); closeUp(ok); }
+  });
+
+  t('日志事故②：账户级失败（429）必须照记模型级失败 —— 否则坏家永远攒不到阈值（amd 实测 7 败 0 熔断）', async () => {
+    // 现场：amd 当天 7 次失败（4×429 并发超限 + 3×超时）、**0 次成功**、**0 次熔断**，
+    // 每个请求都要先白等它 12 秒超时（该模型条目声明 timeoutMs: 12000）。
+    // 根因：429 走"账户级失败"早退分支，那里调的是 breakerRecordSuccess
+    //（它不只是交还半开名额，还会把 fails 清零 + lastOkAt 置现在）——
+    // 与超时路径记的失败**交替清零**，于是永远攒不到阈值；lastOkAt 被刷新后连死家预检也不再触发。
+    const up = await startFakeOpenAIUpstream({ script: ['rate429', 'rate429', 'rate429', 'rate429', 'rate429', 'rate429', 'rate429', 'rate429', 'rate429', 'rate429'] });
+    // 用显式 `accounts: [{id, apiKey}]` 形态（而不是 apiKeys 字符串数组）：只有这种写法
+    // 才会建出**可轮换的账户池**、让 429 走"账户级失败 → 换下一把"的路径 —— 正是 amd 的现场。
+    // 根因回顾：那个早退分支原来调 breakerRecordSuccess（会清 fails + 刷 lastOkAt），
+    // 与超时路径记的模型级失败交替清零 → 永远攒不到阈值 → 坏家每轮都被优先选中，
+    // 用户每次先白等它 12 秒（实测当天 7 次失败 0 次成功 0 次熔断）。
+    //
+    // 两把 Key：一次请求内 k1、k2 各 429 一次 → 计数到 2；第二次请求再各一次 → 到 4 ≥ 阈值 3 → 开闸。
+    // 用 5 把的话第 1 次请求就凑够 5 次直接开闸，后面几次全是 503（虽然也证明了修复生效，
+    // 但断言"看到 rate 分支 + 看到 breaker OPEN"更稳的是 2 把的节奏）。
+    const prov = openaiProvider('ratetrap', up, {
+      priority: 1,
+      accounts: [{ id: 'k1', apiKey: 'sk-k1' }, { id: 'k2', apiKey: 'sk-k2' }],
+    });
+    const gw = await startGatewayWith([prov], 'acctfail', {
+      DSH_GW_MODEL_BREAKER_COOLDOWN_MS: '60000',
+      // 把账户限流冷却压到 1ms：真实形态是"冷却 90 秒、90 秒后同一把 Key 再次被选中又 429"，
+      // 快进成"下一轮就能再打"，这样几次请求就能把模型级失败攒到阈值。
+      // 不压的话两把 Key 各冷却 90s 之后就是"全部冷却中"，模型级计数永远停在 2 攒不到 3。
+      DSH_GATEWAY_ACCOUNT_RATE_COOLDOWN_MS: '1',
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      for (let i = 0; i < 3; i++) await call({ port: gw.port });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/判定为账户级失败（rate）/.test(logText), '应走账户级 rate 分支：' + logText.slice(-600));
+      assert.ok(/breaker OPEN: ratetrap\[test-model\]/.test(logText),
+        '连续 429 之后必须开**模型级**闸（旧实现被 breakerRecordSuccess 清零，永远不开）：' + logText.slice(-1000));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('日志事故②配套：session 类（裸 401/403 = 这一把 Key 坏了）**不得**记供应商失败（多 Key 不连坐）', async () => {
+    // classifyAccountFailure 把裸 401/403 判成 session（该罚的是这把 Key）。
+    // 若照着"账户级失败一律记"改，就会把用户特意配的多把 Key 连坐 —— 实测过 nvidia 4 把 Key 全废。
+    const up = await startFakeOpenAIUpstream({ script: ['session', 'session', 'session', 'session'] });
+    const prov = openaiProvider('sesskey', up, { priority: 1, apiKeys: ['k1', 'k2', 'k3', 'k4'] });
+    const gw = await startGatewayWith([prov], 'sessfail', { DSH_GW_MODEL_BREAKER_COOLDOWN_MS: '60000' });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      for (let i = 0; i < 3; i++) await call({ port: gw.port });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/判定为账户级失败（session）/.test(logText), '应判成 session：' + logText.slice(-400));
+      assert.ok(!/breaker OPEN: sesskey\[test-model\]/.test(logText),
+        'session 类不得记入熔断（该罚 Key，不罚供应商/模型）：' + logText.slice(-800));
+      assert.ok(up.st.calls >= 3, '应逐把 Key 轮换（而不是一上来就熔断）：' + up.st.calls);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('日志事故③：临时型"额度类"400 必须真能熔断（旧实现 fails 永远停在 1，25 次请求 0 次开闸）', async () => {
+    // 审计实测：上游回 `400 {"error":{"message":"insufficient resources"}}`
+    //  → PROVIDER_SIDE_4XX_RE 命中 → 旧代码 `persistent ? 403 : 0` 传了 **0**
+    //  → 0 是"网络层失败"哨兵 → 判成整家级却**没有 immediate** → fails 每次加到 1
+    //  → 而上面刚 breakerRecordSuccess 清零 → **永远开不了闸**，日志却每次宣称"冷却该家"。
+    // 这条用例钉住修复：临时类落**模型级**，攒够阈值必须开闸，且日志要说"仅该模型"。
+    const up = await startFakeUpstream({ status: 400, errorBody: { error: { message: 'insufficient resources' } } });
+    const gw = await startGatewayWith([providerOf('tmpquota', up, { priority: 1 })], 'tmpquota', {
+      DSH_GW_MODEL_BREAKER_COOLDOWN_MS: '60000',
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      for (let i = 0; i < 3; i++) await call({ port: gw.port });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/临时状态 → 仅冷却该模型/.test(logText),
+        '临时额度类必须说"仅冷却该模型"（旧日志谎称"冷却该家"）：' + logText.slice(-500));
+      assert.ok(/breaker OPEN: tmpquota\[test-model\]/.test(logText),
+        '连续 3 次后必须开模型级闸（旧实现 0 次开闸）：' + logText.slice(-800));
+    } finally { killGw(gw); closeUp(up); }
   });
 
   for (const { name, fn } of __tests) {

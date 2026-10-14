@@ -638,7 +638,7 @@ class GatewayManager extends EventEmitter {
         this.proxyDecision = { mode: 'direct', reason: 'config-disabled', configured: '', used: '' };
         return null;
       }
-      if (cfg.proxy && cfg.proxy.enabled) {
+      if (cfg.proxy && cfg.proxy.enabled !== false) {
         const u = String(cfg.proxy.url || '').trim();
         if (u) {
           const norm = u.includes('://') ? u : 'http://' + u;
@@ -694,14 +694,30 @@ class GatewayManager extends EventEmitter {
    */
   computeNoProxy() {
     const hosts = new Set();
+    // 归一化（2026-10-14 审计补）：真正决定走不走代理的是 Node 的 EnvHttpProxyAgent，
+    // 它对 NO_PROXY 条目**不做**大小写归一、不认 `*.`、不认带端口的条目、`[::1]` 方括号形态也不匹配。
+    // 四条实测（都表现为"用户以为直连了，实际照走代理"，与意图完全相反）：
+    //   `API.Example.COM`（从 URL 复制的）→ 原样输出 → 大小写不匹配；
+    //   `*.example.com`（**设置页的示例与注释就是这么教的**）→ 旧代码只去前导 `.`，`*.` 留着；
+    //   `example.org:8080` → 旧代码只去路径不去端口；
+    //   `new URL('http://[::1]:8080').hostname` 在 Node 返回 **`[::1]`（带方括号，实测确认）**。
     const norm = (v) => {
       const s = String(v || '').trim();
       if (!s) return '';
       let host = s;
       if (/^https?:\/\//i.test(s)) { try { host = new URL(s).hostname; } catch (_) { /* 原样 */ } }
-      host = host.replace(/^\./, '').replace(/\/.*$/, '');
+      host = host.replace(/\/.*$/, '')          // 去路径
+        .replace(/^\*\./, '')                   // 去通配前缀（*.example.com → example.com）
+        .replace(/^\./, '')                     // 去前导点（.example.com → example.com）
+        .replace(/^\[/, '').replace(/\]$/, '')  // 去 IPv6 方括号（[::1] → ::1，与 LOOPBACK 一致）
+        .replace(/:\d+$/, '')                   // 去端口（example.org:8080 → example.org）
+        .toLowerCase();                         // 大小写归一（域名大小写无意义）
       return host;
     };
+    // 判断"某条目是否被 forceProxy 剔除"：规范化后相等，或互为父/子域（用户写父域、
+    // 清单里是子域的情况很常见 —— 只按字面量删会漏，与本文件既有注释的意图不符）。
+    const coveredBy = (entry, target) => entry === target
+      || (target.startsWith('.') ? entry.endsWith(target) : entry.endsWith('.' + target));
     const listOf = (v) => (Array.isArray(v) ? v : (typeof v === 'string' ? v.split(',') : []));
     LOOPBACK_NO_PROXY.forEach((h) => hosts.add(h));
     try {
@@ -714,7 +730,10 @@ class GatewayManager extends EventEmitter {
       }
       for (const v of listOf(cfg.proxy && cfg.proxy.forceProxy)) {
         const h = norm(v);
-        if (h && !LOOPBACK_NO_PROXY.includes(h)) hosts.delete(h);
+        if (!h || LOOPBACK_NO_PROXY.includes(h)) continue;
+        for (const entry of [...hosts]) {
+          if (coveredBy(entry, h) || coveredBy(h, entry)) hosts.delete(entry);
+        }
       }
     } catch (_) { /* 配置解析失败也必须保住回环直连 */ }
     return [...hosts].join(',');
@@ -818,6 +837,13 @@ class GatewayManager extends EventEmitter {
 
   async start() {
     if (this.proc) return;
+    // ⚠ 2026-10-14 修正（审计）：`stopping` 原来只有 `_doStart` 开头一处复位。
+    // 触发路径：用户连点两次「重启」→ 第一次 stop() 置 stopping=true → start() 撞上
+    // 仍在飞行的 `_starting`（托盘菜单无禁用态、无 debounce）直接 return，**无人复位**。
+    // 此后 `stopping` 永久为 true：`_scheduleHeal` 里 `if (this.stopping) return`
+    // → **引擎崩了不再自愈**；且 _doStart 里每个 await 之后的取消语义全部失效。
+    // 现在在每次 start() 请求入口无条件复位：start 的意图就是"我要它跑着"。
+    this.stopping = false;
     if (this._starting) return this._starting;      // 并发 start/restart 只执行一次
     this._starting = this._doStart();
     try {

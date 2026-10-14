@@ -63,7 +63,19 @@ function readSettingsInto() {
   const brkTh = String($('#stBrkThreshold').value || '').trim();
   const brkCd = String($('#stBrkCooldownMin').value || '').trim();
   if (brkTh) brkKeys.threshold = Number(brkTh); else delete brkKeys.threshold;
-  if (brkCd) brkKeys.cooldownMs = Math.round(Number(brkCd) * 60_000); else delete brkKeys.cooldownMs;
+  // ⚠ 冷却时长按"分钟"展示，就**不是无损往返**：配置里写 90000ms（合法值，下限 1000），
+  // 界面显示 2，用户**只改了一下端口**、这两个框一动没动，applyChange 也会走这里 →
+  // 写回 2×60000 = 120000 → 90 秒悄悄变成 2 分钟，界面无提示。
+  // 所以：输入框里的分钟数与"原值量化出来的分钟数"相同，就**原样保留毫秒值**，
+  // 判定"用户到底改没改"要跟**量化后的原值**比，而不是跟原值比。
+  if (brkCd) {
+    const min = Number(brkCd);
+    const origMs = Number((c.breaker && c.breaker.cooldownMs) || 0);
+    const shownOrig = origMs ? Math.round(origMs / 60_000) : null;
+    brkKeys.cooldownMs = (shownOrig !== null && shownOrig === min) ? origMs : Math.round(min * 60_000);
+  } else {
+    delete brkKeys.cooldownMs;
+  }
   if (Object.keys(brkKeys).length) set('breaker', brkKeys);
   else if (c.breaker !== undefined) { delete c.breaker; changed = true; }
   return changed;
@@ -113,9 +125,14 @@ LG.initSettings = function initSettings() {
   };
 
   // 网关参数：改动即标脏（点「保存并生效」才落盘）
-  ['stRouting', 'stProfile', 'stProxyEnabled', 'stProxyUrl', 'stNoProxy', 'stForceProxy'].forEach((id) => {
-    $('#' + id).addEventListener('change', () => applyChange('网关设置'));
-  });
+  // ⚠ `stBrkThreshold` / `stBrkCooldownMin`（模型级冷却两个框）**必须**在这张表里。
+  // 漏了它们的后果不是"少个提示"，而是：改完不标脏 → 顶栏不出现"有未保存的更改" →
+  // 点「保存并生效」写回去的还是旧值 → **界面显示 3、实际生效 90**，全程无任何提示。
+  // （2026-10-14 审计发现：这是我上一个版本引入这两个框时漏掉的接线。）
+  ['stRouting', 'stProfile', 'stProxyEnabled', 'stProxyUrl', 'stNoProxy', 'stForceProxy',
+    'stBrkThreshold', 'stBrkCooldownMin'].forEach((id) => {
+      $('#' + id).addEventListener('change', () => applyChange('网关设置'));
+    });
   $('#stPort').addEventListener('change', () => applyChange('端口 ' + $('#stPort').value));
 
   // 应用偏好：直接落盘（与网关配置无关）
