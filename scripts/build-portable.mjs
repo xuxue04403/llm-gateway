@@ -66,6 +66,42 @@ if (existsSync(dataDir)) {
   stashed = true;
   console.log('  已暂存 data\\（构建后原样放回，配置不会丢）');
 }
+
+/**
+ * 异常退出也要把 data\ 放回。
+ *
+ * ⚠ 2026-10-14 实测命中（不是理论风险）：应用正在运行时执行本脚本，
+ * 第 69 行的 `rmSync(OUT_DIR)` 会因文件被占用抛 **EPERM**。此时 data\ 已经**暂存走**
+ * （stashed=true），而原来的放回逻辑在文件末尾 —— 异常直接终止进程，**永远走不到那里**。
+ * 结果：`out\.data-stash\` 成为唯一副本，而用户以为配置还在原处。
+ * （这次是 `cpSync` 复制而非移动，原目录侥幸完好；但只要哪天真改成 move，就是数据丢失。）
+ * 审计里这条被列为"build-portable 的 data 暂存在中途失败时不自动还原"——现在它真的发生了。
+ *
+ * 用 `process.on('exit')` 而不是 try/catch 包住全文：本文件是**顶层顺序语句**，
+ * 包 try/catch 要把 1~8 步整体缩进重排，改动面大、易错。exit 钩子在"正常结束"与
+ * "未捕获异常导致的退出"两种路径上都会跑，且 cpSync/rmSync 都是同步的，可以在这里安全收尾。
+ */
+let restored = false;
+const restoreStash = (why) => {
+  if (restored || !stashed) return;
+  restored = true;
+  try {
+    if (!existsSync(stashDir)) return;
+    cpSync(stashDir, dataDir, { recursive: true });
+    rmSync(stashDir, { recursive: true, force: true });
+    console.log(`  data\\ 已放回（${why}）`);
+  } catch (e) {
+    console.warn('  ⚠ 放回 data\\ 失败：' + (e && e.message)
+      + '\n    副本仍在：' + stashDir + '　请手工拷回 ' + dataDir);
+  }
+};
+process.on('exit', () => restoreStash('进程退出兜底'));
+process.on('uncaughtException', (e) => {
+  console.error('构建异常：' + (e && e.message));
+  restoreStash('异常退出');
+  process.exit(1);
+});
+
 rmSync(OUT_DIR, { recursive: true, force: true });
 mkdirSync(OUT_DIR, { recursive: true });
 // ⚠ `data\` 刻意**不在这里**放回。
@@ -203,27 +239,61 @@ if (leaked.length || leakFiles.length) {
 //
 // ⚠ 不用系统的 bsdtar：它写 zip 时**不设 UTF-8 文件名标志位**，中文文件名（`使用说明.txt`）
 // 在 Windows 资源管理器/Expand-Archive 下会变成 `ʹ��˵��.txt`（实测确认，内容不受影响但名字坏了）。
-// 改用 .NET 的 ZipFile.CreateFromDirectory + 显式 UTF8 编码：一次调用、名字正确、速度可接受。
+//
+// ⚠⚠ 2026-10-14 修正：**不能**用 `ZipFile.CreateFromDirectory`（Windows PowerShell 5.1 的
+// .NET Framework 版）。它用 `Path.DirectorySeparatorChar` 拼条目名 → 在 Windows 上写出的是
+// `LLM-Gateway\chrome_100_percent.pak` 这种**反斜杠条目名**。ZIP 规范要求正斜杠，
+// 实测：本脚本产出的 zip 113 个条目**全部**是反斜杠；而手工用 pwsh(.NET Core) 重打的同内容
+// zip 是正斜杠。反斜杠条目在 Windows 资源管理器/Expand-Archive 下能看（伪装成目录），
+// 但在 Linux/macOS 的 unzip 下会变成**文件名里带反斜杠的散文件**，等于解压出一堆垃圾。
+//
+// 现改为：自己遍历目录 + `ZipArchive.CreateEntry(名字)`，名字里的分隔符显式用 `/`。
+// 仍然走 .NET（保持 UTF-8 文件名标志位，中文名不乱码），仍然带一层 `LLM-Gateway/` 顶层目录。
 if (!process.argv.includes('--no-zip')) {
   const zipPath = path.join(ROOT, 'out', `${OUT_NAME}-${pkg.version}.zip`);
   rmSync(zipPath, { force: true });
   console.log('     正在打 zip（几百 MB，需要一会儿）…');
   const q = (s) => "'" + String(s).replace(/'/g, "''") + "'";
+  // 注意：整段脚本里**不出现反斜杠字面量**（用 [char]92/[char]47 代替），
+  // 免得在 JS 字符串与 PowerShell 字符串之间来回转义出错。
   const script = [
     '$ErrorActionPreference = "Stop"',
+    // ⚠ 两个程序集都要加载：`ZipFile` 在 System.IO.Compression.FileSystem，
+    // 而 **`ZipArchive` / `CompressionLevel` 在 System.IO.Compression**。
+    // 只加载前者会报 `Unable to find type [System.IO.Compression.ZipArchive]`
+    // （实测踩到：zip 被建成 0 字节的坏文件）。
+    'Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue',
     'Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue',
-    // includeBaseDirectory = $true：zip 里带一层 `LLM-Gateway/` 顶层目录。
-    // 传 $false 的话解压出来是一堆散文件直接铺在当前目录（实测踩到，很难看也不好分发）。
-    `[System.IO.Compression.ZipFile]::CreateFromDirectory(${q(OUT_DIR)}, ${q(zipPath)}, `
-      + '[System.IO.Compression.CompressionLevel]::Optimal, $true, [System.Text.Encoding]::UTF8)',
+    `$src = (Resolve-Path ${q(OUT_DIR)}).Path`,
+    `$zip = ${q(zipPath)}`,
+    `$top = ${q(OUT_NAME)}`,
+    'if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }',
+    '$sep = [char]92',
+    '$slash = [char]47',
+    '$fs = [System.IO.File]::Open($zip, [System.IO.FileMode]::CreateNew)',
+    '$arch = [System.IO.Compression.ZipArchive]::new($fs, [System.IO.Compression.ZipArchiveMode]::Create, [System.Text.Encoding]::UTF8)',
+    'try {',
+    '  $files = Get-ChildItem -LiteralPath $src -Recurse -File -Force',
+    '  foreach ($f in $files) {',
+    '    $rel = $f.FullName.Substring($src.Length + 1).Replace($sep, $slash)',
+    '    $entry = $arch.CreateEntry($top + $slash + $rel, [System.IO.Compression.CompressionLevel]::Optimal)',
+    '    $es = $entry.Open()',
+    '    $ins = [System.IO.File]::OpenRead($f.FullName)',
+    '    try { $ins.CopyTo($es) } finally { $ins.Dispose(); $es.Dispose() }',
+    '  }',
+    '} finally { $arch.Dispose(); $fs.Dispose() }',
   ].join('; ');
   const r = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], {
     encoding: 'utf8', windowsHide: true, timeout: 30 * 60 * 1000,
   });
-  if (r.status === 0 && existsSync(zipPath)) {
+  // ⚠ 判定必须带**大小下限**：出错时 ZipArchive 已经建好文件而内容为空，
+  // 只判 `existsSync` 会把 0 字节的坏 zip 报成 `[OK]`（实测踩到，发布前才发现）。
+  const zipOk = r.status === 0 && existsSync(zipPath) && statSync(zipPath).size > 1024 * 1024;
+  if (zipOk) {
     console.log(`[OK] zip：${zipPath}（${(statSync(zipPath).size / 1048576).toFixed(1)} MB）`);
   } else {
-    console.log('     zip 打包失败：' + ((r.stderr || r.stdout || '').trim() || '未知错误'));
+    const why = existsSync(zipPath) ? `产物过小（${statSync(zipPath).size} 字节，疑似损坏）` : '未生成';
+    console.log('     zip 打包失败：' + why + '　' + ((r.stderr || r.stdout || '').trim() || ''));
   }
 }
 
@@ -238,7 +308,21 @@ if (!process.argv.includes('--no-zip')) {
 // 两者不矛盾，只要顺序对：**暂存 → 构建 → 闸门 → 打 zip → 放回**。
 // 摆成"构建后立刻放回"会让闸门挡住 zip；摆成"根本不暂存"会删掉用户配置。
 if (stashed) {
-  cpSync(stashDir, dataDir, { recursive: true });
-  rmSync(stashDir, { recursive: true, force: true });
-  console.log('  data\\ 已放回（用户的供应商配置完好；它**没有**进 zip）');
+  restoreStash('构建收尾：用户的供应商配置完好，且**没有**进 zip');
+}
+
+// 9) 清理 out\data-backup-* 的旧副本（只留最新 2 份）。
+// 这些是上面"额外备份"留下的**整目录**副本（每个都有几百 MB 的日志），
+// 不清理会随每次构建无界增长 —— 审计里点过这一条。
+try {
+  const baks = readdirSync(path.join(ROOT, 'out'), { withFileTypes: true })
+    .filter((e) => e.isDirectory() && e.name.startsWith('data-backup-'))
+    .map((e) => e.name)
+    .sort();
+  for (const name of baks.slice(0, Math.max(0, baks.length - 2))) {
+    rmSync(path.join(ROOT, 'out', name), { recursive: true, force: true });
+    console.log('  已清理旧备份 out\\' + name);
+  }
+} catch (e) {
+  console.warn('  ⚠ 清理旧备份失败（不影响构建）：' + (e && e.message));
 }
