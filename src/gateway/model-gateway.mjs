@@ -1049,7 +1049,7 @@ function providerBreakerRecordFail(providerId, httpStatus, serverRetryMs, timedO
   breaker.set(providerId, b);
 }
 
-/** 模型级记录（规则 2/3）：连续 N 次 → **只**冷却该模型 M 分钟（不指数退避，可预期）。 */
+/** 模型级记录（规则 2/3）：连续 N 次 → **只**冷却该模型，首档短冷却、反复开闸按指数退避到配置上限。 */
 function modelBreakerRecordFail(providerId, model, key, httpStatus, serverRetryMs, timedOutByUs) {
   const b = modelBreaker.get(key) || { state: 'closed', fails: 0, openUntil: 0, opens: 0 };
   b.fails += 1;
@@ -1058,12 +1058,29 @@ function modelBreakerRecordFail(providerId, model, key, httpStatus, serverRetryM
   if (wasProbe) b.probeFull = (!!timedOutByUs && !b.probeFull);
   if (b.fails >= MODEL_BREAKER_THRESHOLD || wasProbe) {
     b.opens = (b.opens || 0) + 1;
-    let ms = MODEL_BREAKER_COOLDOWN_MS;
+    // ⚠⚠ 2026-10-14 修正（用户报「ling-3.1-flash 调用失败 503」）：
+    // 旧实现 `let ms = MODEL_BREAKER_COOLDOWN_MS;` —— **首次开闸就直接 30 分钟**。
+    // 对**瞬时**故障（上游 429「temporarily unavailable, try again in a moment」/ 5xx / 网络抖动）
+    // 这时长是灾难性的：上游 10 秒后就恢复，我们却把该模型锁死 30 分钟 ——
+    // 该模型只有一家候选时，用户整轮任务直接死掉（实测 ling-3.1-flash 正是此形态）。
+    //
+    // 这也与**供应商级**熔断的既有设计不一致：那边早就分「短熔断（网络/5xx，90 秒）→
+    // 指数退避 90s→3m→6m→12m→24m → 上限 30 分钟」。模型级照抄同一套阶梯：
+    //   · 首次开闸 → BREAKER_SHORT_MS（90 秒），给上游一个恢复窗口；
+    //   · 反复开闸 → 指数退避，直到用户在 `breaker.cooldownMs` 里设的上限（默认 30 分钟）。
+    // 即 30 分钟仍是**上限**（用户规则 3 的语义不变），只是不再当"首档"用。
+    // 每次冷却到点后半开探测自动放行一次 → 上游恢复后**最多 90 秒**就能重新用上。
+    const ladder = Math.min(
+      BREAKER_SHORT_MS * Math.pow(2, Math.max(0, b.opens - 1)),
+      MODEL_BREAKER_COOLDOWN_MS,
+    );
+    let ms = ladder;
     if (serverRetryMs > 0) ms = Math.max(ms, Math.min(serverRetryMs, MODEL_BREAKER_COOLDOWN_MS));
     b.state = 'open';
     b.openUntil = Date.now() + ms;
     log(`breaker OPEN: ${providerId}[${model}] 失败（${httpStatus || (timedOutByUs ? 'timeout' : 'network')}），`
-      + `**仅该模型**冷却 ${fmtMs(ms)}（连续 ${b.fails} 次失败；规则：${MODEL_BREAKER_THRESHOLD} 次 → ${fmtMs(MODEL_BREAKER_COOLDOWN_MS)}。`
+      + `**仅该模型**冷却 ${fmtMs(ms)}（连续 ${b.fails} 次失败；第 ${b.opens} 次开闸`
+      + `${b.opens > 1 ? '，退避递增' : ''}；规则：${MODEL_BREAKER_THRESHOLD} 次 → 上限 ${fmtMs(MODEL_BREAKER_COOLDOWN_MS)}。`
       + `该家其它模型不受影响）`);
     noteModelCooled(providerId, model);   // 护栏：多模型相继冷却 → 升级为整家
   }
@@ -1298,15 +1315,23 @@ async function maybeRestoreProxy() {
 }
 
 /** 熔断冷却剩余秒数（客户端重试提示用）。 */
-function breakerCooldownSecs(providers) {
+function breakerCooldownSecs(providers, model) {
   // ⚠ 必须过滤掉非对象条目。配置里出现 `providers: [null]`（手改 JSON / 别的工具写出）时，
   // 旧实现直接 `p.id` 抛 TypeError —— 而它是在**构造 503 响应体**的过程中被调用的，
   // 于是真正的信息（"全部候选都在熔断"）被 startServer 的兜底 catch 换成了不透明的
   // `500 gateway internal error`，用户看到的是一句和事实无关的报错。
   const list = (Array.isArray(providers) ? providers : []).filter((p) => p && p.id);
+  const remain = (b) => (b ? Math.max(0, b.openUntil - Date.now()) : 0);
   const until = Math.max(0, ...list.map((p) => {
-    const b = breaker.get(p.id);
-    return b ? b.openUntil - Date.now() : 0;
+    // ⚠⚠ 2026-10-14 修正：必须**两级都看**。
+    // 旧实现只看 `breaker`（供应商级）。而规则 2 的模型级冷却存在 `modelBreaker` 里，
+    // 于是"某模型冷却 1800 秒"被算成 until=0 → 落到兜底 BREAKER_SHORT_MS → **文案写
+    // "retry in ~90s"，实际要等 30 分钟**。
+    // 实测事故：`ling-3.1-flash` 被模型级冷却 1800s，503 却告诉用户 90 秒；
+    // 用户照提示重试仍然 503，只会判定"网关坏了" —— 而这句提示本是他唯一的线索。
+    const providerMs = remain(breaker.get(p.id));
+    const modelMs = model ? remain(modelBreaker.get(modelBreakerKey(p.id, model))) : 0;
+    return Math.max(providerMs, modelMs);
   }));
   return Math.max(1, Math.ceil((until || BREAKER_SHORT_MS) / 1000));
 }
@@ -4535,6 +4560,48 @@ function isModelUnavailableByProvider(status, detail) {
   return Number(status) === 404 && MODEL_MISSING_RE.test(d);
 }
 
+/** 见下方 MODEL_NOT_ON_ENDPOINT_RE：这家有这模型，但不在这个端点上（baseURL 路径写错）。 */
+function isEndpointMismatchByProvider(status, detail) {
+  const s = Number(status);
+  // 只在 4xx 上认：同一句话若出现在 200 的 SSE 错误帧里，语义不同（那是内容拦截那一路）。
+  return (s >= 400 && s < 500) && isModelNotOnThisEndpoint(detail);
+}
+
+/**
+ * 「**这家有这个模型，但不在这个端点上**」——配置里 baseURL 写错了路径（实测 2026-10-14）。
+ *
+ * 现场（commandcode）：
+ *   baseURL = `https://api.commandcode.ai/provider/v1`
+ *   上游回 `400 {"error":{"type":"invalid_request_error","message":
+ *     "Model \"deepseek/deepseek-v4.1-flash\" is not supported on this endpoint.
+ *      Use /provider/v1/chat/completions for OpenAI and OSS models."}}`
+ *
+ * 它**不是**"请求本身有错"：请求完全合法，是**我们的 baseURL 指到了不对的路由**
+ * （OpenRouter 那种多路由网关：`/provider/v1` 与 `/provider/v1/chat/completions`
+ * 各自服务的模型集合不同）。旧实现落进"确定性 4xx → 终止 failover"，客户端整轮任务拿到 400 而死 ——
+ * 而同一个逻辑模型在配置里还有 8 家候选（x666 / opencode-go / amd / sensenova / cline /
+ * nvidia / workbuddy / muyuan.do）本可服务。
+ *
+ * ⚠ 它也不会被"模型不存在"那条判据覆盖：措辞是 `is not supported on this endpoint`
+ * 而不是 `not supported` / `does not offer`，两个正则不相交 ——
+ * 实测七个豁免判据（模型缺失 / 路由缺失 / 供应商侧 4xx / 客户端指纹 / 渠道拦截 /
+ * 上游损坏 / 内容拦截）**全部不命中**，于是它一路掉进"确定性 4xx"。
+ *
+ * 处置：继续 failover、**不熔断该家**（配错路径属于配置问题，不是这家坏了），
+ * 但日志必须留下上游建议的正确路径 —— 否则用户只看到"这家坏了"，根本不知道该改哪。
+ */
+const MODEL_NOT_ON_ENDPOINT_RE = /is\s+not\s+supported\s+on\s+this\s+endpoint|not\s+available\s+on\s+this\s+endpoint|is\s+not\s+supported\s+(?:at|by)\s+this\s+(?:endpoint|route)|use\s+\S+\s+for\s+/i;
+
+function isModelNotOnThisEndpoint(detail) {
+  return MODEL_NOT_ON_ENDPOINT_RE.test(String(detail || ''));
+}
+
+/** 从这类错误体里抠出上游建议的路径，好让用户能直接照着改 baseURL。 */
+function suggestedEndpointHint(detail) {
+  const m = /use\s+(\/[^\s"'\\]+)/i.exec(String(detail || ''));
+  return m ? m[1] : '';
+}
+
 /**
  * 「**这一发没成，但请求本身没问题**」——上游回了一个**不带任何错误说明**的 4xx。
  *
@@ -5752,6 +5819,25 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       //（裸 401/403 → session 是该函数的既定规则），把该家**所有 Key** 逐个标记冷却 1 小时。
       // 连坐效果与"熔断整家"等价：实测随后请求同家另一个完全正常的模型，路由阶段就是
       // `provider p1: 2 个账户全部冷却中 → 交给下一家` —— 一个模型坏掉 = 这家对所有模型静默停用。
+      //
+      // 2026-10-14 新增（commandcode 实测）：「**这家有这模型，但不在这个端点上**」要**单独**成支，
+      // 因为它的处置与"不提供该模型"虽然相同（继续 failover、不熔断、不冷却账户），
+      // 但**给用户的提示完全不同** —— 用户需要知道该改 baseURL 路径，而不是删掉模型映射。
+      if (isEndpointMismatchByProvider(upstream.status, detail)) {
+        const hint = suggestedEndpointHint(detail);
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"模型不在这个端点上"（请求本身没问题，`
+          + `是本供应商的 baseURL 指到了不对的路由）→ 继续 failover（不熔断该家、不冷却账户）`
+          + (hint ? `；**上游建议改用 ${hint}**，请在供应商设置里把地址改成对应路径` : ''));
+        if (opts.failureSink) opts.failureSink.modelScopeOnly = true;
+        breakerReleaseSlot(provider.id, bModel);
+        // ⚠ 但要**记一次模型级失败**：baseURL 写错是**持续**状态，不是一次性抖动。
+        // 只交还名额的话，每一条请求都会再来打一次这个必然 400 的端点 ——
+        // 实测 2026-10-14：commandcode priority=1，每次都排第一个，于是**每一轮**都先在这
+        // 浪费 25 秒（dur=25064ms）再 failover。记模型级失败后，攒够阈值就冷却这个
+        // （该家 × 该模型）组合；用户改好 baseURL 后半开探测会自愈。
+        breakerRecordFail(provider.id, upstream.status, 0, false, bModel);
+        return rawMode ? { retryable: upstream.status } : false;
+      }
       if (isModelUnavailableByProvider(upstream.status, detail)) {
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"这家不提供该模型"（含地区/套餐受限）`
           + ' → 继续 failover（**不熔断该家、不冷却账户**；该家对别的模型仍然正常。'
@@ -5804,6 +5890,19 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     //（这个函数、forwardAnthropicViaOpenAI、以及"全部账户不可用"的收尾），三处都要判，
     // 否则同一个 403 走不同路径会有不同后果 —— 这正是 2026-09-30 模型全量测试里
     // "地区受限的模型把整家 13 个正常模型一起封掉"的成因。
+    // 2026-10-14 新增（commandcode 实测）：端点不匹配要**先于**它单独成支 ——
+    // 措辞 `is not supported on this endpoint` 与"模型不存在"两条正则都不相交，
+    // 旧实现因此漏判、终止了整轮 failover（用户侧 400 终止任务）。
+    if (isEndpointMismatchByProvider(upstream.status, detail)) {
+      const hint = suggestedEndpointHint(detail);
+      log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"模型不在这个端点上"（请求本身没问题，`
+        + `是本供应商的 baseURL 指到了不对的路由）→ 继续 failover（不熔断该家）`
+        + (hint ? `；**上游建议改用 ${hint}**，请改供应商设置里的地址` : ''));
+      breakerReleaseSlot(provider.id, bModel);
+      // 同上：持续性配置错误 → 记一次**模型级**失败，攒够阈值冷却（该家 × 该模型），避免每轮都白打。
+      breakerRecordFail(provider.id, upstream.status, 0, false, bModel);
+      return rawMode ? { retryable: upstream.status } : false;
+    }
     if (isModelUnavailableByProvider(upstream.status, detail)) {
       log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"这家不提供该模型"（含地区/套餐受限）`
         + ' → 继续 failover（**不熔断该家**；该家对别的模型仍然正常。若长期如此，请从配置的 models 里移除该映射）');
@@ -8687,6 +8786,20 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       //    （`Requested model X not supported`）永远走不到这一行，落到下面的
       //     `DETERMINISTIC_4XX_STATUS → {stop}` 直接回客户端 400。
       //     直通路径对同一种响应是继续 failover 的（2026-09-23 修过那一处），翻译路径当时漏了。
+      //
+      // 2026-10-14 新增（commandcode 实测，DSH 走的就是这条翻译路径）：
+      // 「模型不在这个端点上」要**先于**"不提供该模型"单独成支 —— 两者处置相同（继续 failover、
+      // 不熔断、不冷却账户），但提示不同：这里必须告诉用户改 baseURL 路径。
+      if (isEndpointMismatchByProvider(upstream.status, lastDetail)) {
+        const hint = suggestedEndpointHint(lastDetail);
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"模型不在这个端点上"（请求本身没问题，`
+          + `是本供应商的 baseURL 指到了不对的路由）→ 继续 failover（不熔断该家、不冷却账户）`
+          + (hint ? `；**上游建议改用 ${hint}**，请改供应商设置里的地址` : ''));
+        breakerReleaseSlot(provider.id, bModel);
+        // 持续性配置错误 → 记模型级失败（攒够阈值冷却该家该模型），避免每轮都白打这 25 秒。
+        breakerRecordFail(provider.id, upstream.status, 0, false, bModel);
+        return false;
+      }
       if (isModelUnavailableByProvider(upstream.status, lastDetail)) {
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"这家不提供该模型"（含地区/套餐受限）`
           + ' → 继续 failover（**不熔断该家、不冷却账户**；该家对别的模型仍然正常。'
@@ -8955,6 +9068,14 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
   // `breakerRecordFail(provider.id, 403)` 把**整家**熔断 30 分钟，随后同家另一个完全
   // 正常的模型在路由阶段就被 `skip p1 (breaker open)` 挡掉。直通路径因为豁免在最顶层，
   // 所以只有翻译路径复现 —— 这正是"三处都要判"里漏掉的第三处。
+  if (isEndpointMismatchByProvider(lastStatus, lastDetail)) {
+    const hint = suggestedEndpointHint(lastDetail);
+    log(`provider ${provider.id} 的失败原因是"模型不在这个端点上"（baseURL 指到了不对的路由）`
+      + ' → 交还半开名额、**不熔断该家**，继续 failover'
+      + (hint ? `；**上游建议改用 ${hint}**` : ''));
+    breakerReleaseSlot(provider.id, bModel);
+    return false;
+  }
   if (isModelUnavailableByProvider(lastStatus, lastDetail)) {
     log(`provider ${provider.id} 的失败原因是"这家不提供该模型"（含地区/套餐受限）→ 交还半开名额，**不熔断该家**`
       + '（该家对别的模型仍然正常；若长期如此，请从配置的 models 里移除该映射）');
@@ -9122,7 +9243,7 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
       // 全部候选都熔断中（catalog 因熔断未探测 → 归属无法判定）：暂时状态 → 503 + 重试提示（R20）
       log(`[route] ${model}: 全部候选熔断，归属无法判定（${reasonsText}）`);
       logCall('breaker-all', 'fail');
-      return json(res, 503, { error: { message: `all providers for model "${model}" are temporarily in breaker cooldown (network/upstream failures); retry in ~${breakerCooldownSecs(candidates)}s or restart the gateway` } });
+      return json(res, 503, { error: { message: `all providers for model "${model}" are temporarily in breaker cooldown (network/upstream failures); retry in ~${breakerCooldownSecs(candidates, model)}s or restart the gateway` } });
     }
     if (eligible.length === 0) {
       // 没有任何候选承载该模型：catalog 未收录 / models 列表不含 → 404 + 排查提示
@@ -9137,7 +9258,7 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
     // 候选存在但全部处于熔断冷却：暂时状态 → 503 + 重试提示（R20）
     log(`[route] ${model}: 候选全部熔断（${reasonsText}）`);
     logCall('breaker-all', 'fail');
-    return json(res, 503, { error: { message: `all providers for model "${model}" are temporarily in breaker cooldown (network/upstream failures); retry in ~${breakerCooldownSecs(eligible)}s or restart the gateway` } });
+    return json(res, 503, { error: { message: `all providers for model "${model}" are temporarily in breaker cooldown (network/upstream failures); retry in ~${breakerCooldownSecs(eligible, model)}s or restart the gateway` } });
   }
 
   // 路由模式（S1）：
@@ -9474,7 +9595,7 @@ async function handleMessages(cfg, req, res, body) {
       // 全部候选都熔断中（catalog 因熔断未探测 → 归属无法判定）：暂时状态 → 503（R20），不再误报 404
       log(`[route] ${model}: 全部候选熔断，归属无法判定（${reasonsText}）`);
       logCall('breaker-all', 'fail');
-      return json(res, 503, { type: 'error', error: { type: 'api_error', message: `all providers for model "${model}" are temporarily in breaker cooldown; retry in ~${breakerCooldownSecs(candidates)}s or restart the gateway` } });
+      return json(res, 503, { type: 'error', error: { type: 'api_error', message: `all providers for model "${model}" are temporarily in breaker cooldown; retry in ~${breakerCooldownSecs(candidates, model)}s or restart the gateway` } });
     }
     if (eligible.length === 0) {
       // catalog 未收录且 models 列表不含 → 404 + 排查提示（只回网关自身的判定码，不回显上游内容）
@@ -9489,7 +9610,7 @@ async function handleMessages(cfg, req, res, body) {
     // 候选存在但全部处于熔断冷却：暂时状态 → 503（R20）
     log(`[route] ${model}: 候选全部熔断（${reasonsText}）`);
     logCall('breaker-all', 'fail');
-    return json(res, 503, { type: 'error', error: { type: 'api_error', message: `all providers for model "${model}" are temporarily in breaker cooldown; retry in ~${breakerCooldownSecs(eligible)}s or restart the gateway` } });
+    return json(res, 503, { type: 'error', error: { type: 'api_error', message: `all providers for model "${model}" are temporarily in breaker cooldown; retry in ~${breakerCooldownSecs(eligible, model)}s or restart the gateway` } });
   }
 
   let tryOrder = ordered;

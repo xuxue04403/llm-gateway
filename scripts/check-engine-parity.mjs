@@ -39,6 +39,16 @@ const DECLARED = [
   { name: 'PERSISTENT_ACCOUNT_RE', why: '改动：不再让"长期欠费"的判定单独承担 insufficient_quota —— 该措辞已由 TRANSIENT_QUOTA_429_RE 在 classifyAccountFailure **最前面**（必须早于 WORKBUDDY_CREDIT_RE，否则那条分支先 return）翻案成短期限流。正文含 credit/balance/insufficient_user_quota 等真·欠费措辞的仍判长期，语义不变' },
   { name: 'classifyAccountFailure', why: '改动：在函数**最前面**加 `if (status === 429 && TRANSIENT_QUOTA_429_RE.test(detail)) return \'rate\'`。位置是生死线 —— 放在末尾没用，WORKBUDDY_CREDIT_RE 分支在它之前就 return 了（这是本次修复的第一版错法，已改正）' },
 
+  // —— 2026-10-14：模型"不在这个端点上"被当成"请求有错"，终止整轮 failover ——
+  { name: 'MODEL_NOT_ON_ENDPOINT_RE', why: '新增：判据「这家有这个模型，但不在这个端点上」。实测 commandcode（baseURL=https://api.commandcode.ai/provider/v1）回 400 `"Model \\"…\\" is not supported on this endpoint. Use /provider/v1/chat/completions for OpenAI and OSS models."` —— 它**七个豁免判据全不命中**（措辞与模型缺失/路由缺失都不相交），于是掉进"确定性 4xx → 终止 failover"，客户端整轮任务拿到 400 而死，而同模型还有 8 家候选可用' },
+  { name: 'isModelNotOnThisEndpoint', why: '新增：MODEL_NOT_ON_ENDPOINT_RE 的判定入口（只认文案，不看状态码）' },
+  { name: 'isEndpointMismatchByProvider', why: '新增：把上面的文案判据限制在 **4xx** 上（同一句话若出现在 200 的 SSE 错误帧里语义不同），并在四条路径（直通账户池 / 直通非账户池 / 翻译路径 / 全部账户耗尽收尾）接入：继续 failover + **不熔断整家** + 交还半开名额，但**记一次模型级失败**（baseURL 写错是持续性配置错误，否则每轮都白打一次必然 400 的端点 —— 实测 dur=25064ms）' },
+  { name: 'suggestedEndpointHint', why: '新增：从这类错误体里抠出上游建议的路径（如 `/provider/v1/chat/completions`）写进日志 —— 否则用户只看到"这家坏了"，根本不知道该改 baseURL 的哪一段' },
+
+  // —— 2026-10-14：模型级冷却首档 30 分钟 + 503 文案报错时长 ——
+  { name: 'modelBreakerRecordFail', why: '改动（用户报「ling-3.1-flash 调用失败 503」）：模型级冷却**首档改为短冷却**并接上指数退避阶梯。旧实现 `let ms = MODEL_BREAKER_COOLDOWN_MS` —— 首次开闸就直接 30 分钟；而上游当时回的是 429「Upstream model provider is temporarily unavailable. Please try again in a moment.」（明说"稍后重试"），我们却把该模型锁死半小时。该模型只有一家候选 → 用户整轮任务直接死掉。现在与**供应商级**熔断的既有设计对齐：90s → 3m → 6m → 12m → 24m → **上限 30 分钟**（`breaker.cooldownMs` 仍是上限，规则 3 语义不变）。每次冷却到点后半开探测放行一次 → 上游恢复后最多 90 秒即可重新用上' },
+  { name: 'breakerCooldownSecs', why: '改动（同一个 503 事故）：必须**两级都看**。旧实现只读 `breaker`（供应商级），而规则 2 的模型级冷却存在 `modelBreaker` 里 → 模型级冷却时算出 until=0 → 落到兜底 BREAKER_SHORT_MS → **503 文案写 "retry in ~90s"，实际要等 30 分钟**。用户照提示重试仍然 503，只会判定"网关坏了"，而这句提示本是他唯一的线索。新增第二个参数 `model`，四处调用点都传入当前模型' },
+
   // —— 2026-09-30：客户端仿真 / 防封禁专项改进（依据是官方 SDK/CLI 一手源码）——
   { name: 'clientIdentityOverrides', why: '新增：版本/身份统一覆盖入口（env > 配置 > 默认），避免版本号写死后被上游最低版本门禁拒掉' },
   { name: 'osRelease', why: '新增：os.release() 安全包装，供 UA 与平台头构造使用' },

@@ -1922,6 +1922,22 @@ let upstreamPort = 0;
           res.end(JSON.stringify({ error: { message: opts.brokeMsg || 'credit insufficient balance: balance=0' } }));
           return;
         }
+        // 2026-10-14：commandcode 的真实形态 ——「这家有这模型，但不在这个端点上」。
+        // 七个豁免判据全部不命中，旧实现落进"确定性 4xx"→ 终止 failover → 整轮任务被打死。
+        if (behavior === 'endpointMismatch') {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: {
+            type: 'invalid_request_error',
+            message: opts.endpointMsg || ('Model "deepseek/deepseek-v4.1-flash" is not supported on this endpoint. Use /provider/v1/chat/completions for OpenAI and OSS models.'),
+          } }));
+          return;
+        }
+        // 真·请求参数错误：上游**说了**是哪个字段的问题 → 必须仍终止 failover。
+        if (behavior === 'badReq') {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: opts.badReqMsg || 'invalid request body: messages must not be empty' } }));
+          return;
+        }
         if (behavior === 'err500') {
           res.writeHead(500, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: { message: 'internal error' } }));
@@ -5249,7 +5265,12 @@ let upstreamPort = 0;
       assert.ok(/breaker OPEN: cfg\[test-model\]/.test(logText), '第 5 次应开闸：' + logText.slice(-400));
       assert.ok(/仅该模型\**冷却 2 分钟/.test(logText),
         '冷却时长必须取配置值（90000ms → 2 分钟），实际：' + logText.slice(-400));
-      // 默认值也要能被看到：不配 breaker 时是 3 次 / 30 分钟（用另一实例的日志证明默认没被改坏）
+      // 默认值也要能被看到：不配 breaker 时是 3 次 / 上限 30 分钟（用另一实例的日志证明默认没被改坏）
+      // ⚠ 2026-10-14 语义修正：30 分钟现在是**上限**，不是"首次开闸就 30 分钟"。
+      // 首档走短冷却阶梯（90s → 3m → … → 上限），所以这里断言的是
+      //   ① 默认阈值仍是 3 次；
+      //   ② 日志里自述的**上限**是 30 分钟（配置默认值没被改坏）；
+      //   ③ 首次开闸用的是短档（远小于 30 分钟）—— 这是修 ling-3.1-flash 那次事故的核心。
       const up2 = await startFakeUpstream({ status: 500 });
       const gw2 = await startGatewayWith([providerOf('dflt', up2, { priority: 1 })], 'breakdflt', {});
       try {
@@ -5258,8 +5279,12 @@ let upstreamPort = 0;
         assert.ok(!/breaker OPEN: dflt\[test-model\]/.test(l2), '默认阈值 3 → 2 次失败不该开闸：' + l2.slice(-300));
         await call({ port: gw2.port });
         l2 = fs.readFileSync(gw2.logPath, 'utf8');
-        assert.ok(/仅该模型\**冷却 30 分钟/.test(l2),
-          '默认冷却应为 30 分钟（规则3 的默认值）：' + l2.slice(-400));
+        assert.ok(/仅该模型\**冷却 [^（]*（连续 3 次失败；第 1 次开闸/.test(l2),
+          '默认阈值仍是连续 3 次失败，且应标出"第 1 次开闸"：' + l2.slice(-400));
+        assert.ok(/上限 30 分钟/.test(l2),
+          '默认的冷却**上限**应为 30 分钟（规则3 的默认值）：' + l2.slice(-400));
+        assert.ok(!/第 1 次开闸[^）]*冷却 30 分钟/.test(l2),
+          '首次开闸不得直接顶到 30 分钟上限（瞬时故障会被锁死半小时）：' + l2.slice(-400));
       } finally { killGw(gw2); closeUp(up2); }
     } finally { killGw(gw); closeUp(up); }
   });
@@ -5464,6 +5489,119 @@ let upstreamPort = 0;
       const logText = fs.readFileSync(gw.logPath, 'utf8');
       assert.ok(/credit insufficient balance/.test(logText) || /标记为 credit/.test(logText),
         '余额为 0 必须走长期状态路径：' + logText.slice(-600));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('commandcode：模型"不在这个端点上"的 400 → 必须继续 failover（并提示改 baseURL）', async () => {
+    // 2026-10-14 实测事故（用户报"调用 commandcode 模型报错终止任务"）：
+    //   baseURL = https://api.commandcode.ai/provider/v1
+    //   upstream commandcode HTTP 400: {"error":{"type":"invalid_request_error",
+    //     "message":"Model \"deepseek/deepseek-v4.1-flash\" is not supported on this endpoint.
+    //                Use /provider/v1/chat/completions for OpenAI and OSS models."}}
+    //   → 确定性 4xx → 终止 failover → 客户端整轮任务拿到 400 而死
+    //
+    // 实测**七个豁免判据全部不命中**（模型缺失/路由缺失/供应商侧4xx/指纹/渠道拦截/上游损坏/内容拦截）——
+    // 措辞 `is not supported on this endpoint` 与那些正则都不相交，于是掉进"确定性 4xx"。
+    //
+    // 语义上它是**配置问题**：请求完全合法，是我们把 baseURL 指到了不对的路由。
+    // 必须继续 failover（同模型还有 8 家候选），而且要留下上游建议的路径给用户照着改。
+    const up = await startFakeOpenAIUpstream({
+      script: ['endpointMismatch', 'endpointMismatch', 'endpointMismatch'],
+      endpointMsg: 'Model "deepseek/deepseek-v4.1-flash" is not supported on this endpoint. Use /provider/v1/chat/completions for OpenAI and OSS models.',
+    });
+    const ok2 = await startFakeOpenAIUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      openaiProvider('commandcode', up, { priority: 1 }),
+      openaiProvider('fallback', ok2, { priority: 2 }),
+    ], 'ccmismatch', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200,
+        '端点不匹配之后必须换下一家并成功（旧实现回 400 打死任务），实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(ok2.st.calls, 1, '应真的落到第二家：' + ok2.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/判定为"模型不在这个端点上"/.test(logText), '日志须写明是端点问题：' + logText.slice(-600));
+      assert.ok(/\/provider\/v1\/chat\/completions/.test(logText),
+        '日志须带上游建议的正确路径（否则用户不知道该改哪）：' + logText.slice(-600));
+      assert.ok(!/failover stopped/.test(logText), '不得终止 failover：' + logText.slice(-400));
+    } finally { killGw(gw); closeUp(up); closeUp(ok2); }
+  });
+
+  t('commandcode 负例：真·请求参数错误仍须终止 failover（别把"请求有错"一起放过去）', async () => {
+    // 判据必须保守：只有"模型不在这个端点上"才放行；
+    // 真的参数错误（上游说了是哪个字段）仍然终止，否则会把坏请求重发给每一家。
+    const up = await startFakeOpenAIUpstream({
+      script: ['badReq', 'badReq', 'badReq'],
+      badReqMsg: 'invalid request body: messages must not be empty',
+    });
+    const ok2 = await startFakeOpenAIUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      openaiProvider('told', up, { priority: 1 }),
+      openaiProvider('fallback2', ok2, { priority: 2 }),
+    ], 'ccbadreq', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 400, '有明确说明的参数错误应原样终止（回 400），实际 ' + r.status);
+      assert.strictEqual(ok2.st.calls, 0, '不该把同一个坏请求重发给下一家：' + ok2.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/确定性 4xx HTTP 400 → 终止 failover/.test(logText), '应走确定性 4xx 分支：' + logText.slice(-400));
+    } finally { killGw(gw); closeUp(up); closeUp(ok2); }
+  });
+
+  t('规则2 修正：模型级冷却**首档必须是短冷却**（瞬时 429 不能一上来就锁 30 分钟）', async () => {
+    // 2026-10-14 用户报「ling-3.1-flash 调用失败 503」：
+    //   upstream commandcode HTTP 429: {"error":{"message":"Upstream model provider is
+    //     temporarily unavailable. Please try again in a moment.","type":"rate_limit_error"}}
+    //   → breaker OPEN: commandcode[ling-3.1-flash] … **仅该模型**冷却 **30 分钟**
+    // 上游明说"稍后重试"，而我们把该模型锁死 30 分钟；该模型只有一家候选 → 整轮任务死掉。
+    // 供应商级熔断早有「短档 90s → 指数退避 → 上限 30min」的阶梯，模型级此前是**平的 30 分钟**。
+    // 这条用例钉住：首档必须是短冷却（远小于配置的 30 分钟），且日志写明"第 1 次开闸"。
+    const up = await startFakeOpenAIUpstream({
+      script: ['rate429', 'rate429', 'rate429', 'rate429'],
+      quotaMsg: "Model 'x' is at its concurrency limit (16); please retry later",
+    });
+    const prov = openaiProvider('lingpool', up, { priority: 1 });
+    const gw = await startGatewayWith([prov], 'modelshort', {
+      DSH_GW_MODEL_BREAKER_COOLDOWN_MS: String(30 * 60_000),   // 上限仍是 30 分钟
+      DSH_GATEWAY_BREAKER_SHORT_MS: '90000',                    // 首档 90 秒
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      for (let i = 0; i < 3; i++) await call({ port: gw.port });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      const m = logText.match(/breaker OPEN: lingpool\[test-model\][^\n]*/);
+      assert.ok(m, '应看到模型级开闸日志：' + logText.slice(-800));
+      assert.ok(/第 1 次开闸/.test(m[0]), '日志须标出这是首次开闸（便于排查退避阶梯）：' + m[0]);
+      // 首档是短冷却：90 秒（若上游给了 Retry-After 可能略长，但**绝不能**一上来就 30 分钟）
+      const mins = (m[0].match(/冷却 ([\d.]+) 分钟/) || [])[1];
+      const secs = (m[0].match(/冷却 (\d+) 秒/) || [])[1];
+      const asSec = mins ? Number(mins) * 60 : (secs ? Number(secs) : NaN);
+      assert.ok(Number.isFinite(asSec) && asSec < 600,
+        `首档必须是短冷却（<10 分钟），不能是一上来 30 分钟；实际 ${asSec}s —— ${m[0]}`);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('规则2 修正：503 文案必须报**真实**剩余冷却（旧实现把模型级 30 分钟报成 90 秒）', async () => {
+    // 旧 breakerCooldownSecs() 只看供应商级断路器；模型级冷却时它算出 0 → 落到兜底 90 秒。
+    // 于是 503 写 "retry in ~90s"，用户按提示重试、仍然 503，只会判定"网关坏了"。
+    // 实测 ling-3.1-flash 被模型级冷却 1800 秒时，文案就是 ~90s。
+    const up = await startFakeOpenAIUpstream({ script: ['err500', 'err500', 'err500', 'err500', 'err500'] });
+    const prov = openaiProvider('truthy', up, { priority: 1 });
+    // 上限设成 20 分钟（1200 秒）：文案若报 ~90s 就是旧 bug，报 ~1200s 才对。
+    const gw = await startGatewayWith([prov], 'truthmsg', {
+      DSH_GW_MODEL_BREAKER_COOLDOWN_MS: String(20 * 60_000),
+      DSH_GATEWAY_BREAKER_SHORT_MS: String(20 * 60_000),   // 让首档就等于上限，便于断言
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      for (let i = 0; i < 3; i++) await call({ port: gw.port });
+      const r = await call({ port: gw.port });   // 此时闸已开 → 走"候选全部熔断"分支
+      assert.strictEqual(r.status, 503, '应回 503，实际 ' + r.status);
+      const secs = Number((r.text.match(/retry in ~(\d+)s/) || [])[1] || 0);
+      assert.ok(secs > 600,
+        `文案必须报真实剩余（约 1200 秒），不能是兜底的 90 秒；实际 ~${secs}s 全文：${r.text.slice(0, 200)}`);
     } finally { killGw(gw); closeUp(up); }
   });
 
