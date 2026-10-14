@@ -289,6 +289,26 @@ function validateConfigText(text) {
       }
     }
   }
+  // 模型级冷却参数（2026-10-14 规则 3）：threshold / cooldownMs 可配置，默认 3 次 / 30 分钟。
+  // 只在**填了**的时候校验 —— 缺省由引擎用内置默认值（与 provider 其它可选字段同一口径）。
+  if (cfg.breaker !== undefined) {
+    if (!cfg.breaker || typeof cfg.breaker !== 'object' || Array.isArray(cfg.breaker)) {
+      return { ok: false, error: 'breaker 必须是对象（{ threshold, cooldownMs }）' };
+    }
+    if (cfg.breaker.threshold !== undefined) {
+      const th = cfg.breaker.threshold;
+      if (typeof th !== 'number' || !Number.isInteger(th) || th < 1 || th > 100) {
+        return { ok: false, error: 'breaker.threshold 必须是 1–100 的整数（连续失败多少次后冷却该模型），当前：' + JSON.stringify(th) };
+      }
+    }
+    if (cfg.breaker.cooldownMs !== undefined) {
+      const cd = cfg.breaker.cooldownMs;
+      // 下限 1 秒、上限 24 小时：太小等于没冷却，太大等于永久下架（都会让用户以为"网关坏了"）
+      if (typeof cd !== 'number' || !Number.isFinite(cd) || cd < 1000 || cd > 24 * 3600_000) {
+        return { ok: false, error: 'breaker.cooldownMs 必须是 1000–86400000 之间的毫秒数（1 秒–24 小时），当前：' + JSON.stringify(cd) };
+      }
+    }
+  }
   // 供应商 id 必须唯一：运行期一切按 provider.id 为键的状态（熔断、目录缓存、thinking
   // 学习、Responses 亲和）都会在同 id 的两家之间串味——一家 401 会把另一家一起熔断。
   const seenIds = new Set();
@@ -608,6 +628,9 @@ class GatewayManager extends EventEmitter {
   /* ---------------- 代理 ---------------- */
 
   async resolveProxy() {
+    // 每次决策都从零开始。否则"上一次的降级告警"会在下次启动时被复用，
+    // 界面上就会出现一条与当前配置无关的旧告警（手工把整个 proxy 段从 JSON 里删掉时能复现）。
+    this.proxyDecision = null;
     try {
       const cfg = JSON.parse(this.configText() || '{}');
       if (cfg.proxy && cfg.proxy.enabled === false) {

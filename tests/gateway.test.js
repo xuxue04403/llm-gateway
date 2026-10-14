@@ -2920,7 +2920,7 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up); }
   });
 
-  t('代理事故回归：回环被代理且代理未运行时，日志必须点名"代理未运行"（而不是记成上游账号故障）', async () => {
+  t('规则1：代理不可达但**直连可达** → 该家自动切直连并把这次请求重试成功（不再 503）', async () => {
     const up = await startFakeUpstream({ status: 200 });
     const gw = await startGatewayWith([providerOf('p1', up, { priority: 1 })], 'deadproxy2', {
       NODE_USE_ENV_PROXY: '1',
@@ -2931,11 +2931,24 @@ let upstreamPort = 0;
     try {
       assert.ok(gw.ready, 'watchdog 用裸 socket 自检，不经过代理 → 即使代理死掉也不该自杀');
       const r = await call({ port: gw.port });
-      assert.strictEqual(r.status, 503, '代理不可达时唯一候选失败 → 503，实际 ' + r.status);
+      // 2026-10-14（规则 1）：旧契约是这里回 503。现在"代理路径失败 + 直连可达"被识别出来，
+      // 该 host 切成直连并原地重试 → 用户的请求不再因为代理没启动而失败。
+      assert.strictEqual(r.status, 200,
+        '规则1：代理不可达但直连可达 → 应自动切直连并成功，实际 ' + r.status + ' ' + r.text.slice(0, 200));
       const logText = fs.readFileSync(gw.logPath, 'utf8');
-      assert.ok(/upstream p1 request error/.test(logText), '应记录上游请求错误：' + logText.slice(-300));
-      assert.ok(/代理未运行/.test(logText), '必须点名"代理未运行"（否则又会把环境问题记成上游故障）：' + logText.slice(-400));
-      assert.strictEqual(up.st.calls, 0, '请求根本没到上游（死在代理连接上），实际 ' + up.st.calls);
+      // ① 必须把这次失败**归因到代理** —— 旧契约里最值钱的那句诊断，不能因为自动切直连就丢掉。
+      //    两种形态都算：代理彻底失败时是"代理未运行"（proxyHintFor 的文案），
+      //    切直连成功时是"代理不可达"（switchHostToDirect 的文案）。
+      assert.ok(/代理(未运行|不可达)/.test(logText),
+        '必须点名"代理未运行/不可达"（否则又会把环境问题记成上游故障）：' + logText.slice(-400));
+      // ② 必须留下切换记录，否则"为什么这家突然不走代理了"无从判断
+      assert.ok(/直连可达[\s\S]{0,80}切成直连/.test(logText), '必须记录已切直连：' + logText.slice(-600));
+      // ③ 请求最终真的到了上游（= 切直连后确实重试了，而不是放弃了事）
+      assert.strictEqual(up.st.calls, 1, '切直连后应重试一次并到达上游，实际 ' + up.st.calls);
+      // ④ /health 要能看见"运行期被切成直连的 host"
+      const h = JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
+      assert.ok(Array.isArray(h.proxy.runtimeDirect) && h.proxy.runtimeDirect.includes('127.0.0.1'),
+        '/health 应暴露运行期直连 host：' + JSON.stringify(h.proxy));
     } finally { killGw(gw); closeUp(up); }
   });
 
@@ -2989,6 +3002,9 @@ let upstreamPort = 0;
     const up = await startFakeUpstream({ status: 500 });
     const gw = await startGatewayWith([providerOf('slowp', up, { priority: 1, timeoutMs: 5000 })], 'probetimeout', {
       DSH_GATEWAY_BREAKER_SHORT_MS: '300', DSH_GATEWAY_BREAKER_PROBE_TIMEOUT_MS: '300',
+      // 规则 2/3（2026-10-14）：上游 500 现在记在**模型级**，冷却时长由这个旋钮控制
+      //（供应商级旋钮只管鉴权/欠费与连接未建立）。旧用例只设了 BREAKER_SHORT_MS，改完立刻变红。
+      DSH_GW_MODEL_BREAKER_COOLDOWN_MS: '300',
     });
     try {
       assert.ok(gw.ready, '独立网关实例应就绪');
@@ -3572,8 +3588,15 @@ let upstreamPort = 0;
   });
 
   t('网络类熔断按连续开闸次数指数退避（90s→3m→…，修"坏家每 90 秒被重探"）', async () => {
-    const up = await startFakeUpstream({ status: 500, errorBody: { error: { message: 'boom' } } });
-    const gw = await startGatewayWith([providerOf('flap', up, { priority: 1 })], 'backoff', {
+    // ⚠ 规则 2/3（2026-10-14）之后，上游**给了响应**的失败（4xx/5xx/429/超时）记在**模型级**，
+    // 供应商级的指数退避阶梯只剩"连接根本没建立"这一类。所以这条用例必须用**连不上的家**
+    //（端口没人监听 → ECONNREFUSED）来测 —— 它测的本来就是"网络类熔断"，语义反而更准了。
+    const deadPort = await freePort();
+    const deadProv = {
+      id: 'flap', baseURL: 'http://127.0.0.1:' + deadPort + '/v1',
+      apiKey: UPSTREAM_KEY, models: ['test-model'], priority: 1, enabled: true,
+    };
+    const gw = await startGatewayWith([deadProv], 'backoff', {
       DSH_GATEWAY_BREAKER_SHORT_MS: '300', DSH_GATEWAY_BREAKER_BACKOFF_MAX_MS: '5000',
     });
     try {
@@ -3587,7 +3610,7 @@ let upstreamPort = 0;
       assert.ok(/熔断 600ms/.test(logText), '第 2 次开闸应翻倍到 600ms（旧版固定 300ms）：' + logText.slice(-600));
       assert.ok(/熔断 1200ms/.test(logText), '第 3 次开闸应到 1200ms：' + logText.slice(-600));
       assert.ok(/退避递增/.test(logText), '日志应说明退避：' + logText.slice(-300));
-    } finally { killGw(gw); closeUp(up); }
+    } finally { killGw(gw); }
   });
 
   t('半开探测用短超时：坏家不会让用户请求白等 60 秒（当天实测 78.5s 的那次）', async () => {
@@ -3598,6 +3621,7 @@ let upstreamPort = 0;
       providerOf('ok', upOk, { priority: 2 }),
     ], 'probe', {
       DSH_GATEWAY_BREAKER_PROBE_TIMEOUT_MS: '600', DSH_GATEWAY_BREAKER_SHORT_MS: '300', DSH_GATEWAY_BREAKER_LONG_MS: '300',
+      DSH_GW_MODEL_BREAKER_COOLDOWN_MS: '300',   // 500 记在模型级（规则 2/3）
     });
     try {
       assert.ok(gw.ready, '独立网关实例应就绪');
@@ -3958,7 +3982,10 @@ let upstreamPort = 0;
       script: ['err500', 'err500', 'err500', 'rate429', 'rate429', 'rate429', 'ok', 'ok'],
     });
     const prov = openaiProvider('leak', up, { priority: 1, apiKeys: ['k1'], models: ['test-model', 'test-model-2'] });
-    const gw = await startGatewayWith([prov], 'd1leak', { DSH_GATEWAY_BREAKER_SHORT_MS: '500' });
+    const gw = await startGatewayWith([prov], 'd1leak', {
+      DSH_GATEWAY_BREAKER_SHORT_MS: '500',
+      DSH_GW_MODEL_BREAKER_COOLDOWN_MS: '500',   // 500/429 记在模型级（规则 2/3）
+    });
     try {
       assert.ok(gw.ready, '独立网关实例应就绪');
       // ① 3 次 500 → 开闸
@@ -4862,6 +4889,7 @@ let upstreamPort = 0;
     const up = await startFakeUpstream({ status: 500 });
     const gw = await startGatewayWith([providerOf('stall', up, { priority: 1, timeoutMs: 8000 })], 'probelad1', {
       DSH_GATEWAY_BREAKER_SHORT_MS: '300', DSH_GATEWAY_BREAKER_PROBE_TIMEOUT_MS: '400',
+      DSH_GW_MODEL_BREAKER_COOLDOWN_MS: '300',   // 500 记在模型级（规则 2/3）
     });
     try {
       assert.ok(gw.ready, '独立网关实例应就绪');
@@ -4889,6 +4917,7 @@ let upstreamPort = 0;
     const up = await startFakeUpstream({ status: 500 });
     const gw = await startGatewayWith([providerOf('gone', up, { priority: 1, timeoutMs: 8000 })], 'preflight', {
       DSH_GATEWAY_BREAKER_SHORT_MS: '300', DSH_GATEWAY_BREAKER_PROBE_TIMEOUT_MS: '8000',
+      DSH_GW_MODEL_BREAKER_COOLDOWN_MS: '300',   // 500 记在模型级（规则 2/3）
     });
     try {
       assert.ok(gw.ready, '独立网关实例应就绪');
@@ -4912,11 +4941,14 @@ let upstreamPort = 0;
   });
 
   t('网络类熔断退避上限默认 120 分钟（死家不再每 30 分钟就被重新放行一次探测）', async () => {
-    // 用户实测：h-e.top 当天 9 次超时 / 18 次熔断跳过，而"冷却到点必然放行一次探测"是
-    // **必须保留**的保底性质（否则恢复后永远选不上）。所以只能降低频率：上限 30m → 120m。
-    // 这条用例钉住**默认值**（不设 env 覆盖），并断言日志里报出的上限与之一致。
-    const up = await startFakeUpstream({ status: 500 });
-    const gw = await startGatewayWith([providerOf('slowdeath', up, { priority: 1 })], 'backoffcap', {
+    // 与"退避阶梯"那条同理：这个上限只体现在**供应商级网络类**熔断的日志里
+    //（规则 2/3 之后，上游给了响应的失败记在模型级、走模型级冷却时长）。
+    const deadPort = await freePort();
+    const deadProv = {
+      id: 'slowdeath', baseURL: 'http://127.0.0.1:' + deadPort + '/v1',
+      apiKey: UPSTREAM_KEY, models: ['test-model'], priority: 1, enabled: true,
+    };
+    const gw = await startGatewayWith([deadProv], 'backoffcap', {
       DSH_GATEWAY_BREAKER_SHORT_MS: '300',
     });
     try {
@@ -4926,7 +4958,291 @@ let upstreamPort = 0;
       assert.ok(/breaker OPEN: slowdeath/.test(logText), '应先开闸：' + logText.slice(-400));
       assert.ok(/上限 120 分钟/.test(logText),
         '网络类熔断的退避上限应为 120 分钟（旧值 30 分钟 → 死家每半小时被重新探测一次）：' + logText.slice(-500));
+    } finally { killGw(gw); }
+  });
+
+  // ============ 2026-10-13（本版）：DSML 流式也能构造 tool_use ============
+  // 旧版流式只做"剔除标记"（不再显示乱码），**工具不会被执行** —— 那是 v0.8.4 明确声明的限制。
+  // 本版把它接到与结构化 tool_calls **同一个出口**：解析出的调用塞进 toolCalls 映射，
+  // 由流结束的 flushToolCalls() 补成真正的 tool_use 块。
+
+  /** 把 SSE 里所有 text_delta 拼起来（正文可能被拆成多个事件，不能按整串断言） */
+  const textDeltasOf = (sse) => [...String(sse).matchAll(/"type":"text_delta","text":"((?:[^"\\]|\\.)*)"/g)]
+    .map((m) => { try { return JSON.parse('"' + m[1] + '"'); } catch (_) { return m[1]; } });
+
+  const DSML_BLOCK = [
+    '<|DSML|calls>',
+    '<|DSML|invoke name="run_shell">',
+    '<|DSML|parameter name="cmd">uninstall cursor</|DSML|parameter>',
+    '</|DSML|invoke>',
+    '</|DSML|calls>',
+  ].join('\n');
+
+  t('DSML 流式①：原生工具标记跨分片到达 → 转成真正的 tool_use（工具能被执行，不再只剔乱码）', async () => {
+    const chunk = (o) => 'data: ' + JSON.stringify(o) + '\n\n';
+    const head = '我先确认一下，再动手删除。 ';
+    const part1 = head + DSML_BLOCK.slice(0, 5);   // '<|DSM' —— 标记被**切成两片**
+    const part2 = DSML_BLOCK.slice(5);             // 'L|calls>\n…'
+    assert.ok(part1.endsWith('<|DSM') && part2.startsWith('L|calls>'), '用例自身：标记必须真的跨分片');
+    const sseBody = chunk({ choices: [{ delta: { content: part1 } }] })
+      + chunk({ choices: [{ delta: { content: part2 } }] })
+      + chunk({ choices: [{ delta: {}, finish_reason: 'stop' }] })
+      + 'data: [DONE]\n\n';
+    // sseSplitAt 再切一刀（切在第一帧中间）：连"字节级切断"一起测
+    const up = await startFakeUpstream({ sseBody, sseGapMs: 200, sseSplitAt: 40 });
+    const prov = Object.assign(providerOf('dsmls', up, { priority: 1 }), { protocol: 'openai-chat' });
+    const gw = await startGatewayWith([prov], 'dsmlstream1', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 256, stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '应 200，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const sse = r.text;
+      // ① 标记绝不能泄漏（这是 v0.8.4 已修的部分，防止本次改动把它弄回去）
+      assert.ok(!/DSML/.test(sse), 'DSML 标记不得出现在任何事件里：' + sse.slice(0, 700));
+      // ② 必须真的构造出 tool_use 块 + 完整参数
+      assert.ok(/"type":"tool_use"/.test(sse), '应发出 tool_use 块：' + sse.slice(0, 900));
+      assert.ok(/"name":"run_shell"/.test(sse), '工具名应正确：' + sse.slice(0, 900));
+      assert.ok(/"partial_json":"\{\\"cmd\\":\\"uninstall cursor\\"\}"/.test(sse),
+        '参数应完整（input_json_delta）：' + sse.slice(0, 1200));
+      // ③ stop_reason 必须是 tool_use —— 客户端正是靠它决定去执行工具
+      assert.ok(/"stop_reason":"tool_use"/.test(sse), 'stop_reason 应为 tool_use：' + sse.slice(-500));
+      // ④ 标记之外的正文照常交付
+      assert.strictEqual(textDeltasOf(sse).join(''), head,
+        '标记之前的正文必须原样交付：' + JSON.stringify(textDeltasOf(sse)));
     } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('DSML 流式②：上游没写闭合标记，但调用本身完整 → 收尾时照样转成 tool_use（否则工具被丢掉）', async () => {
+    const chunk = (o) => 'data: ' + JSON.stringify(o) + '\n\n';
+    // 缺 `</|DSML|calls>`：上游被截断/偷懒都会这样。调用本身是完整的。
+    const unclosed = DSML_BLOCK.replace('</|DSML|calls>', '');
+    const sseBody = chunk({ choices: [{ delta: { content: '好的，我删。 ' + unclosed } }] })
+      + chunk({ choices: [{ delta: {}, finish_reason: 'stop' }] })
+      + 'data: [DONE]\n\n';
+    const up = await startFakeUpstream({ sseBody });
+    const prov = Object.assign(providerOf('dsmlu', up, { priority: 1 }), { protocol: 'openai-chat' });
+    const gw = await startGatewayWith([prov], 'dsmlstream2', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 256, stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '应 200，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const sse = r.text;
+      assert.ok(!/DSML/.test(sse), '未闭合的标记残片也不得泄漏：' + sse.slice(0, 700));
+      assert.ok(/"name":"run_shell"/.test(sse), '未闭合块里的完整调用必须照样转成 tool_use：' + sse.slice(0, 900));
+      assert.ok(/"stop_reason":"tool_use"/.test(sse), 'stop_reason 应为 tool_use：' + sse.slice(-400));
+      assert.strictEqual(textDeltasOf(sse).join(''), '好的，我删。 ',
+        '块外正文必须保留：' + JSON.stringify(textDeltasOf(sse)));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('DSML 流式③：收尾必须归还扣住的残余 —— 尾部一个正当的 < 不能被静默吞掉', async () => {
+    // dsmlStreamFeed 为了防"标记跨分片泄漏"会扣住"未闭合的 <"尾巴；若收尾不归还，
+    // 模型正常写出的最后一个 '<'（比较运算符、泛型、HTML 片段…）就凭空消失了。
+    const chunk = (o) => 'data: ' + JSON.stringify(o) + '\n\n';
+    const sseBody = chunk({ choices: [{ delta: { content: '比较运算符是 <' } }] })
+      + chunk({ choices: [{ delta: {}, finish_reason: 'stop' }] })
+      + 'data: [DONE]\n\n';
+    const up = await startFakeUpstream({ sseBody });
+    const prov = Object.assign(providerOf('dsmlt', up, { priority: 1 }), { protocol: 'openai-chat' });
+    const gw = await startGatewayWith([prov], 'dsmlstream3', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '应 200，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(textDeltasOf(r.text).join(''), '比较运算符是 <',
+        '尾部正文必须完整交付（收尾不归还残余就会吞掉这个 <）：' + JSON.stringify(textDeltasOf(r.text)));
+      assert.ok(!/"type":"tool_use"/.test(r.text), '这不该被当成工具调用');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('DSML 流式④（聚合路径）：客户端要非流式、上游被强制流式 → 同样要拿到 tool_use 块', async () => {
+    // 这条路径真实存在且很常用：供应商配了 quirks: ['force-stream']（workbuddy 那类只收流式的上游），
+    // 而客户端要的是非流式 → 引擎把流收完再回一条完整 message。DSML 若只修流式出口，
+    // 这条路上工具照样不会被执行。
+    const chunk = (o) => 'data: ' + JSON.stringify(o) + '\n\n';
+    const sseBody = chunk({ choices: [{ delta: { content: '我删了。 ' + DSML_BLOCK } }] })
+      + chunk({ choices: [{ delta: {}, finish_reason: 'stop' }] })
+      + 'data: [DONE]\n\n';
+    const up = await startFakeUpstream({ sseBody });
+    const prov = Object.assign(providerOf('dsmla', up, { priority: 1 }), {
+      protocol: 'openai-chat', quirks: ['force-stream'],
+    });
+    const gw = await startGatewayWith([prov], 'dsmlstream4', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 256, messages: [{ role: 'user', content: 'hi' }] },   // 不带 stream
+      });
+      assert.strictEqual(r.status, 200, '应 200，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.ok(!/DSML/.test(r.text), '标记不得出现在返回体里：' + r.text.slice(0, 500));
+      const msg = JSON.parse(r.text);
+      const types = (msg.content || []).map((b) => b.type);
+      assert.deepStrictEqual(types, ['text', 'tool_use'],
+        '聚合路径也必须给出 tool_use 块：' + JSON.stringify(types) + ' ' + r.text.slice(0, 400));
+      const tu = msg.content.find((b) => b.type === 'tool_use');
+      assert.strictEqual(tu.name, 'run_shell', '工具名应正确：' + JSON.stringify(tu));
+      assert.deepStrictEqual(tu.input, { cmd: 'uninstall cursor' }, '参数应完整：' + JSON.stringify(tu));
+      assert.strictEqual(msg.stop_reason, 'tool_use', 'stop_reason 应为 tool_use：' + msg.stop_reason);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // ============ 2026-10-14：规则 2（模型级冷却）/ 规则 3（可配置）============
+
+  t('规则2：某个模型连续失败 → 只冷却**该模型**，同家另一个模型照常可用（不再连坐整家）', async () => {
+    // 假上游：按请求体里的 model 分流 —— test-model 一直 500，test-model-2 正常。
+    // 这正是用户报的形态："一个模型的毛病把整家拖下水"，代码里为此打的豁免补丁已有 5 处。
+    const srv = http.createServer((req, res) => {
+      if (req.url === '/v1/models') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ data: [{ id: 'test-model' }, { id: 'test-model-2' }] }));
+        return;
+      }
+      let raw = '';
+      req.on('data', (c) => { raw += c; });
+      req.on('end', () => {
+        let model = '';
+        try { model = JSON.parse(raw).model || ''; } catch (_) { /* 忽略 */ }
+        if (model === 'test-model') {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'boom' } }));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          id: 'c1', object: 'chat.completion', model,
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+        }));
+      });
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const up = { server: srv, port: srv.address().port, st: { calls: 0 } };
+    const prov = Object.assign(
+      providerOf('iso', up, { priority: 1, models: ['test-model', 'test-model-2'] }),
+      { protocol: 'openai-chat' },
+    );
+    const gw = await startGatewayWith([prov], 'modeliso', {
+      DSH_GATEWAY_BREAKER_SHORT_MS: '60000', DSH_GW_MODEL_BREAKER_COOLDOWN_MS: '60000',
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      for (let i = 0; i < 3; i++) await call({ port: gw.port });   // 默认 model=test-model
+      const log1 = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/breaker OPEN: iso\[test-model\]/.test(log1),
+        '应开**模型级**闸，且日志必须标明只影响该模型：' + log1.slice(-600));
+      assert.ok(!/breaker OPEN: iso 失败/.test(log1),
+        '不得把整家熔断（500 属模型级，规则2）：' + log1.slice(-600));
+      // 核心断言：同家另一个模型必须照常可用（旧行为 → 整家熔断 → 503）
+      const r2 = await call({ port: gw.port, body: { model: 'test-model-2', messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r2.status, 200,
+        '同家另一个模型应照常可用（旧行为是整家熔断 → 503），实际 ' + r2.status + ' ' + r2.text.slice(0, 200));
+      // 而被冷却的那个模型自己仍应被挡住
+      const r1 = await call({ port: gw.port });
+      assert.strictEqual(r1.status, 503, '被冷却的那个模型应回 503，实际 ' + r1.status);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('规则2 护栏：同家 3 个不同模型相继冷却 → 升级为**整家**冷却（防"整家坏掉被当成 N 个模型分别失败"）', async () => {
+    const up = await startFakeUpstream({ status: 500 });
+    const prov = Object.assign(
+      providerOf('esc', up, { priority: 1, models: ['m1', 'm2', 'm3', 'm4'] }),
+      { protocol: 'openai-chat' },
+    );
+    const gw = await startGatewayWith([prov], 'escalate', {
+      DSH_GATEWAY_BREAKER_SHORT_MS: '60000', DSH_GW_MODEL_BREAKER_COOLDOWN_MS: '60000',
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      for (const m of ['m1', 'm2', 'm3']) {
+        for (let i = 0; i < 3; i++) {
+          // eslint-disable-next-line no-await-in-loop
+          await call({ port: gw.port, body: { model: m, messages: [{ role: 'user', content: 'hi' }] } });
+        }
+      }
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/3 个不同模型在 5 分钟内相继冷却/.test(logText), '应触发升级护栏：' + logText.slice(-700));
+      assert.ok(/冷却整家/.test(logText), '护栏应升级为整家冷却：' + logText.slice(-700));
+      // 第 4 个从未失败过的模型也应被整家冷却挡住
+      const r = await call({ port: gw.port, body: { model: 'm4', messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 503, '护栏生效后第 4 个模型也应被挡，实际 ' + r.status);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('规则3：breaker.threshold / breaker.cooldownMs 可配置，且启动日志自述生效值', async () => {
+    const up = await startFakeUpstream({ status: 500 });
+    const gw = await startGatewayWith([providerOf('cfg', up, { priority: 1 })], 'breakcfg', {}, {
+      breaker: { threshold: 5, cooldownMs: 90_000 },
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const log0 = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/模型级冷却：连续 5 次失败 → 仅该模型冷却 2 分钟/.test(log0),
+        '启动日志必须自述生效的配置（否则用户改了配置却不知道有没有生效）：' + log0.slice(0, 700));
+      for (let i = 0; i < 4; i++) await call({ port: gw.port });
+      let logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(!/breaker OPEN: cfg\[test-model\]/.test(logText),
+        '阈值配成 5 → 4 次失败不该开闸：' + logText.slice(-400));
+      await call({ port: gw.port });
+      logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/breaker OPEN: cfg\[test-model\]/.test(logText), '第 5 次应开闸：' + logText.slice(-400));
+      assert.ok(/仅该模型\**冷却 2 分钟/.test(logText),
+        '冷却时长必须取配置值（90000ms → 2 分钟），实际：' + logText.slice(-400));
+      // 默认值也要能被看到：不配 breaker 时是 3 次 / 30 分钟（用另一实例的日志证明默认没被改坏）
+      const up2 = await startFakeUpstream({ status: 500 });
+      const gw2 = await startGatewayWith([providerOf('dflt', up2, { priority: 1 })], 'breakdflt', {});
+      try {
+        for (let i = 0; i < 2; i++) await call({ port: gw2.port });
+        let l2 = fs.readFileSync(gw2.logPath, 'utf8');
+        assert.ok(!/breaker OPEN: dflt\[test-model\]/.test(l2), '默认阈值 3 → 2 次失败不该开闸：' + l2.slice(-300));
+        await call({ port: gw2.port });
+        l2 = fs.readFileSync(gw2.logPath, 'utf8');
+        assert.ok(/仅该模型\**冷却 30 分钟/.test(l2),
+          '默认冷却应为 30 分钟（规则3 的默认值）：' + l2.slice(-400));
+      } finally { killGw(gw2); closeUp(up2); }
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('规则1 负例：直连**也不可达**时不切换（否则被墙的上游会被误判成"代理坏了"）', async () => {
+    // 场景：上游自己就是关着的（本地关闭端口 → 确定 ECONNREFUSED），代理也是死的。
+    // 这时"切直连"救不了任何东西，守卫必须拦住 —— 否则被墙/已下线的上游会被误判成
+    // "代理的问题"，日志把排查方向彻底引偏。
+    //
+    // ⚠ 为什么不用 `.invalid` 域名来造"直连不可达"：本机跑着 Clash（TUN + fake-ip），
+    // 实测**任意**域名的 TCP 连接都会被 TUN 秒接住（连 no-such-host.invalid 都"连得上"，
+    // 本机对 10.255.255.1 / 192.0.2.1 也是 0–4ms 就"成功"）。所以这里改用关闭的回环端口 ——
+    // 回环不经 TUN，必定被拒，判据确定。
+    const deadPort = await freePort();
+    const prov = {
+      id: 'gone2', baseURL: 'http://127.0.0.1:' + deadPort + '/v1',
+      apiKey: UPSTREAM_KEY, models: ['test-model'], priority: 1, enabled: true,
+    };
+    const gw = await startGatewayWith([prov], 'nodirect', {
+      NODE_USE_ENV_PROXY: '1',
+      HTTP_PROXY: 'http://127.0.0.1:7899',
+      HTTPS_PROXY: 'http://127.0.0.1:7899',
+      NO_PROXY: '',
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 503, '唯一候选连不上 → 503，实际 ' + r.status);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/直连也不可达/.test(logText),
+        '必须写明"直连也不可达 → 不切换"（这条日志就是守卫的证据）：' + logText.slice(-600));
+      assert.ok(!/切成直连（规则 1）/.test(logText), '不得切换：' + logText.slice(-600));
+      const h = JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
+      assert.ok(!h.proxy.runtimeDirect, '运行期直连清单必须为空：' + JSON.stringify(h.proxy));
+    } finally { killGw(gw); }
   });
 
   for (const { name, fn } of __tests) {

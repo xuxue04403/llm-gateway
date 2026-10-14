@@ -1545,4 +1545,49 @@ t('代理：主进程的代理决策必须真的透出到 /health（界面靠它
   }
 });
 
+t('代理：每次决策都从零开始 —— 上一次的降级告警不得被复用（否则界面显示与当前配置无关的旧告警）', async () => {
+  const deadPort = await freeTcpPort();
+  const dir = fs.mkdtempSync(path.join(tmp, 'proxy2-'));
+  const gm = new GatewayManager({ dataDir: dir, logger: { info: () => {} }, settings: null });
+  // 第一次：配置里写着一个连不上的代理 → 降级 + warn
+  fs.writeFileSync(gm.configPath, JSON.stringify({
+    port: 3099, apiKey: 'k', proxy: { enabled: true, url: 'http://127.0.0.1:' + deadPort }, providers: [],
+  }), 'utf8');
+  await gm.resolveProxy();
+  assert.strictEqual(gm.proxyNote().warn, true, '第一次应判定为"配置的代理不可达"');
+  // 第二次：把整个 proxy 段删掉 → 决策必须重新算
+  fs.writeFileSync(gm.configPath, JSON.stringify({ port: 3099, apiKey: 'k', providers: [] }), 'utf8');
+  const second = await gm.resolveProxy();
+  assert.strictEqual(gm.proxyNote().warn, false,
+    '删掉 proxy 段后不得再报"配置的代理连不上"：' + JSON.stringify(gm.proxyNote()));
+  assert.strictEqual(gm.proxyNote().configured, '', '旧地址也必须清掉：' + JSON.stringify(gm.proxyNote()));
+  assert.strictEqual(gm.proxyNote().used, second || '', 'used 必须反映本次实际用的代理');
+});
+
+t('validateConfigText：breaker.threshold / cooldownMs 的范围要拦（规则3 的两个旋钮）', () => {
+  const withBrk = (b) => {
+    const c = JSON.parse(JSON.stringify(OK_CFG));
+    c.breaker = b;
+    return JSON.stringify(c);
+  };
+  // 合法：显式取值 / 空对象（= 全用引擎内置默认 3 次 / 30 分钟）
+  assert.strictEqual(validateConfigText(withBrk({ threshold: 3, cooldownMs: 1800000 })).ok, true);
+  assert.strictEqual(validateConfigText(withBrk({})).ok, true, '空对象应放行（等于全用默认）');
+  assert.strictEqual(validateConfigText(withBrk({ threshold: 10 })).ok, true, '只写一项应放行');
+  // 非法：类型 / 范围。0 次或 0 分钟等于"关掉冷却"，超大值等于永久下架 ——
+  // 两者都会让用户以为"网关坏了"，所以在保存前拦掉，而不是等运行期去猜。
+  assert.strictEqual(validateConfigText(withBrk({ threshold: 0 })).ok, false, '0 次应拦');
+  assert.strictEqual(validateConfigText(withBrk({ threshold: 2.5 })).ok, false, '非整数应拦');
+  assert.strictEqual(validateConfigText(withBrk({ threshold: '3' })).ok, false, '字符串应拦');
+  assert.strictEqual(validateConfigText(withBrk({ threshold: 101 })).ok, false, '上限 100');
+  assert.strictEqual(validateConfigText(withBrk({ cooldownMs: 999 })).ok, false, '低于 1 秒应拦');
+  assert.strictEqual(validateConfigText(withBrk({ cooldownMs: 24 * 3600_000 + 1 })).ok, false, '超过 24 小时应拦');
+  assert.strictEqual(validateConfigText(withBrk([1])).ok, false, 'breaker 必须是对象');
+  assert.strictEqual(validateConfigText(withBrk(null)).ok, false, 'breaker=null 应拦');
+  // 不写 breaker → 完全不受影响（向后兼容：老配置必须照常放行）
+  const c = JSON.parse(JSON.stringify(OK_CFG));
+  delete c.breaker;
+  assert.strictEqual(validateConfigText(JSON.stringify(c)).ok, true, '老配置（没有 breaker）必须照常放行');
+});
+
 run();

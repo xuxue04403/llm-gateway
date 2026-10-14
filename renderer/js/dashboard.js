@@ -42,15 +42,22 @@ LG.renders.dashboard = function renderDashboard() {
     }
     const px = (LG.health && LG.health.proxy) || {};
     const pn = (LG.health && LG.health.proxyNote) || {};
+    // 规则 1：运行期因"代理不可用但直连可达"被切成直连的 host —— 也要说出来，
+    // 否则用户只会看到"某几家明明配了代理却不走代理"，无从判断是引擎自动降级还是配置错了。
+    const rt = Array.isArray(px.runtimeDirect) ? px.runtimeDirect : [];
     const proxyText = px.url
       ? ('代理 ' + px.url + (px.noProxy ? ' · ' + px.noProxy.split(',').length + ' 个域名直连' : ''))
       : '直连（未注入代理）';
     // 配置里写的代理连不上时**必须让用户看见**：那种情况下所有未标直连的供应商请求都会失败，
     // 而这一页原本显示一切正常（用户实测就是这么被误导的）。主进程的决策见 gateway-manager.proxyNote()。
-    if (pn.warn) {
-      $('#dashProxy').innerHTML = esc(proxyText)
-        + ' <span class="tag warn">配置的代理 ' + esc(pn.configured || '')
-        + ' 连不上，已' + (pn.used ? '改用 ' + esc(pn.used) : '直连') + '</span>';
+    if (pn.warn || rt.length) {
+      const head = pn.warn
+        ? esc(proxyText) + ' <span class="tag warn">配置的代理 ' + esc(pn.configured || '')
+          + ' 连不上，已' + (pn.used ? '改用 ' + esc(pn.used) : '直连') + '</span>'
+        : esc(proxyText);
+      $('#dashProxy').innerHTML = head
+        + (rt.length ? ` <span class="tag warn">${rt.length} 个域名已自动切直连</span>`
+          + `<span class="hint">（${esc(rt.join(', '))}）</span>` : '');
     } else {
       $('#dashProxy').textContent = proxyText;
     }

@@ -240,6 +240,16 @@
               </select>
               <span class="hint">决定发往上游的请求头形态，也决定写入 dsh 时的协议（claude → Anthropic）</span>
             </div>
+            <label>模型级冷却</label>
+            <div class="field">
+              <input type="number" id="stBrkThreshold" class="input short" min="1" max="100" placeholder="3" />
+              <span class="hint">次连续失败后，**仅冷却该模型**（不是整家）。留空 = 默认 3 次</span>
+            </div>
+            <label>冷却时长</label>
+            <div class="field">
+              <input type="number" id="stBrkCooldownMin" class="input short" min="1" max="1440" placeholder="30" />
+              <span class="hint">分钟。留空 = 默认 30 分钟。该家其它模型不受影响</span>
+            </div>
           </div>
         </div>
 

@@ -9,6 +9,15 @@
     "可让指定供应商绕过代理直连；proxy.forceProxy: [\"域名\"] 反向强制走代理（可覆盖内置直连清单）。",
     "回环 127.0.0.1/localhost 与国内端点（copilot.tencent.com/workbuddy.cn）**恒直连**：",
     "NODE_USE_ENV_PROXY=1 时连本机 /health 自检都会被塞进代理，代理一停就会误判进程死亡。",
+    "【代理不可用自动切直连】配置的代理没启动/节点不可用时：引擎会先做 TCP 可达性探测（启动时由宿主做），",
+    "  运行期若发现「走代理失败但该上游直连可达」，就把**这一家**的域名临时加入 NO_PROXY 改走直连，",
+    "  并在日志写明（`[proxy] … 已把 <host> 切成直连（规则 1）`）；代理恢复后自动切回。",
+    "  判据要求「直连也可达」——否则被墙的上游会被误判成「代理坏了」而切直连（那样只会全部失败）。",
+    "【模型级冷却】breaker: { threshold: 3, cooldownMs: 1800000 } —— 某个模型连续失败 N 次后**只冷却该模型**",
+    "  （默认 3 次 / 30 分钟），同家其它模型不受影响。鉴权/欠费（401/402/403）与「连接根本没建立」",
+    "  （DNS 失败/拒绝连接）仍按供应商级冷却（与模型无关）；另有一条护栏：同家 3 个不同模型在 5 分钟内",
+    "  相继冷却 → 判定整家故障、冷却整家（避免整家坏掉时被当成 N 个模型分别失败而白打上游）。",
+    "  设置页「网关 → 模型级冷却 / 冷却时长」可直接改；留空 = 用上面的默认值。",
     "【上游线协议】protocol: \"openai-chat\" —— 该上游只会 OpenAI chat/completions；Anthropic 客户端",
     "  （dsh 的 claude 仿真）的请求由网关翻译成 OpenAI 转发，再把响应/SSE 翻回 Anthropic。",
     "【兼容开关】quirks: force-stream（上游只收流式）/ stringify-tool-choice（tool_choice 只能是字符串）/",
@@ -47,6 +56,10 @@
   ],
   "port": 3091,
   "apiKey": "dsh-gateway-change-me",
+  "breaker": {
+    "threshold": 3,
+    "cooldownMs": 1800000
+  },
   "providers": [
     {
       "id": "provider-a",

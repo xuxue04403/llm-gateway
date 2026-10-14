@@ -127,6 +127,14 @@ function providerTimeoutMs(provider, model) {
       // 否则一律按 PROBE 快速放弃（声明没声明 timeoutMs 一视同仁）。
       return b.probeFull ? base : Math.min(base, BREAKER_PROBE_TIMEOUT_MS);
     }
+    // 模型级也要看：规则 2 之后，"超时"这类失败记在模型级，半开探测状态也在那里。
+    // 只看供应商级会导致探测不再按短阈值 —— 实测（改完立刻跑用例）：那条"坏家不该让用户白等
+    // 60 秒"的用例报出 60028ms。
+    const mk = modelBreakerKey(provider && provider.id, logicalModelOf(provider, model));
+    const mb = mk ? modelBreaker.get(mk) : null;
+    if (mb && mb.state === 'half-open') {
+      return mb.probeFull ? base : Math.min(base, BREAKER_PROBE_TIMEOUT_MS);
+    }
   } catch (_) { /* 模块初始化早期（const 尚未就绪）→ 退回常规超时 */ }
   return base;
 }
@@ -207,6 +215,26 @@ function isTransientNetError(e) {
   return false;
 }
 
+/* ---------------- 规则 1（2026-10-14）：代理不可用 → 该家自动切直连 ----------------
+ * 用户场景：供应商配了走代理，但 clash 没启动 / 节点不可用 → 旧行为是"所有走代理的家一起挂"，
+ * 只能等重启引擎才恢复。
+ *
+ * 关键实证（本机三段实验，写在 tests/gateway.test.js 的注释里）：Node 的 EnvHttpProxyAgent
+ * **每个请求都重读 process.env.NO_PROXY** —— ① NO_PROXY 空 → ECONNREFUSED；
+ * ② 运行期把该 host 加进去 → 立刻直连成功；③ 再清空 → 又失败。
+ * 所以"运行期按 host 切直连"不需要重启引擎，也不需要自定义 dispatcher
+ *（零依赖约束下本来就拿不到 undici 的 Agent）。
+ *
+ * 触发判据是**两个条件同时成立**：走代理的请求失败了 **且** 该上游**直连可达**。
+ * 只判"代理不可用"是不够的：被墙的上游直连本来就必然失败，拿它当判据会把好家误判成死家。
+ */
+const PROXY_PROBE_MS = envMs('DSH_GW_PROXY_PROBE_MS', 2500);
+const PROXY_RESTORE_PROBE_MS = envMs('DSH_GW_PROXY_RESTORE_PROBE_MS', 60_000);
+/** 启动时注入的 NO_PROXY 原值。运行期直连清单在它之上**追加**（每次重写都由它重建，幂等）。 */
+const BASE_NO_PROXY = String(process.env.NO_PROXY || process.env.no_proxy || '');
+const runtimeDirectHosts = new Map();   // host -> { at, reason }
+let runtimeDirectProbedAt = 0;
+
 /**
  * 本进程的代理状态（v1.8.2）：宿主 gateway-manager 会注入 NODE_USE_ENV_PROXY=1 +
  * HTTP(S)_PROXY + NO_PROXY；这里只做**可见性**，便于 /health 与日志一眼看清
@@ -234,7 +262,14 @@ function proxyStatus() {
       }
     } catch { shown = '<无法解析的代理 URL>'; }
   }
-  return { url: shown, noProxy: noProxy || null, envProxy: env.NODE_USE_ENV_PROXY === '1' };
+  return {
+    url: shown,
+    noProxy: noProxy || null,
+    envProxy: env.NODE_USE_ENV_PROXY === '1',
+    // 规则 1：运行期因"代理不可用但直连可达"被切成直连的 host（见 switchHostToDirect）。
+    // 放进 /health 是为了让界面能说清"为什么某几家没走代理"，而不是让人去猜。
+    runtimeDirect: runtimeDirectHosts.size ? [...runtimeDirectHosts.keys()] : null,
+  };
 }
 
 /** host 是否命中 NO_PROXY 清单（精确或后缀——实测 `tencent.com` 命中 copilot.tencent.com）。 */
@@ -371,6 +406,21 @@ function loadConfig() {
     // Anthropic 缓存断点的全局开关（'auto' 默认开；'off' 完全不动请求体）。
     // 放在这里而不是当参数传：forward() 的签名里没有 cfg（见 CACHE_BREAKPOINT_MODE 注释）。
     if (cfg.cacheBreakpoints !== undefined) CACHE_BREAKPOINT_MODE = cfg.cacheBreakpoints;
+    // 规则 3（2026-10-14 用户确认）：**模型级**冷却的次数/时长可配置 —— 缺省 3 次 / 30 分钟。
+    // ⚠ 只作用于模型级；供应商级（鉴权/欠费、连接未建立）沿用各自已调优的时长，不受这里影响。
+    // env 优先于配置文件（便于测试与应急：配置文件被改坏时冷却不会因此失效）。
+    if (cfg.breaker && typeof cfg.breaker === 'object' && !Array.isArray(cfg.breaker)) {
+      const th = Number(cfg.breaker.threshold);
+      if (!process.env.DSH_GW_MODEL_BREAKER_THRESHOLD && Number.isFinite(th) && th >= 1) {
+        MODEL_BREAKER_THRESHOLD = Math.min(100, Math.floor(th));
+      }
+      const cd = Number(cfg.breaker.cooldownMs);
+      if (!process.env.DSH_GW_MODEL_BREAKER_COOLDOWN_MS && Number.isFinite(cd) && cd >= 1000) {
+        MODEL_BREAKER_COOLDOWN_MS = Math.min(24 * 3600_000, Math.floor(cd));
+      }
+      log(`模型级冷却：连续 ${MODEL_BREAKER_THRESHOLD} 次失败 → 仅该模型冷却 ${fmtMs(MODEL_BREAKER_COOLDOWN_MS)}`
+        + '（该家其它模型不受影响；供应商级冷却不受此配置影响）');
+    }
     return cfg;
   } catch (e) {
     log(`config parse error: ${e.message}`);
@@ -673,6 +723,38 @@ const BREAKER_PROBE_TIMEOUT_MS = envMs('DSH_GATEWAY_BREAKER_PROBE_TIMEOUT_MS', 1
  *（env 名刻意取短，避免自身被降敏成占位符而无法在源码里检索。） */
 const BREAKER_STALE_MS = envMs('DSH_GW_BREAKER_STALE_MS', 180_000);
 
+/* ---------------- 模型级冷却（2026-10-14 用户规则 2 / 3） ----------------
+ * 现象：一家配了多个模型时，**一个**模型的毛病会把整家熔断，于是同家其它完全正常的模型
+ * 也被 `skip X (breaker open)`。为此打的"不熔断该家"豁免补丁在本文件里已有 5 处，每处都要
+ * 记得加 —— 这是设计层面的问题，不是补丁能解决的。
+ *
+ * 现在分两层：
+ *   · **模型级**（本层）：provider × **逻辑模型**。超时、上游 4xx/5xx/429、模型不存在
+ *     → 只冷却这一个模型。次数与时长**可配置**（默认 3 次 / 30 分钟，见下方 env 与
+ *     loadConfig 里的 `breaker.threshold` / `breaker.cooldownMs`）。
+ *   · **供应商级**（既有 breaker）：只在"与模型无关"的失败上记录 —— 鉴权/欠费（401/402/403）
+ *     与"连接根本没建立"（DNS 失败/拒绝连接/代理不可用）。仍按既有阶梯退避（90s→…→2h）。
+ *   路由与半开探测**两层都看**：任一层开着就跳过该候选。
+ *
+ * 为什么"超时"归模型级而不是"连接未建立"：实测事故里 amd 的慢模型（首字节 14s）把同家
+ * 快模型（0.7s）一起熔断了 —— 那正是用户要避免的"连坐"。而连接被拒/DNS 失败与模型无关。
+ *
+ * 护栏（防"整家坏了却被当成 N 个模型分别失败"，那是本改造唯一的真实代价）：
+ * 同一家在 5 分钟内有 ≥3 个**不同**模型相继冷却 → 判定为该家整体故障，直接冷却整家。
+ */
+function envInt(name, def) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : def;
+}
+/** 模型级冷却：连续失败次数阈值（默认 3，规则 3）。env 优先于配置文件（便于测试/应急）。 */
+let MODEL_BREAKER_THRESHOLD = envInt('DSH_GW_MODEL_BREAKER_THRESHOLD', 3);
+/** 模型级冷却时长（默认 30 分钟，规则 3）。⚠ 与供应商级不同：本层**不指数退避**（用户选择"可预期"）。 */
+let MODEL_BREAKER_COOLDOWN_MS = envMs('DSH_GW_MODEL_BREAKER_COOLDOWN_MS', 30 * 60_000);
+const MODEL_BREAKER_ESCALATE_MODELS = envInt('DSH_GW_MODEL_BREAKER_ESCALATE_MODELS', 3);
+const MODEL_BREAKER_ESCALATE_WINDOW_MS = envMs('DSH_GW_MODEL_BREAKER_ESCALATE_WINDOW_MS', 5 * 60_000);
+/** 供应商内"哪些模型最近被冷却过"（升级护栏用）。providerId -> [{ at, model }] */
+const modelCooledLog = new Map();
+
 /* 熔断状态机（审计修复 P2，本次）：closed / open / half-open
  * 旧版 breakerIsOpen() 带**副作用**（冷却到点即把 fails 重置、openUntil 清零），而同一个请求会
  * 调用它 2 次以上（预过滤 + 候选过滤）→ 冷却到点时 N 个并发请求**同时**判定"已恢复"，一起打向
@@ -685,6 +767,32 @@ const BREAKER_STALE_MS = envMs('DSH_GW_BREAKER_STALE_MS', 180_000);
  * 保底性质（与旧实现一致，必须保住）：冷却到点必然放行一次探测 → 熔断**不会永久卡死**。
  */
 const breaker = new Map();                      // providerId -> { state, fails, openUntil, opens }
+/** 模型级冷却：`providerId\u0000逻辑模型` -> 同形状的状态。见上方"模型级冷却"注释。 */
+const modelBreaker = new Map();
+const MODEL_BREAKER_SEP = '\u0000';
+
+/** 模型级冷却键。没有模型信息时返回 ''（调用方退回"只走供应商级"的旧行为）。 */
+function modelBreakerKey(providerId, model) {
+  const m = String(model || '').trim();
+  if (!m || !providerId) return '';
+  return String(providerId) + MODEL_BREAKER_SEP + m;
+}
+
+/**
+ * 把"上游模型 ID"折回**逻辑模型名**。
+ *
+ * 为什么必须折：路由筛候选用的是**逻辑名**（selectCandidates 里 `e.as === model`）。
+ * 若失败记在上游 ID 上（如 `qwen3.8-flash-next-262k`），而路由按 `qwen3.8-flash` 查冷却，
+ * 冷却就永远命中不了 —— 表现为"冷却记了但完全没用"，且日志里看不出哪里不对。
+ */
+function logicalModelOf(provider, model) {
+  const m = String(model || '').trim();
+  if (!m || !provider) return m;
+  try {
+    for (const e of modelEntries(provider)) if (e.up === m) return e.as || m;
+  } catch (_) { /* 取不到映射时按原值 */ }
+  return m;
+}
 
 /**
  * 空名 tool_use 告警计数器（2026-09-17）：见 anthropicToOpenAIRequest 里的去重日志。
@@ -795,9 +903,14 @@ function probeSlotStale(b) {
   return !!b.probeAt && (Date.now() - b.probeAt) > BREAKER_STALE_MS;
 }
 
-/** 纯读：该 provider 当前是否不可用（冷却窗口内，或半开探测名额已被别的请求占用）。 */
-function breakerIsOpen(providerId) {
-  const b = breaker.get(providerId);
+/* ---------------- 熔断状态机（两级共用同一套转移） ----------------
+ * 状态：closed / open / half-open。两级（供应商级 breaker / 模型级 modelBreaker）的**转移逻辑
+ * 完全一样**，所以只写一份 slot* 系列两边共用 —— 避免"同一逻辑两处实现→漂移"（本项目为此吃过
+ * 多次亏）。区别只在**策略**：阈值、时长、以及是否指数退避。
+ */
+
+/** 纯读：这个状态槽当前是否应跳过（冷却中，或半开探测名额已被别的请求占用）。 */
+function slotIsOpen(b) {
   if (!b) return false;
   if (b.state === 'open') return Date.now() < b.openUntil;   // 冷却中 → 跳过
   // D1：半开名额若已被占用且超过兜底期仍未结算 → 视为遗弃，放行新探测（否则永久卡死）
@@ -805,25 +918,87 @@ function breakerIsOpen(providerId) {
   return false;                                              // closed
 }
 
-/** 准备向上游发起请求前调用：占用半开探测名额（唯一的 open → half-open 转换点）。 */
-function breakerAcquire(providerId) {
-  const b = breaker.get(providerId);
+/** 半开探测放行（唯一的 open → half-open 转换点）。true = 可以发请求。 */
+function slotAcquire(map, key, label, threshold) {
+  const b = map.get(key);
   if (!b || !b.state || b.state === 'closed') return true;
   // D1：单飞——但"遗弃名额"（超过 BREAKER_STALE_MS 未结算）允许被回收，否则该家永久失联
   if (b.state === 'half-open' && !probeSlotStale(b)) return false;
   if (b.state !== 'half-open' && Date.now() < b.openUntil) return false;   // 冷却未到点（并发窗口内）
   if (b.state === 'half-open') {
-    log(`breaker HALF-OPEN: ${providerId} 上一个探测名额已超期（${Math.round(BREAKER_STALE_MS / 1000)}s）未结算，回收后重新放行`);
+    log(`breaker HALF-OPEN: ${label} 上一个探测名额已超期（${Math.round(BREAKER_STALE_MS / 1000)}s）未结算，回收后重新放行`);
   }
   b.state = 'half-open';
   b.probeAt = Date.now();                                    // D1：结算兜底的时间基准
-  b.fails = BREAKER_THRESHOLD - 1;                           // 探测失败 → 立刻回到 open
-  breaker.set(providerId, b);
-  log(`breaker HALF-OPEN: ${providerId} 冷却到点，放行一次探测（single-flight）`);
+  b.fails = Math.max(0, (threshold || BREAKER_THRESHOLD) - 1);   // 探测失败 → 立刻回到 open
+  map.set(key, b);
+  log(`breaker HALF-OPEN: ${label} 冷却到点，放行一次探测（single-flight）`);
   return true;
 }
 
-function breakerRecordFail(providerId, httpStatus, serverRetryMs, timedOutByUs) {
+/** 交还/清零一个状态槽（成功，或"这不是该家的错"时释放名额）。**保留 opens** 让退避阶梯继续爬。 */
+function slotRecordSuccess(b) {
+  if (!b) return;
+  // ⚠ **不要整条删除**。`opens`（连续开闸次数）存在这个条目里，而退避阶梯是
+  // `base * 2**(opens-1)` —— 删掉条目就等于把阶梯历史清零。
+  // 后果实测（2026-10-08 审计）：一个"3 次失败 → 冷却 → 探活成功 → 又 3 次失败"的
+  // **抖动型坏家**永远停在第一档 90s；只有一路坏到底、中途一次都没成功的家才升到 30m。
+  // 而抖动型恰恰是最该退避的那一类（反复打扰正在限流的上游）。
+  b.fails = 0;
+  b.state = 'closed';
+  b.openUntil = 0;
+  b.probeAt = 0;
+  b.probeFull = false;      // 探测超时阶梯归零：该家已经能正常应答，下次探测从短阈值重新开始
+  b.lastOkAt = Date.now();  // "最近一次确实应答过" —— upstreamSuspect() 靠它与 lastNetFailAt 比较
+}
+
+/**
+ * 这次失败是否"与模型无关"（→ 应冷却**整家**）。判据（2026-10-14 用户确认）：
+ *   · 鉴权/欠费/权限（401/402/403）——Key 坏、欠费、被封，换模型也一样；
+ *   · **连接根本没建立**（网络层失败，且**不是我们自己的超时**）。
+ * 为什么把"我们自己的超时"排除在整家之外：超时是"这家**对这个模型**慢/挂住"，正是用户要求
+ * "只冷却该模型"的那一类（实测事故：amd 的慢模型把同家快模型一起熔断了）。
+ */
+function isProviderWideFailure(httpStatus, timedOutByUs) {
+  if (httpStatus === 401 || httpStatus === 402 || httpStatus === 403) return true;
+  if (!httpStatus) return !timedOutByUs;
+  return false;   // 上游给了响应（4xx/5xx/429）→ 按模型级处理（护栏会兜住"整家都坏"的情形）
+}
+
+/** 人读时长（日志与断言都用它，保持一致） */
+function fmtMs(ms) {
+  return ms >= 60_000 ? Math.round(ms / 60_000) + ' 分钟' : ms + 'ms';
+}
+
+/** 纯读：两级任一开着 → 该候选当前不可用。model 缺省时只看供应商级（=旧行为）。 */
+function breakerIsOpen(providerId, model) {
+  if (slotIsOpen(breaker.get(providerId))) return true;
+  const key = modelBreakerKey(providerId, model);
+  return key ? slotIsOpen(modelBreaker.get(key)) : false;
+}
+
+/**
+ * 发请求前占用探测名额（两级都要占）。
+ * 顺序：先判模型级（更细的粒度，先判它就不必动供应商级名额），再逐级 acquire；
+ * 若模型级抢不到，把供应商级**精确还原**到调用前的样子 —— 不能留下一个刚被推进到
+ * half-open 的悬挂名额（那会让该家所有模型在 BREAKER_STALE_MS 内全被跳过）。
+ */
+function breakerAcquire(providerId, model) {
+  const key = modelBreakerKey(providerId, model);
+  if (key && slotIsOpen(modelBreaker.get(key))) return false;
+  const pb = breaker.get(providerId);
+  if (slotIsOpen(pb)) return false;
+  const snapshot = pb ? Object.assign({}, pb) : null;
+  if (!slotAcquire(breaker, providerId, providerId, BREAKER_THRESHOLD)) return false;
+  if (key && !slotAcquire(modelBreaker, key, providerId + '[' + model + ']', MODEL_BREAKER_THRESHOLD)) {
+    if (snapshot) breaker.set(providerId, snapshot); else breaker.delete(providerId);
+    return false;
+  }
+  return true;
+}
+
+/** 供应商级记录：鉴权/欠费立即长熔断；连接类按连续开闸次数指数退避（既有语义，未改）。 */
+function providerBreakerRecordFail(providerId, httpStatus, serverRetryMs, timedOutByUs) {
   const b = breaker.get(providerId) || { state: 'closed', fails: 0, openUntil: 0, opens: 0 };
   b.fails += 1;
   // 「最近一次连不上」的时间戳（只有网络类失败才更新：httpStatus 为空 = 根本没能拿到响应）。
@@ -850,29 +1025,83 @@ function breakerRecordFail(providerId, httpStatus, serverRetryMs, timedOutByUs) 
     if (serverRetryMs > 0 && !long) ms = Math.max(ms, Math.min(serverRetryMs, BREAKER_BACKOFF_MAX_MS));
     b.state = 'open';
     b.openUntil = Date.now() + ms;
-    log(`breaker OPEN: ${providerId} 失败（${httpStatus || 'network'}），熔断 ${
-      ms >= 60_000 ? Math.round(ms / 60_000) + ' 分钟' : ms + 'ms'}`
-      + `${long ? '' : `（第 ${b.opens} 次开闸，退避递增；上限 ${Math.round(BREAKER_BACKOFF_MAX_MS / 60_000)} 分钟）`}`
+    log(`breaker OPEN: ${providerId} 失败（${httpStatus || (timedOutByUs ? 'timeout' : 'network')}），熔断 ${fmtMs(ms)}`
+      + `${long ? '（鉴权/欠费/权限类：与具体模型无关 → 冷却整家）'
+        : `（第 ${b.opens} 次开闸，退避递增；上限 ${Math.round(BREAKER_BACKOFF_MAX_MS / 60_000)} 分钟）`}`
       + `${serverRetryMs > 0 ? '（已遵循上游 Retry-After）' : ''}（保护上游账号）`);
   }
   breaker.set(providerId, b);
 }
-function breakerRecordSuccess(providerId) {
-  const b = breaker.get(providerId);
-  if (!b) return;
-  // ⚠ **不要整条删除**。`opens`（连续开闸次数）存在这个条目里，而退避阶梯是
-  // `base * 2**(opens-1)` —— 删掉条目就等于把阶梯历史清零。
-  // 后果实测（2026-10-08 审计）：一个"3 次失败 → 冷却 → 探活成功 → 又 3 次失败"的
-  // **抖动型坏家**永远停在第一档 90s；只有一路坏到底、中途一次都没成功的家才升到 30m。
-  // 而抖动型恰恰是最该退避的那一类（反复打扰正在限流的上游）。
-  // 改成只清"失败计数 + 开闸状态"，保留 opens 让阶梯继续爬。
-  // 安全性：`breakerIsOpen` 对 state==='closed' 返回 false，`breaker.has` 全文件只有这一处用过。
-  b.fails = 0;
-  b.state = 'closed';
-  b.openUntil = 0;
-  b.probeAt = 0;
-  b.probeFull = false;      // 探测超时阶梯归零：该家已经能正常应答，下次探测从短阈值重新开始
-  b.lastOkAt = Date.now();  // "最近一次确实应答过" —— upstreamSuspect() 靠它与 lastNetFailAt 比较
+
+/** 模型级记录（规则 2/3）：连续 N 次 → **只**冷却该模型 M 分钟（不指数退避，可预期）。 */
+function modelBreakerRecordFail(providerId, model, key, httpStatus, serverRetryMs, timedOutByUs) {
+  const b = modelBreaker.get(key) || { state: 'closed', fails: 0, openUntil: 0, opens: 0 };
+  b.fails += 1;
+  if (!httpStatus) b.lastNetFailAt = Date.now();
+  const wasProbe = b.state === 'half-open';
+  if (wasProbe) b.probeFull = (!!timedOutByUs && !b.probeFull);
+  if (b.fails >= MODEL_BREAKER_THRESHOLD || wasProbe) {
+    b.opens = (b.opens || 0) + 1;
+    let ms = MODEL_BREAKER_COOLDOWN_MS;
+    if (serverRetryMs > 0) ms = Math.max(ms, Math.min(serverRetryMs, MODEL_BREAKER_COOLDOWN_MS));
+    b.state = 'open';
+    b.openUntil = Date.now() + ms;
+    log(`breaker OPEN: ${providerId}[${model}] 失败（${httpStatus || (timedOutByUs ? 'timeout' : 'network')}），`
+      + `**仅该模型**冷却 ${fmtMs(ms)}（连续 ${b.fails} 次失败；规则：${MODEL_BREAKER_THRESHOLD} 次 → ${fmtMs(MODEL_BREAKER_COOLDOWN_MS)}。`
+      + `该家其它模型不受影响）`);
+    noteModelCooled(providerId, model);   // 护栏：多模型相继冷却 → 升级为整家
+  }
+  modelBreaker.set(key, b);
+}
+
+/**
+ * 升级护栏：同一家 ≥N 个**不同**模型在窗口内相继冷却 → 判定为该家整体故障，直接冷却整家。
+ * 为什么需要它：模型级冷却的唯一真实代价是"整家坏了却被当成 N 个模型分别失败"，那会白打上游
+ * N 倍（防封画像也要考虑）。这条护栏把它压回"最多多打 N 次"。
+ */
+function noteModelCooled(providerId, model) {
+  const now = Date.now();
+  const arr = (modelCooledLog.get(providerId) || []).filter((x) => now - x.at < MODEL_BREAKER_ESCALATE_WINDOW_MS);
+  if (!arr.some((x) => x.model === model)) arr.push({ at: now, model });
+  modelCooledLog.set(providerId, arr);
+  if (arr.length < MODEL_BREAKER_ESCALATE_MODELS) return;
+  modelCooledLog.delete(providerId);
+  const b = breaker.get(providerId) || { state: 'closed', fails: 0, openUntil: 0, opens: 0 };
+  b.fails = BREAKER_THRESHOLD;
+  b.opens = (b.opens || 0) + 1;
+  const ms = Math.min(BREAKER_SHORT_MS * 2 ** (b.opens - 1), BREAKER_BACKOFF_MAX_MS);
+  b.state = 'open';
+  b.openUntil = now + ms;
+  breaker.set(providerId, b);
+  log(`breaker OPEN: ${providerId} —— ${arr.length} 个不同模型在 ${Math.round(MODEL_BREAKER_ESCALATE_WINDOW_MS / 60_000)}`
+    + ` 分钟内相继冷却（${arr.map((x) => x.model).join(', ')}）→ 判定为该家整体故障，冷却整家 ${fmtMs(ms)}`
+    + '（"模型级冷却"的护栏：否则整家坏掉时会被当成 N 个模型分别失败、白打上游 N 倍）');
+}
+
+/**
+ * 记一次失败。两级分工见"模型级冷却"注释。
+ * @param {string} providerId
+ * @param {number} httpStatus 0/undefined = 网络层（没拿到响应）
+ * @param {number} serverRetryMs 上游 Retry-After
+ * @param {boolean} timedOutByUs 这次失败是**我们自己的超时**掐掉的
+ * @param {string} model 逻辑模型名（缺省 = 只记供应商级，= 旧行为）
+ */
+function breakerRecordFail(providerId, httpStatus, serverRetryMs, timedOutByUs, model) {
+  if (isProviderWideFailure(httpStatus, timedOutByUs)) {
+    providerBreakerRecordFail(providerId, httpStatus, serverRetryMs, timedOutByUs);
+    return;
+  }
+  const key = modelBreakerKey(providerId, model);
+  if (key) { modelBreakerRecordFail(providerId, model, key, httpStatus, serverRetryMs, timedOutByUs); return; }
+  // 拿到了"模型级失败"却没有模型信息 → 不能凭空放过，退回供应商级（宁可比规则更保守）
+  providerBreakerRecordFail(providerId, httpStatus, serverRetryMs, timedOutByUs);
+}
+
+/** 上游确认正常 → 两级都清零（供应商级 + 该模型级）。 */
+function breakerRecordSuccess(providerId, model) {
+  slotRecordSuccess(breaker.get(providerId));
+  const key = modelBreakerKey(providerId, model);
+  if (key) slotRecordSuccess(modelBreaker.get(key));
 }
 
 /* ---------------- 死家前置连通性检查（2026-10-13） ----------------
@@ -924,13 +1153,19 @@ function tcpReachable(host, port, timeoutMs) {
   });
 }
 
-/** 该家是否"可疑到值得先做一次 TCP 预检"。纯读、无副作用，可被同一请求多次调用。 */
-function upstreamSuspect(provider) {
-  const b = breaker.get(String((provider && provider.id) || ''));
-  if (!b) return false;
-  if (b.state === 'half-open') return true;      // 正在探测：先确认连得上，别白等整个超时
-  if (b.state !== 'closed') return false;        // open：根本轮不到发请求
-  return (b.opens || 0) > 0 && (b.lastNetFailAt || 0) > (b.lastOkAt || 0);
+/** 该家（或该家的这个模型）是否"可疑到值得先做一次 TCP 预检"。纯读、无副作用。 */
+function upstreamSuspect(provider, model) {
+  const id = String((provider && provider.id) || '');
+  const suspectOf = (b) => {
+    if (!b) return false;
+    if (b.state === 'half-open') return true;      // 正在探测：先确认连得上，别白等整个超时
+    if (b.state !== 'closed') return false;        // open：根本轮不到发请求
+    return (b.opens || 0) > 0 && (b.lastNetFailAt || 0) > (b.lastOkAt || 0);
+  };
+  // 模型级（规则 2 之后，超时/上游错误都记在这一层）
+  const mk = modelBreakerKey(id, logicalModelOf(provider, model));
+  if (mk && suspectOf(modelBreaker.get(mk))) return true;
+  return suspectOf(breaker.get(id));
 }
 
 /** 可疑家的发请求前预检。返回 { ok, detail }；baseURL 解析不了时放行（交给正常路径报错）。 */
@@ -940,6 +1175,89 @@ async function upstreamPreflight(provider) {
   const t0 = Date.now();
   const ok = await tcpReachable(t.host, t.port, UPSTREAM_PREFLIGHT_MS);
   return { ok, detail: `${t.host}:${t.port}（${t.via}，${Date.now() - t0}ms，阈值 ${UPSTREAM_PREFLIGHT_MS}ms）` };
+}
+
+/* ---------------- 规则 1：代理不可用 → 该家切直连（状态见文件上方注释） ---------------- */
+
+/** 本进程当前注入的代理 URL（未注入/未启用 → ''）。 */
+function envProxyUrl() {
+  const st = proxyStatus();
+  return (st.url && st.envProxy) ? st.url : '';
+}
+
+/** 代理 host:port 是否可连（TCP）。没走代理时返回 true（不存在"代理不可用"）。 */
+async function proxyReachable() {
+  const url = envProxyUrl();
+  if (!url) return true;
+  let host = '';
+  let port = 0;
+  try {
+    const u = new URL(url);
+    host = u.hostname;
+    port = Number(u.port) || (u.protocol === 'https:' ? 443 : 80);
+  } catch (_) { return true; }
+  return tcpReachable(host, port, PROXY_PROBE_MS);
+}
+
+/**
+ * 把"运行期直连清单"写进 process.env.NO_PROXY。
+ * 每次都从 **BASE_NO_PROXY 重建**（而不是在现值上追加）—— 否则恢复时清不干净，
+ * 而且反复追加会让这个变量无限变长。
+ */
+function syncRuntimeNoProxy() {
+  const merged = [BASE_NO_PROXY, ...runtimeDirectHosts.keys()].filter(Boolean).join(',');
+  try {
+    process.env.NO_PROXY = merged;
+    process.env.no_proxy = merged;
+  } catch (_) { /* 忽略 */ }
+}
+
+/**
+ * 规则 1 的核心：这次请求走代理失败了，若该上游**直连可达** → 把它的 host 切成直连。
+ * @returns {Promise<boolean>} true = 刚刚切了（调用方可以据此重试一次，那次就会走直连）
+ */
+async function switchHostToDirect(provider) {
+  if (!provider || !provider.baseURL) return false;
+  const st = proxyStatus();
+  if (!st.url || !st.envProxy) return false;             // 本来就没走代理 → 无可切
+  let up = null;
+  try {
+    const u = new URL(upstreamBase(provider.baseURL));
+    up = { host: u.hostname, port: Number(u.port) || (u.protocol === 'https:' ? 443 : 80) };
+  } catch (_) { return false; }
+  if (!up.host || !up.port) return false;
+  if (hostInNoProxy(up.host, st.noProxy)) return false;  // 已经是直连
+  if (runtimeDirectHosts.has(up.host)) return false;     // 已经切过
+  // 直连可达性用 **net.connect** 探测（node:net 不走 env 代理，是真直连）。
+  const directOk = await tcpReachable(up.host, up.port, UPSTREAM_PREFLIGHT_MS);
+  if (!directOk) {
+    log(`[proxy] ${provider.id}：代理路径失败，但 ${up.host}:${up.port} **直连也不可达** → 不切换`
+      + '（被墙的上游直连本来就必然失败；此时切直连只会把"代理坏"误判成"这家坏"）');
+    return false;
+  }
+  const proxyOk = await proxyReachable();
+  runtimeDirectHosts.set(up.host, { at: Date.now(), reason: proxyOk ? 'proxy-path-failed' : 'proxy-unreachable' });
+  syncRuntimeNoProxy();
+  log(`[proxy] ${provider.id}：${proxyOk ? '代理路径失败' : '代理不可达（TCP 连不上）'}但**直连可达**`
+    + ` → 已把 ${up.host} 切成直连（规则 1）。本进程运行期直连 ${runtimeDirectHosts.size} 个 host，`
+    + '代理恢复后会自动切回。');
+  return true;
+}
+
+/**
+ * 周期性复查代理是否恢复；恢复则清空运行期直连清单（切回代理）。
+ * 没有"切回"会怎样：clash 重启后所有家仍然直连 —— 被墙的上游会**全部失败**，
+ * 而日志只在很久以前写过一次"已切直连"，用户完全无从判断。
+ */
+async function maybeRestoreProxy() {
+  if (!runtimeDirectHosts.size) return;
+  if (Date.now() < runtimeDirectProbedAt) return;
+  runtimeDirectProbedAt = Date.now() + PROXY_RESTORE_PROBE_MS;
+  if (!(await proxyReachable())) return;
+  const n = runtimeDirectHosts.size;
+  runtimeDirectHosts.clear();
+  syncRuntimeNoProxy();
+  log(`[proxy] 代理已恢复 → ${n} 个 host 切回代理（规则 1 的自动恢复；NO_PROXY 已还原为注入值）`);
 }
 
 /** 熔断冷却剩余秒数（客户端重试提示用）。 */
@@ -4985,22 +5303,27 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
   //（测试实测：`upstream p1 首事件偷看失败：isAnthropicPath is not defined`）。
   // 因此这里在外层也留一个同义常量，专供 try 块之外的判定使用。
   const isAnthropicWire = upstreamPath === '/messages';
+  // 本函数内所有熔断调用都带**同一个**模型作用域（规则 2：模型级冷却）。
+  // ⚠ 必须折回**逻辑模型名**：路由筛候选用的是逻辑名（e.as === model），
+  // 记在上游 ID（如 qwen3.8-flash-next-262k）上的冷却永远不会被路由命中 ——
+  // 表现为"冷却记了但完全没用"，日志里还看不出哪里不对。
+  const bModel = logicalModelOf(provider, body && body.model);
   // 审计修复（P2，本次）：发请求前先占用熔断半开探测名额（唯一的状态转换点）。抢不到
   //（冷却未到点 / 已有探测在途）→ 本次不发任何上游请求，直接交给下一家。
-  if (!breakerAcquire(provider.id)) {
+  if (!breakerAcquire(provider.id, bModel)) {
     log(`skip ${provider.id} (breaker: cooldown or half-open probe already in flight)`);
     return false;
   }
   const timeoutMs = providerTimeoutMs(provider, body && body.model);
   // 死家前置预检（2026-10-13，详见 upstreamSuspect 上方注释）：可疑的家先在 TCP 层确认连得上，
   // 连不上就**一个 HTTP 请求都不发** —— 否则要白等到整个 HTTP 超时才判定失败（用户实测 60 秒）。
-  if (upstreamSuspect(provider)) {
+  if (upstreamSuspect(provider, bModel)) {
     const pre = await upstreamPreflight(provider);
     if (!pre.ok) {
       log(`upstream ${provider.id} 预检连不通（${pre.detail}）→ 不发请求，直接记为网络失败并换下一家`
         + `（省掉本次最多 ${timeoutMs}ms 的上游等待）`);
       catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-      breakerRecordFail(provider.id, 0);
+      breakerRecordFail(provider.id, 0, 0, false, bModel);
       return rawMode ? { retryable: 0 } : false;
     }
     log(`upstream ${provider.id} 预检通过（${pre.detail}），继续转发`);
@@ -5208,6 +5531,12 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     // 现在：**仅对"快速失败的网络层错误"重试一次**（本地超时中止不重试，否则白白翻倍等待）。
     const elapsed = Date.now() - startedAt;
     const upstreamUrl = `${upstreamBase(provider.baseURL)}${upstreamPath}`;
+    // 规则 1：代理路径失败 → 若直连可达就把该 host 切成直连，**然后**再走下面的原地重试
+    //（那一次就会走直连；否则重试还是撞同一个坏代理，白白多等一轮）。
+    // 自己的超时（abort）不触发切换：那类是"这家**对这个模型**慢"，不是代理的问题。
+    if (!describeAbortIfOurs(e, { signal: controller.signal, timeoutMs, elapsedMs: elapsed })) {
+      try { await switchHostToDirect(provider); } catch (_) { /* 切换绝不连累转发 */ }
+    }
     if (isTransientNetError(e) && elapsed < NET_RETRY_MAX_ELAPSED_MS) {
       log(`upstream ${provider.id} 网络错误（${causeText}，${elapsed}ms）→ 原地重试一次`);
       const c2 = new AbortController();
@@ -5233,7 +5562,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       // 先算 abortInfo 再记熔断：第 4 个参数（timedOutByUs）驱动探测超时阶梯 ——
       // "被短阈值掐掉"的探测下一次要放行完整超时，慢家才恢复得回来。
       const abortInfo = describeAbortIfOurs(e, { signal: controller.signal, timeoutMs, elapsedMs: Date.now() - startedAt });
-      breakerRecordFail(provider.id, 0, 0, !!abortInfo);   // V2：网络错误 → 短熔断
+      breakerRecordFail(provider.id, 0, 0, !!abortInfo, bModel);   // V2：网络错误 → 短熔断
       const why = abortInfo
         ? `上游无响应，${abortInfo.text}`
         : `${e.message}${causeText ? ' (' + causeText + ')' : ''}${proxyHintFor(upstreamUrl, causeText)}`;
@@ -5311,7 +5640,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
             : `带 Claude Code 仿真重试仍失败（${revived ? 'HTTP ' + revived.status : '连接错误'}）→ 同样无解。`)
           + '这类拒绝与账号无关（换 Key 没用）。');
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-        breakerRecordFail(provider.id, 403);
+        breakerRecordFail(provider.id, 403, 0, false, bModel);
         return rawMode ? { retryable: upstream.status } : false;
       }
     }
@@ -5332,7 +5661,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         // 紧接着就是 `account acctgeo#key1 标记为 session（冷却 3600s）`，
         // 然后 2 个 Key 全冷却 → healthy-model 直接被"全部冷却中"挡掉。
         if (opts.failureSink) opts.failureSink.modelScopeOnly = true;
-        breakerRecordSuccess(provider.id);
+        breakerRecordSuccess(provider.id, bModel);
         return rawMode ? { retryable: upstream.status } : false;
       }
       const acctKind = classifyAccountFailure(upstream.status, detail);
@@ -5341,7 +5670,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         // D1（审计修复）：账户级失败说明"这家上游是健康的、只是这个账户不行"，**不计供应商失败**，
         // 因此必须把刚占用的半开探测名额交还。旧实现直接 return 不释放 → 该家永久卡在
         // half-open（breakerIsOpen 恒真）再也不会被选中，直到进程重启。
-        breakerRecordSuccess(provider.id);
+        breakerRecordSuccess(provider.id, bModel);
         return rawMode ? { retryable: upstream.status } : false;
       }
     }
@@ -5368,7 +5697,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       // `all providers for model "m2" are temporarily in breaker cooldown`，
       //  而上游命中 0 次；对照组把这次换成 422（会走结算）时 m2 = 200）。
       // 这正是上方 :4377 注释所警告的"连坐"。
-      breakerRecordSuccess(provider.id);
+      breakerRecordSuccess(provider.id, bModel);
       return rawMode ? { retryable: upstream.status } : false;
     }
     if (CLIENT_FINGERPRINT_RE.test(String(detail || ''))) {
@@ -5379,7 +5708,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       // 这是本轮第 9 处"同一判定多处实现"。逻辑已统一到最前面那处，这里只留兜底。
       log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"客户端指纹被拒"（兜底分支）→ 熔断该家`);
       catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-      breakerRecordFail(provider.id, 403);
+      breakerRecordFail(provider.id, 403, 0, false, bModel);
       return rawMode ? { retryable: upstream.status } : false;
     }
     if (upstream.status === 401 || upstream.status === 403 || upstream.status === 429 || upstream.status >= 500) {
@@ -5387,7 +5716,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       // R25：429（限流）计入熔断——不熔断会加剧限流；短熔断（90s）已足够退避
       catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
       // 429 时把服务端的 Retry-After 传下去（真实客户端会遵循它）
-      breakerRecordFail(provider.id, upstream.status, upstream.status === 429 ? retryAfterMs(upstream) : 0);   // V2：按状态码分级熔断（401/403 → 30 分钟）
+      breakerRecordFail(provider.id, upstream.status, upstream.status === 429 ? retryAfterMs(upstream) : 0, false, bModel);   // V2：按状态码分级熔断（401/403 → 30 分钟）
       // raw 模式（资源子路由）：这不是"资源不存在"而是"这家上游暂时不可用"，
       // 把状态码带回去让调用方回 502，避免误导客户端以为 response 已被删除
       return rawMode ? { retryable: upstream.status } : false;
@@ -5400,7 +5729,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     // R9c 降敏重试可能成功，继续 failover（见上方的降敏重试）。
     // 这两种 4xx 都说明上游**能正常应答**（策略性拒绝，连接性是健康的）→ 释放熔断半开探测
     // 名额；否则"确定性 4xx 不记失败"会让半开名额永远被占（熔断卡死）。
-    breakerRecordSuccess(provider.id);
+    breakerRecordSuccess(provider.id, bModel);
     if (!contentBlocked) {
       // 404 的处置（2026-10-13 修）：
       //  · 上游**不实现该路由**（某些供应商没有 /responses，返回通用 404/空体）：换下一家有意义；
@@ -5442,7 +5771,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"供应商账号/额度/权限"类错误`
           + `（${persistent ? '长期状态' : '临时'}）→ 冷却该家并继续 failover`);
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-        breakerRecordFail(provider.id, persistent ? 403 : 0);   // 403 → 长熔断（30 分钟）；0 → 短熔断
+        breakerRecordFail(provider.id, persistent ? 403 : 0, 0, false, bModel);   // 403 → 长熔断（30 分钟）；0 → 短熔断
         return rawMode ? { retryable: upstream.status } : false;
       }
       // ⚠ 指纹类拒绝必须排在"供应商账号/额度"判定**之前**：它长得像 403（也会被
@@ -5461,7 +5790,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         // 这是本轮第 8 处"同一判定两处实现"；同一个函数内也会发生。
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"客户端指纹被拒"（兜底分支）→ 熔断该家`);
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-        breakerRecordFail(provider.id, 403);
+        breakerRecordFail(provider.id, 403, 0, false, bModel);
         return rawMode ? { retryable: upstream.status } : false;
       }
       // 2026-09-23 修复：**这家没有这个模型**不是"请求本身有错" —— 换下一家有意义，
@@ -5628,7 +5957,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
           const detail = head.replace(/\s+/g, ' ').slice(0, 200);
           log(`upstream ${provider.id} HTTP 200 但 SSE 首事件是错误 → 判定该家失败并换下一家：${maskSecrets(detail)}`);
           catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-          breakerRecordFail(provider.id, 0);   // 短熔断（连续 3 次 / 或半开探测失败）
+          breakerRecordFail(provider.id, 0, 0, false, bModel);   // 短熔断（连续 3 次 / 或半开探测失败）
           try { await peekReader.cancel(); } catch { /* 忽略 */ }
           return rawMode ? { retryable: 0 } : false;
         }
@@ -5655,7 +5984,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
   }
   // D2（审计修复）：到这里才确认"上游确实给出了正常事件"（用了流式则已通过首事件偷看），
   // 此时清零熔断计数才是诚实的；提前到 2xx 处会让"200 + 错误 SSE"永远无法熔断。
-  breakerRecordSuccess(provider.id);
+  breakerRecordSuccess(provider.id, bModel);
   // ── 协议矩阵：上游线协议 ≠ 客户端协议 → 翻译后再写给客户端 ──
   // 位置是刻意的：**晚于**首事件偷看（那时才确认上游给的是正常流，否则会把"上游 200 +
   // 错误 SSE"翻译成一条客户端看不懂的成功响应），**早于**任何 res.writeHead
@@ -7715,6 +8044,35 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
     }
   };
 
+  // DSML（2026-10-13 本版）：**流式也能构造 tool_use 了**。
+  // 做法是复用同一套 toolCalls 状态机：把原生工具标记解析出的调用塞进去，由流结束的
+  // flushToolCalls() 一次性补成真正的 tool_use 块 —— 与结构化 tool_calls **同一个出口**。
+  // 刻意不新造一套流式状态机：本项目吃过多次"同一逻辑两处实现→漂移"的亏（见 parity 脚本的说明）。
+  // 槽位用**负数**：结构化调用的槽位是上游给的 index（≥0），两者同时出现也不会串台；
+  // flushToolCalls 按槽位升序发块，负数在前（先 DSML、后结构化），Anthropic 语义上无差别。
+  let dsmlSlot = 0;
+  const addDsmlCalls = (calls) => {
+    for (const c of calls) {
+      dsmlSlot -= 1;
+      toolCalls.set(dsmlSlot, {
+        id: 'toolu_dsml_' + crypto.randomUUID().replace(/-/g, '').slice(0, 12),
+        name: c.name,
+        args: JSON.stringify(c.args || {}),
+        started: false,
+        sent: 0,
+      });
+    }
+  };
+  /** 发一段正文（必要时开 text 块）。DSML 剔除后的正文与"收尾归还的残余"共用它。 */
+  const emitText = (s) => {
+    if (!s) return;
+    if (openKind !== 'text') { closeBlock(); startBlock('text', { type: 'text', text: '' }); }
+    outText += s;
+    if (!aggregateOnly) {
+      sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: s } });
+    }
+  };
+
   const handleChunk = (json) => {
     ensureStart();
     if (json && json.usage && (json.usage.prompt_tokens || json.usage.completion_tokens)) usage = json.usage;
@@ -7753,20 +8111,14 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
       let dsmlOut = { text: delta.content, calls: [] };
       try { dsmlOut = dsmlStreamFeed(res, delta.content); } catch (_) { dsmlOut = { text: delta.content, calls: [] }; }
       if (dsmlOut.calls.length) {
+        addDsmlCalls(dsmlOut.calls);
         try {
           log('[DSML] 流式：上游用原生工具标记回了 ' + dsmlOut.calls.length + ' 个调用（'
-            + dsmlOut.calls.map((c) => c.name).join(', ') + '）；已从正文剔除以免客户端显示乱码，'
-            + '但**流式路径暂不构造 tool_use**，这些工具不会被执行（已知限制）。');
+            + dsmlOut.calls.map((c) => c.name).join(', ') + '）→ 已剔除标记并**转成真正的 tool_use 块**'
+            + '（流结束时统一补出，与结构化 tool_calls 同一出口），客户端可正常执行。');
         } catch (_) { /* 忽略 */ }
       }
-      const dsmlVisible = dsmlOut.text;
-      if (dsmlVisible) {
-        if (openKind !== 'text') { closeBlock(); startBlock('text', { type: 'text', text: '' }); }
-        outText += dsmlVisible;
-        if (!aggregateOnly) {
-          sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: dsmlVisible } });
-        }
-      }
+      emitText(dsmlOut.text);
     }
     for (const call of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
       const idx = toolCallSlot(call, toolCalls, toolCallState);
@@ -7850,6 +8202,40 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
     try { reader.releaseLock(); } catch { /* 忽略 */ }
   }
   if (clientGone) return { ok: false };
+  // 收尾：把 dsmlStreamFeed 扣住的残余**归还**给客户端。
+  // 扣留本身是为了防"标记被切成两片时泄漏"，但流结束时必须吐出来 —— 否则一个正当的尾部 '<'
+  // 会被静默吞掉（dsmlStreamFlush 就是为此存在，本版才真正接上线）。
+  // 位置在 clientGone 检查**之后**：客户端都断了就不必再归还（写也会失败）。
+  try {
+    const rest = dsmlStreamFlush(res);
+    if (rest) {
+      let parsed = parseDsmlToolCalls(rest);
+      if (!parsed.calls.length) {
+        // 上游没写 `</|DSML|calls>` 闭合标记：DSML_CALLS_RE 要求闭合标签，这里退一步只按 invoke 解析
+        //（调用本身可能是完整的，比当正文吐出去有用）。块外正文保留，块内残片丢弃。
+        const inv = parseDsmlInvokes(rest);
+        if (inv.length) {
+          const openM = rest.search(/<\s*[|｜]\s*DSML\s*[|｜]\s*calls\s*>/i);
+          parsed = { text: openM >= 0 ? rest.slice(0, openM) : rest, calls: inv };
+        }
+      }
+      if (parsed.calls.length) {
+        addDsmlCalls(parsed.calls);
+        log('[DSML] 流式收尾：上游未闭合工具标记，但其中 ' + parsed.calls.length
+          + ' 个调用是完整的 → 已转成 tool_use（否则这些工具不会被执行）');
+        // ⚠ 这里**只能**发 `parsed.text`。写成 `parsed.text || rest` 会把整个残余（含标记）
+        // 当正文吐出去 —— 而"块外正文为空"（标记紧跟在前一段正文之后）恰恰是最常见的情形，
+        // 空串是 falsy，于是标记原样泄漏给客户端（本版实测踩到，流式②用例抓住）。
+        emitText(parsed.text || '');
+      } else {
+        // 解析不出调用 → 原样归还（宁可显示乱码，也不静默吞掉正文）
+        emitText(rest);
+      }
+    }
+  } catch (e) {
+    // 观测/收尾绝不影响已发内容
+    try { log('DSML 收尾归还失败（不影响已发出的内容）：' + (e && e.message)); } catch (_) { /* 忽略 */ }
+  }
 
   // ⚠ 上游流**被腰斩**时必须报错，不能伪装成正常结束。
   //
@@ -7952,7 +8338,10 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
  */
 async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, res, opts) {
   noteToolFingerprint(provider.id, body);
-  if (!breakerAcquire(provider.id)) {
+  // 同 forward()：本函数内所有熔断调用统一带这个模型作用域。
+  // 此处 body.model 已经是**上游 ID**（bodyForProvider 映射过），logicalModelOf 折回逻辑名。
+  const bModel = logicalModelOf(provider, body && body.model);
+  if (!breakerAcquire(provider.id, bModel)) {
     log(`skip ${provider.id} (breaker: cooldown or half-open probe already in flight)`);
     return false;
   }
@@ -7963,13 +8352,13 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
   // 死家前置预检：与直通路径同一判据（详见 upstreamSuspect 上方注释）。这条路径
   //（Anthropic 客户端 → openai-chat 上游）是 dsh/cline 走得最多的一条，不能只修直通那条。
   // 放在选账户**之前**：账号池的冷却/轮换不该被一个死家牵动，且预检是供应商粒度、只需一次。
-  if (upstreamSuspect(provider)) {
+  if (upstreamSuspect(provider, bModel)) {
     const pre = await upstreamPreflight(provider);
     if (!pre.ok) {
       log(`upstream ${provider.id} 预检连不通（${pre.detail}）→ 不发请求，直接记为网络失败并换下一家`
         + `（省掉本次最多 ${providerTimeoutMs(provider, scopeModel)}ms 的上游等待）`);
       catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-      breakerRecordFail(provider.id, 0);
+      breakerRecordFail(provider.id, 0, 0, false, bModel);
       return false;
     }
     log(`upstream ${provider.id} 预检通过（${pre.detail}），继续转发`);
@@ -7983,7 +8372,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
     // "all providers ... breaker cooldown"（把"账户全冷却"误报成"供应商熔断"）。
     // 本函数其余所有 return/continue 路径都已结算（见各分支处的 breakerRecordSuccess/
     // breakerRecordFail），只有这一条遗漏。语义上"账户冷却"不构成供应商故障 → 交还名额。
-    breakerRecordSuccess(provider.id);
+    breakerRecordSuccess(provider.id, bModel);
     return false;
   }
   const attemptAccounts = picked.acct ? [picked.acct, ...picked.accounts.filter((a) => a !== picked.acct && accountUsable(provider.id, a, scopeModel))] : [null];
@@ -8045,7 +8434,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       log(`provider ${provider.id} 凭据不可用（${acct ? acct.id : '-'}）：${e && e.message}`);
       if (acct) { clearTimeout(timer); markAccountFailure(provider.id, acct, 'session', e && e.message); continue; }
       clearTimeout(timer);
-      breakerRecordFail(provider.id, 401);
+      breakerRecordFail(provider.id, 401, 0, false, bModel);
       return false;
     }
 
@@ -8083,6 +8472,10 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       clearTimeout(timer);
       const causeText = describeFetchError(e);
       const elapsed = Date.now() - startedAt;
+      // 规则 1：与直通路径同一处理（详见 switchHostToDirect 的注释）
+      if (!describeAbortIfOurs(e, { signal: controller.signal, timeoutMs: providerTimeoutMs(provider, scopeModel), elapsedMs: elapsed })) {
+        try { await switchHostToDirect(provider); } catch (_) { /* 切换绝不连累转发 */ }
+      }
       if (isTransientNetError(e) && elapsed < NET_RETRY_MAX_ELAPSED_MS) {
         log(`upstream ${provider.id} 网络错误（${causeText}，${elapsed}ms）→ 原地重试一次`);
         const c2 = new AbortController();
@@ -8106,7 +8499,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         log(`upstream ${provider.id} request error: ${why}`);
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
         // 第 4 个参数驱动探测超时阶梯：被短阈值掐掉的探测下次放行完整超时（详见 providerTimeoutMs）
-        breakerRecordFail(provider.id, 0, 0, !!abortInfo);
+        breakerRecordFail(provider.id, 0, 0, !!abortInfo, bModel);
         return false;
       }
     }
@@ -8134,7 +8527,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         // half-open 名额被永久占用 → 该家所有模型在熔断窗口内全部 503（连坐）。
         // 实测（.audit\a2-breaker-anthropic-path.js）：Anthropic 客户端 → openai-chat 上游，
         // 半开探测命中这条 early return 后，请求同家另一个正常模型也拿 503、上游命中 0。
-        breakerRecordSuccess(provider.id);
+        breakerRecordSuccess(provider.id, bModel);
         return false;
       }
       // 与直通路径同一条判据（见 UPSTREAM_BROKEN_4XX_RE 的定义处）：
@@ -8145,7 +8538,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"上游侧故障被包成 4xx"`
           + `（${maskSecrets(String(lastDetail || '')).slice(0, 80)}）→ 继续 failover（不熔断该家、不冷却账户）`);
         // 同 MODEL_UNSUPPORTED 那处：上游连接性是健康的 → 必须交还半开探测名额。
-        breakerRecordSuccess(provider.id);
+        breakerRecordSuccess(provider.id, bModel);
         return false;
       }
       if (CLIENT_FINGERPRINT_RE.test(String(lastDetail || ''))) {
@@ -8153,7 +8546,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
           + '这类拒绝与账号无关（换 Key/重试都没用），继续请求只会加剧风控；'
           + '本程序运行在 Node 上，无法伪装 TLS/HTTP 客户端指纹，这是已知上限。');
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-        breakerRecordFail(provider.id, 403);
+        breakerRecordFail(provider.id, 403, 0, false, bModel);
         return false;
       }
       // ⚠⚠ 2026-10-10：WorkBuddy 软性渠道拦截 —— **本路径（矩阵/翻译）必须与直通路径同步**。
@@ -8170,7 +8563,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       if (WORKBUDDY_CHANNEL_BLOCK_RE.test(String(lastDetail || ''))) {
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"软性渠道拦截/风控"`
           + `（上游要求重发；实测约 2% 随机命中）→ 继续 failover，不终止客户端任务`);
-        breakerRecordSuccess(provider.id);   // 上游连接性是健康的 → 交还半开名额
+        breakerRecordSuccess(provider.id, bModel);   // 上游连接性是健康的 → 交还半开名额
         return false;
       }
       const acctKind = acct ? classifyAccountFailure(upstream.status, lastDetail) : null;
@@ -8182,13 +8575,16 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       }
       if (upstream.status === 401 || upstream.status === 403 || upstream.status === 429 || upstream.status >= 500) {
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-        breakerRecordFail(provider.id, upstream.status, upstream.status === 429 ? retryAfterMs(upstream) : 0);
+        breakerRecordFail(provider.id, upstream.status, upstream.status === 429 ? retryAfterMs(upstream) : 0, false, bModel);
         return false;
       }
-      breakerRecordSuccess(provider.id);
+      breakerRecordSuccess(provider.id, bModel);
       if (PROVIDER_SIDE_4XX_RE.test(lastDetail)) {
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-        breakerRecordFail(provider.id, PERSISTENT_ACCOUNT_RE.test(lastDetail) ? 403 : 0);
+        // 账户池全部不可用 → **供应商级**（与模型无关）：显式传空模型名，
+        // 走 providerBreakerRecordFail（见注释"不能因为失败原因属于账户级就跳过，
+        // 否则坏家会被每个请求重复打点"）。
+        breakerRecordFail(provider.id, PERSISTENT_ACCOUNT_RE.test(lastDetail) ? 403 : 0, 0, false, '');
         return false;
       }
       const status = DETERMINISTIC_4XX_STATUS[upstream.status] || 400;
@@ -8198,7 +8594,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
 
     // 成功：OpenAI 响应 → Anthropic
     if (acct) markAccountOk(provider.id, acct, scopeModel);
-    breakerRecordSuccess(provider.id);
+    breakerRecordSuccess(provider.id, bModel);
     const ctype = String(upstream.headers.get('content-type') || '');
     const inputTokens = estimateTokens(JSON.stringify(finalBody.messages || []));
     try {
@@ -8254,7 +8650,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
               continue;
             }
             catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-            breakerRecordFail(provider.id, 0);
+            breakerRecordFail(provider.id, 0, 0, false, bModel);
             try { await peekReader.cancel(); } catch { /* 忽略 */ }
             return false;   // 未写任何字节 → 交给下一家供应商
           }
@@ -8371,7 +8767,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
   if (isModelUnavailableByProvider(lastStatus, lastDetail)) {
     log(`provider ${provider.id} 的失败原因是"这家不提供该模型"（含地区/套餐受限）→ 交还半开名额，**不熔断该家**`
       + '（该家对别的模型仍然正常；若长期如此，请从配置的 models 里移除该映射）');
-    breakerRecordSuccess(provider.id);
+    breakerRecordSuccess(provider.id, bModel);
     return false;
   }
   // 同 UPSTREAM_BROKEN_4XX_RE 的定义处：上游自己坏了却包成 4xx → 该家不算"请求有错"，
@@ -8379,22 +8775,23 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
   if (UPSTREAM_BROKEN_4XX_RE.test(String(lastDetail || ''))) {
     log(`provider ${provider.id} 的失败原因是"上游侧故障被包成 4xx"（${maskSecrets(String(lastDetail || '')).slice(0, 80)}）`
       + ' → 交还半开名额，**不熔断该家**，继续 failover');
-    breakerRecordSuccess(provider.id);
+    breakerRecordSuccess(provider.id, bModel);
     return false;
   }
   if (CLIENT_FINGERPRINT_RE.test(String(lastDetail || ''))) {
     log(`provider ${provider.id} 的失败原因是"客户端指纹被拒" → 熔断该家（换 Key 无用）`);
     catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-    breakerRecordFail(provider.id, 403);
+    breakerRecordFail(provider.id, 403, 0, false, bModel);
     return false;
   }
   if (lastStatus === 401 || lastStatus === 403 || lastStatus === 429 || lastStatus >= 500) {
     catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-    breakerRecordFail(provider.id, lastStatus);
+    // 走到这里是"该家**所有账户**都不行"（账户池耗尽）→ 与模型无关，显式传空模型名走供应商级
+    breakerRecordFail(provider.id, lastStatus, 0, false, '');
   } else {
     // 未拿到可判定的上游状态码（如凭据解析失败、账户全部处于冷却而直接跳过）：
     // 该家这轮没被证明是坏的，但半开名额已占用 —— 交还名额，避免永久 half-open。
-    breakerRecordSuccess(provider.id);
+    breakerRecordSuccess(provider.id, bModel);
   }
   return false;
 }
@@ -8526,10 +8923,10 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
   log(`[route] ${model}: ${eligible.length} 个候选（配置声明 ${tierSizes[0]} / 未配置按目录兜底 ${tierSizes[1]}）｜${reasonsText}`);
 
   // V1 防封：跳过熔断中的 provider（连续失败保护期，不发起上游请求）
-  const breakerOpen = (p) => { if (breakerIsOpen(p.id)) { log(`skip ${p.id} (breaker open)`); return true; } return false; };
+  const breakerOpen = (p) => { if (breakerIsOpen(p.id, model)) { log(`skip ${p.id} (breaker open)`); return true; } return false; };
   const ordered = eligible.filter((p) => !breakerOpen(p));
   if (ordered.length === 0) {
-    if (eligible.length === 0 && candidates.length > 0 && candidates.every((p) => breakerIsOpen(p.id))) {
+    if (eligible.length === 0 && candidates.length > 0 && candidates.every((p) => breakerIsOpen(p.id, model))) {
       // 全部候选都熔断中（catalog 因熔断未探测 → 归属无法判定）：暂时状态 → 503 + 重试提示（R20）
       log(`[route] ${model}: 全部候选熔断，归属无法判定（${reasonsText}）`);
       logCall('breaker-all', 'fail');
@@ -8878,10 +9275,10 @@ async function handleMessages(cfg, req, res, body) {
   log(`[route] ${model}: ${eligible.length} 个候选（配置声明 ${tierSizes[0]} / 未配置按目录兜底 ${tierSizes[1]}）｜${reasonsText}`);
 
   // V1 防封：跳过熔断中的 provider（连续失败保护期，不发起上游请求）
-  const breakerOpen = (p) => { if (breakerIsOpen(p.id)) { log(`skip ${p.id} (breaker open)`); return true; } return false; };
+  const breakerOpen = (p) => { if (breakerIsOpen(p.id, model)) { log(`skip ${p.id} (breaker open)`); return true; } return false; };
   const ordered = eligible.filter((p) => !breakerOpen(p));
   if (ordered.length === 0) {
-    if (eligible.length === 0 && candidates.length > 0 && candidates.every((p) => breakerIsOpen(p.id))) {
+    if (eligible.length === 0 && candidates.length > 0 && candidates.every((p) => breakerIsOpen(p.id, model))) {
       // 全部候选都熔断中（catalog 因熔断未探测 → 归属无法判定）：暂时状态 → 503（R20），不再误报 404
       log(`[route] ${model}: 全部候选熔断，归属无法判定（${reasonsText}）`);
       logCall('breaker-all', 'fail');
@@ -9129,7 +9526,12 @@ function startServer(cfg) {
       sock.on('error', (e) => finish(false, `连接错误 ${e && e.code ? e.code : e.message}`));
       sock.on('close', () => finish(false, '连接被关闭且无响应'));
     });
-    setInterval(() => { probe().catch(() => { /* 自检本身绝不抛 */ }); }, 60_000);
+    setInterval(() => {
+    probe().catch(() => { /* 自检本身绝不抛 */ });
+    // 规则 1 的自动恢复：代理活过来就把运行期直连清单清掉（切回代理）。
+    // 搭这个 60s 的定时器，不再单独开一个（empty 时是零开销的 early return）。
+    maybeRestoreProxy().catch(() => { /* 恢复探测本身绝不抛 */ });
+  }, 60_000);
   }
   return server;
 }

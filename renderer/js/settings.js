@@ -12,6 +12,10 @@ LG.renders.settings = function renderSettings() {
   $('#stProxyUrl').value = px.url || '';
   $('#stNoProxy').value = Array.isArray(px.noProxy) ? px.noProxy.join(', ') : (px.noProxy || '');
   $('#stForceProxy').value = Array.isArray(px.forceProxy) ? px.forceProxy.join(', ') : (px.forceProxy || '');
+  // 模型级冷却（规则 3）：配置里没有就显示空 —— 空 = 用引擎内置默认（3 次 / 30 分钟）
+  const brk = (c.breaker && typeof c.breaker === 'object') ? c.breaker : {};
+  $('#stBrkThreshold').value = brk.threshold == null ? '' : brk.threshold;
+  $('#stBrkCooldownMin').value = brk.cooldownMs == null ? '' : Math.round(brk.cooldownMs / 60_000);
 
   const st = LG.state;
   if (st) {
@@ -52,15 +56,35 @@ function readSettingsInto() {
   if (noProxy.length) proxy.noProxy = noProxy;
   if (forceProxy.length) proxy.forceProxy = forceProxy;
   set('proxy', proxy);
+
+  // 模型级冷却（规则 3）：留空 = 用引擎内置默认 → **把键删掉**，而不是写一份默认值。
+  // 写默认值会让"我没改过"变成"显式覆盖成 3/30"，日后我们调整内置默认就影响不到他。
+  const brkKeys = (c.breaker && typeof c.breaker === 'object') ? Object.assign({}, c.breaker) : {};
+  const brkTh = String($('#stBrkThreshold').value || '').trim();
+  const brkCd = String($('#stBrkCooldownMin').value || '').trim();
+  if (brkTh) brkKeys.threshold = Number(brkTh); else delete brkKeys.threshold;
+  if (brkCd) brkKeys.cooldownMs = Math.round(Number(brkCd) * 60_000); else delete brkKeys.cooldownMs;
+  if (Object.keys(brkKeys).length) set('breaker', brkKeys);
+  else if (c.breaker !== undefined) { delete c.breaker; changed = true; }
   return changed;
 }
 
-/** 只拦真正会坏事的情况：端口非法、代理地址不是 http(s)。 */
+/** 只拦真正会坏事的情况：端口非法、代理地址不是 http(s)、冷却参数超范围。 */
 function validateSettingsInput() {
   const port = Number($('#stPort').value);
   if (!Number.isInteger(port) || port < 1 || port > 65535) return '端口必须是 1-65535 的整数';
   const url = $('#stProxyUrl').value.trim();
   if (url && !/^https?:\/\//i.test(url)) return '代理地址必须以 http:// 或 https:// 开头';
+  // 模型级冷却（规则 3）：留空合法（= 用内置默认），但填了就必须在范围内 ——
+  // 0 次/0 分钟等于"关掉冷却"（用户会以为网关坏了），超大值等于永久下架。
+  const th = String($('#stBrkThreshold').value || '').trim();
+  if (th && (!/^\d+$/.test(th) || Number(th) < 1 || Number(th) > 100)) {
+    return '「模型级冷却」的失败次数必须是 1–100 的整数（留空 = 默认 3 次）';
+  }
+  const cd = String($('#stBrkCooldownMin').value || '').trim();
+  if (cd && (!/^\d+$/.test(cd) || Number(cd) < 1 || Number(cd) > 1440)) {
+    return '「冷却时长」必须是 1–1440 分钟（留空 = 默认 30 分钟）';
+  }
   return '';
 }
 
