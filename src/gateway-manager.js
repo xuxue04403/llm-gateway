@@ -706,13 +706,24 @@ class GatewayManager extends EventEmitter {
       if (!s) return '';
       let host = s;
       if (/^https?:\/\//i.test(s)) { try { host = new URL(s).hostname; } catch (_) { /* 原样 */ } }
-      host = host.replace(/\/.*$/, '')          // 去路径
+      // 剥 IPv6 方括号**要在端口剥离之前**，且要连端口一起剥：
+      // `new URL('http://[::1]:8080/v1').hostname` 返回的是 **`[::1]`（不带端口，实测确认）**。
+      const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(host);
+      if (bracketed) host = bracketed[1];
+      else {
+        // ⚠ 端口剥离的判据必须是"**恰好一个**冒号，且前面像个域名"：
+        //   `example.org:8080` → `example.org` ✓
+        //   `::1` / `fe80::1` / `[::1]` → **原样保留**（IPv6 字面量全是冒号，
+        //     用"结尾冒号+数字"去剥会把 `::1` 削成裸 `:`）。
+        // 这个坑是我自己踩的：第一版写成 `.replace(/:\d+$/,'')`，它把 `::1` 的结尾 `:1`
+        // 当成端口剥掉，剩下裸冒号进了 NO_PROXY（本机重启日志里实测到
+        // `…,workbuddy.cn,:,token.sensenova.cn,…`）。加了"恰好一个冒号"的限制才修好。
+        if (/^[^:]+:\d+$/.test(host) && host.includes('.')) host = host.replace(/:\d+$/, '');
+      }
+      return host.replace(/\/.*$/, '')          // 去路径
         .replace(/^\*\./, '')                   // 去通配前缀（*.example.com → example.com）
         .replace(/^\./, '')                     // 去前导点（.example.com → example.com）
-        .replace(/^\[/, '').replace(/\]$/, '')  // 去 IPv6 方括号（[::1] → ::1，与 LOOPBACK 一致）
-        .replace(/:\d+$/, '')                   // 去端口（example.org:8080 → example.org）
         .toLowerCase();                         // 大小写归一（域名大小写无意义）
-      return host;
     };
     // 判断"某条目是否被 forceProxy 剔除"：规范化后相等，或互为父/子域（用户写父域、
     // 清单里是子域的情况很常见 —— 只按字面量删会漏，与本文件既有注释的意图不符）。

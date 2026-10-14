@@ -1590,4 +1590,62 @@ t('validateConfigText：breaker.threshold / cooldownMs 的范围要拦（规则3
   assert.strictEqual(validateConfigText(JSON.stringify(c)).ok, true, '老配置（没有 breaker）必须照常放行');
 });
 
+t('computeNoProxy：域名归一化（大小写/通配/端口/IPv6）—— IPv6 绝不能被削成裸冒号', async () => {
+  const dir = fs.mkdtempSync(path.join(tmp, 'noproxy-'));
+  const gm = new GatewayManager({ dataDir: dir, logger: { info: () => {} }, settings: null });
+  const withNoProxy = (entries) => {
+    fs.writeFileSync(gm.configPath, JSON.stringify({
+      port: 3099, apiKey: 'k',
+      proxy: { enabled: true, url: 'http://127.0.0.1:7890', noProxy: entries, forceProxy: [] },
+      providers: [],
+    }), 'utf8');
+    return gm.computeNoProxy().split(',');
+  };
+  // ⚠ 这条用例的由来（2026-10-14）：我给 norm() 加端口剥离时写成 `.replace(/:\d+$/,'')`，
+  // 它把 **`::1` 的结尾 `:1` 当成端口剥掉**，剩下一个裸冒号 `:` 进了 NO_PROXY ——
+  // 本机重启后的日志实测到 `…,workbuddy.cn,:,token.sensenova.cn,…`。
+  // 后果方向是"多一条无害条目"，但它说明规则写错了：IPv6 字面量里全是冒号，不能用单冒号规则。
+  const bare = (list) => list.filter((h) => h === ':' || /^\:+$/.test(h));
+  assert.deepStrictEqual(bare(withNoProxy(['::1', '[::1]', 'fe80::1', '[fe80::1]:8080'])), [],
+    'IPv6 回环/链路本地必须原样保留，不能削成裸冒号：' + JSON.stringify(withNoProxy(['::1'])));
+  assert.ok(withNoProxy(['::1']).includes('::1'), '`::1` 应保留');
+  assert.ok(withNoProxy(['fe80::1']).includes('fe80::1'), '`fe80::1` 应原样保留');
+  // URL 形态：Node 的 hostname 对 IPv6 返回**带方括号**的（实测确认）
+  const gm2 = new GatewayManager({ dataDir: dir, logger: { info: () => {} }, settings: null });
+  fs.writeFileSync(gm2.configPath, JSON.stringify({
+    port: 3099, apiKey: 'k',
+    proxy: { enabled: true, url: 'http://127.0.0.1:7890', noProxy: ['http://[::1]:8080/v1'] },
+    providers: [{ id: 'p', baseURL: 'http://[::1]:8080/v1', enabled: true }],
+  }), 'utf8');
+  const l2 = gm2.computeNoProxy().split(',');
+  assert.ok(l2.includes('::1'), 'URL 形态的 IPv6 应归一为 `::1`：' + JSON.stringify(l2));
+  assert.deepStrictEqual(bare(l2), [], 'URL 形态也不能产出裸冒号：' + JSON.stringify(l2));
+  // 其余四类归一（审计实测：它们各自让"直连"失效，与用户意图相反）
+  assert.ok(withNoProxy(['example.org:8080']).includes('example.org'), '应剥掉端口');
+  assert.ok(withNoProxy(['*.example.com']).includes('example.com'), '应剥掉通配前缀');
+  assert.ok(withNoProxy(['.example.com']).includes('example.com'), '应剥掉前导点');
+  assert.ok(withNoProxy(['API.Example.COM']).includes('api.example.com'), '应小写化（EnvHttpProxyAgent 不做大小写归一）');
+});
+
+t('computeNoProxy：forceProxy 按父/子域剔除（只删字面量相同的条目会漏）', async () => {
+  const dir = fs.mkdtempSync(path.join(tmp, 'forceproxy-'));
+  const gm = new GatewayManager({ dataDir: dir, logger: { info: () => {} }, settings: null });
+  const build = (noProxy, forceProxy) => {
+    fs.writeFileSync(gm.configPath, JSON.stringify({
+      port: 3099, apiKey: 'k',
+      proxy: { enabled: true, url: 'http://127.0.0.1:7890', noProxy, forceProxy },
+      providers: [],
+    }), 'utf8');
+    return gm.computeNoProxy().split(',');
+  };
+  // 用户写父域、清单里是子域（很常见）→ 旧实现只 delete 字面量相同的那个，父域留着 → 该家照走直连
+  assert.ok(!build(['api.example.com'], ['example.com']).includes('api.example.com'),
+    'forceProxy 写父域时应把子域条目也剔掉：' + JSON.stringify(build(['api.example.com'], ['example.com'])));
+  // 大小写变体（旧实现 delete 一个 Set 里根本不存在的大小写形态 → 空操作）
+  assert.ok(!build(['API.Example.com'], ['api.example.com']).includes('api.example.com'),
+    '大小写变体也应命中：' + JSON.stringify(build(['API.Example.com'], ['api.example.com'])));
+  // 回环恒不可被剔除（否则网关自己的 /health 自检会被塞进代理）
+  assert.ok(build([], ['127.0.0.1']).includes('127.0.0.1'), '回环不得被 forceProxy 剔除');
+});
+
 run();
