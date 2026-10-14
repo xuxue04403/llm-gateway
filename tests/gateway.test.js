@@ -1905,6 +1905,23 @@ let upstreamPort = 0;
           res.end(JSON.stringify({ error: { message: "Model '" + (body && body.model) + "' is at its concurrency limit (32); please retry later" } }));
           return;
         }
+        // 2026-10-14：商汤 sensenova 对 RPM/TPM 限流的**真实形态** ——
+        // 措辞里写着额度类的 `insufficient_quota`，但语义是瞬时限流。
+        // 旧实现被 WORKBUDDY_CREDIT_RE 里的 `insufficient[_a-z]*quota` 抓成"欠费"→ 锁 1800 秒。
+        if (behavior === 'quota429') {
+          res.writeHead(429, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: {
+            message: opts.quotaMsg || 'inference exceeds tpm/rpm limit',
+            type: 'rate_limit_error', code: 'insufficient_quota',
+          } }));
+          return;
+        }
+        // 真·欠费（余额为 0）：措辞是 credit/balance，**不含**速率字样 → 必须仍判长期。
+        if (behavior === 'broke402') {
+          res.writeHead(429, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: opts.brokeMsg || 'credit insufficient balance: balance=0' } }));
+          return;
+        }
         if (behavior === 'err500') {
           res.writeHead(500, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: { message: 'internal error' } }));
@@ -5404,6 +5421,49 @@ let upstreamPort = 0;
         '临时额度类必须说"仅冷却该模型"（旧日志谎称"冷却该家"）：' + logText.slice(-500));
       assert.ok(/breaker OPEN: tmpquota\[test-model\]/.test(logText),
         '连续 3 次后必须开模型级闸（旧实现 0 次开闸）：' + logText.slice(-800));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('sensenova：限流被写成 insufficient_quota → 必须判「短期限流」，不能判成欠费锁 30 分钟', async () => {
+    // 2026-10-14 实测事故：本机 sensenova 连续 5 天不可用，最后一次成功停在 10-09 09:55。
+    // 商汤对 RPM/TPM 限流回的是：
+    //   429 {"error":{"message":"inference exceeds tpm/rpm limit","type":"rate_limit_error",
+    //                   "code":"insufficient_quota"}}
+    // `insufficient_quota` 命中 WORKBUDDY_CREDIT_RE 的 `insufficient[_a-z]*quota`
+    // → 判成 credit（欠费）→ **冷却 1800 秒**；而它其实是几十秒就恢复的瞬时限流。
+    // 两把 Key 轮流被锁 → 整家静默失能 → 每条请求都只能跳过它。
+    // 这条用例钉住"限流=短期、欠费=长期"必须分开。
+    const sniff = 'inference exceeds tpm/rpm limit';
+    const up = await startFakeOpenAIUpstream({ script: ['quota429', 'quota429', 'quota429', 'quota429'], quotaMsg: sniff });
+    const prov = openaiProvider('sensenova', up, { priority: 1, apiKeys: ['k1', 'k2'] });
+    const gw = await startGatewayWith([prov], 'ssnova', {
+      DSH_GATEWAY_ACCOUNT_RATE_COOLDOWN_MS: '2000',
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      for (let i = 0; i < 3; i++) await call({ port: gw.port });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      // 关键断言：**不能**出现 credit（那意味着锁 30 分钟）
+      assert.ok(!/标记为 credit/.test(logText),
+        '限流**不得**被判成 credit/欠费（旧实现就是这样，把两把 Key 各锁 1800 秒）：' + logText.slice(-800));
+      assert.ok(/标记为 rate/.test(logText),
+        '应按短期限流冷却（几十秒即恢复）：' + logText.slice(-800));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('sensenova 负例：真正的余额不足仍必须判「长期」（别把欠费也一起放成短期）', async () => {
+    // 修上面的误判时最容易犯的错：把 `insufficient_quota` 从 credit 名单里整个删掉，
+    // 于是真正的欠费也变成短期冷却 → 每 90 秒白撞一次余额为 0 的墙。
+    // 真·欠费的正文是 credit/balance 措辞、**不含**速率字样，必须仍判长期。
+    const up = await startFakeOpenAIUpstream({ script: ['broke402', 'broke402', 'broke402'], brokeMsg: 'credit insufficient balance: balance=0' });
+    const prov = openaiProvider('broke', up, { priority: 1 });
+    const gw = await startGatewayWith([prov], 'snbroke');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      await call({ port: gw.port });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/credit insufficient balance/.test(logText) || /标记为 credit/.test(logText),
+        '余额为 0 必须走长期状态路径：' + logText.slice(-600));
     } finally { killGw(gw); closeUp(up); }
   });
 

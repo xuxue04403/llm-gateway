@@ -34,6 +34,11 @@ const DECLARED = [
   { name: '<文件头>', why: '顶部注明本文件是 dsh-app 引擎的副本，并指向本脚本复核差异' },
   { name: 'APP_DIR', why: '默认数据目录名 DSHDesktop → llm-gateway（只影响不传 --config 的裸跑）' },
 
+  // —— 2026-10-14：限流措辞被误判成欠费（本机 sensenova 连续 5 天不可用）——
+  { name: 'TRANSIENT_QUOTA_429_RE', why: '新增：「限流被写成额度/配额措辞」的判据。实测商汤对 **RPM/TPM 限流**回 `429 …"code":"insufficient_quota"`，该码命中 WORKBUDDY_CREDIT_RE 的 `insufficient[_a-z]*quota` → 判成欠费 → **冷却 1800 秒**；而它几十秒即恢复，于是两把 Key 轮流被锁、整家静默失能（最后一次成功停在 10-09 09:55）。这条正则把「正文含 tpm/rpm/rate-limit/每分钟」或「错误码是 insufficient_quota / 429003」的 429 先摘出来判成短期限流' },
+  { name: 'PERSISTENT_ACCOUNT_RE', why: '改动：不再让"长期欠费"的判定单独承担 insufficient_quota —— 该措辞已由 TRANSIENT_QUOTA_429_RE 在 classifyAccountFailure **最前面**（必须早于 WORKBUDDY_CREDIT_RE，否则那条分支先 return）翻案成短期限流。正文含 credit/balance/insufficient_user_quota 等真·欠费措辞的仍判长期，语义不变' },
+  { name: 'classifyAccountFailure', why: '改动：在函数**最前面**加 `if (status === 429 && TRANSIENT_QUOTA_429_RE.test(detail)) return \'rate\'`。位置是生死线 —— 放在末尾没用，WORKBUDDY_CREDIT_RE 分支在它之前就 return 了（这是本次修复的第一版错法，已改正）' },
+
   // —— 2026-09-30：客户端仿真 / 防封禁专项改进（依据是官方 SDK/CLI 一手源码）——
   { name: 'clientIdentityOverrides', why: '新增：版本/身份统一覆盖入口（env > 配置 > 默认），避免版本号写死后被上游最低版本门禁拒掉' },
   { name: 'osRelease', why: '新增：os.release() 安全包装，供 UA 与平台头构造使用' },

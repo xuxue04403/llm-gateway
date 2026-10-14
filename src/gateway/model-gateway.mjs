@@ -3438,6 +3438,20 @@ async function aggregateOpenAIStream(upstream, headBytes) {
 const WORKBUDDY_CREDIT_RE = /insufficient credit|credit insufficient|no credit|credit exhausted|credits exhausted|out of credit|quota exceeded|quota exhaust|payment required|credit not enough|not enough credit|insufficient[_ ]?balance|insufficient[_a-z]*quota|exceeded\s+your\s+(?:current\s+)?quota|积分不足|额度不足|余额不足|积分用完|额度用尽|没有积分/i;
 const WORKBUDDY_SESSION_RE = /Offline user session not found|12153|session not found|login expired|重新登录/i;
 function classifyAccountFailure(status, detail) {
+  // ⚠⚠ 2026-10-14：**位置必须在最前面**，而且必须在 WORKBUDDY_CREDIT_RE 之前。
+  //
+  // 实测事故（本机 sensenova 连续 5 天不可用，最后一次成功停在 10-09 09:55）：
+  // 商汤对 **RPM/TPM 限流**回
+  //   `429 {"error":{"message":"inference exceeds tpm/rpm limit","type":"rate_limit_error",
+  //             "code":"insufficient_quota"}}`
+  // `insufficient_quota` 命中 WORKBUDDY_CREDIT_RE 的 `insufficient[_a-z]*quota`
+  // → 被判成 **credit（欠费）→ 冷却 1800 秒**；而它其实是**瞬时限流**，几十秒即恢复。
+  // 两把 Key 轮流被锁 30 分钟 → 整家静默失能 → 网关每条请求都只能跳过它。
+  //
+  // 放最后是没用的：credit 那条分支在它之前 return 了（这是我第一版的错，已改到最前）。
+  // 真正的欠费 429（余额为 0）正文是 `credit insufficient balance: balance=0`，
+  // 含 balance/credit 而**不含**速率字样，仍然按长期状态处理，语义不变。
+  if (status === 429 && TRANSIENT_QUOTA_429_RE.test(String(detail || ''))) return 'rate';
   // 客户端指纹类拒绝**不是账户的问题** → 不能冷却账户（换 Key 一点用都没有），
   // 交给上层按"熔断该供应商"处理（见 failover 里的 CLIENT_FINGERPRINT_RE 分支）。
   // 否则会白白把用户所有可用的 Key 逐把冷却掉，还继续往上打 —— 最坏的画像行为。
@@ -4620,6 +4634,26 @@ const WORKBUDDY_CHANNEL_BLOCK_RE = /"code"\s*:\s*11128|unapproved\s+channel|ille
 const PROVIDER_SIDE_4XX_RE = /credit|balance|insufficient|quota|deposit|billing|unpaid|arrears|recharge|top\s*up|account\s+(?:suspended|disabled|locked|deactivated|banned)|no\s+available\s+(?:channel|quota|balance)|exceeded\s+your\s+(?:current\s+)?quota|not\s+available\s+(?:for|on)\s+your\s+(?:plan|account)|欠费|余额|额度|充值|未开通|无可用(?:渠道|额度)/i;
 /** 其中"余额/欠费"类属于长期状态（充值前不会自愈）→ 用长熔断，避免反复打点 */
 const PERSISTENT_ACCOUNT_RE = /credit|balance|deposit|billing|unpaid|arrears|欠费|余额|充值|budget\s*pool|quota|额度|预算|套餐/i;
+
+/**
+ * 「**限流**被写成了额度/配额措辞」——必须**先于** PERSISTENT_ACCOUNT_RE 判掉。
+ *
+ * 2026-10-14 实测事故（本机 sensenova 连续 5 天不可用、最后一次成功是 10-09 09:55）：
+ * 商汤对 **RPM/TPM 限流**回的是
+ *   `429 {"error":{"message":"inference exceeds tpm/rpm limit","type":"rate_limit_error",
+ *             "code":"insufficient_quota"}}`
+ * 它那句 `insufficient_quota` 命中了 PERSISTENT_ACCOUNT_RE 的 `quota` → 被判成
+ * **"长期欠费"→ 该账户冷却 1800 秒**。而它其实是**瞬时限流**，几十秒后就恢复 ——
+ * 于是这把 Key 被按"欠费"整整锁 30 分钟，多把 Key 轮流被锁，整家静默失能。
+ * （日志实测：key1/key2 各被标 credit 冷却 1800s，随后 `全部账户不可用`。）
+ *
+ * 判据取自实测形态，两条都要认（文案和错误码都会变）：
+ *   · 正文明说是速率/并发限制：tpm / rpm / rate limit / 每分钟 / 并发…
+ *   · 商汤的错误码：`insufficient_quota` + `429003`（它们在限流时用这一族码）
+ * 只在**同时**是 429 时才这样翻案 —— 真正的欠费 429（余额为 0）正文是
+ * `credit insufficient balance: balance=0`，不含速率字样，仍按长期状态处理。
+ */
+const TRANSIENT_QUOTA_429_RE = /(?:tpm|rpm|rate[\s_-]?limit|per\s+minute|too\s+many\s+requests|并发|每分钟|速率)|"code"\s*:\s*"(?:insufficient_quota|429003)"/i;
 
 /**
  * thinking 回传要求（2026-09-16 实测事故：air-outer / agentrouter）。
