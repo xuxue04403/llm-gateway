@@ -13,6 +13,15 @@ out/_test-leak-settings.yaml
 *.bak-llmgateway-before-restore
 *.bak-import
 *.bak-broken
+# ⚠ 2026-10-15：通用 .bak 规则。此前只挡了上面几种固定后缀，
+# 而我临时备份 example 配置时用了 `*.pre-v1.0.0-<时间戳>.bak` —— 直接被提交进库。
+# 备份文件天然可能含真实密钥（配置文件、settings），一律不入库。
+*.bak
+*.bak.*
+*.pre-*.json
+*.pre-*.bak
+# 运行时材料（引擎被 materialize 出来的副本等）
+resources/
 
 # 我用来写 commit message 的临时文件（忘了删就会被提交 —— 已经犯过两次）
 *.txt
