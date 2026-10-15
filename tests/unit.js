@@ -223,6 +223,46 @@ t('datadir.isPlaceholderConfig：真实配置判为非占位', () => {
   assert.strictEqual(datadir.isPlaceholderConfig(real), false);
 });
 
+t('datadir.isPlaceholderConfig：**v1.0.0 预置示例**也必须判为占位（锚点从 provider-a 换成了 9 家预置）', () => {
+  // 2026-10-15 回归：v1.0.0 的示例换成了 9 家真实供应商的预置模板，`provider-a` 锚点消失，
+  // 于是 `isPlaceholderConfig(示例)` 返回 false —— "没动过的出厂示例"被误判成"用户的真实配置"。
+  // 后果：用户点"导入配置"被静默拒绝（只回 `已有真实配置`）。
+  const ex = fs.readFileSync(EXAMPLE_PATH, 'utf8');
+  assert.strictEqual(datadir.isPlaceholderConfig(ex), true, '出厂示例必须仍被判为占位');
+
+  // 边界①：预置家 + 停用 + 占位 Key → 占位
+  assert.strictEqual(datadir.isPlaceholderConfig(JSON.stringify({ providers: [
+    { id: 'sensenova', baseURL: 'https://token.sensenova.cn/v1', apiKey: 'sk-llm-gatway-xxxxxxxx', enabled: false },
+    { id: 'opencode-go', baseURL: 'https://opencode.ai/zen/go', apiKey: 'sk-llm-gatway-xxxxxxxx', enabled: false },
+  ] })), true, '预置家 + 全停用 + 占位 Key = 没动过的模板');
+
+  // 边界②：**启用**了任意一家 → 用户动过了 → 真实配置（绝不覆盖）
+  assert.strictEqual(datadir.isPlaceholderConfig(JSON.stringify({ providers: [
+    { id: 'sensenova', baseURL: 'https://token.sensenova.cn/v1', apiKey: 'sk-llm-gatway-xxxxxxxx', enabled: true },
+  ] })), false, '★ 启用任意一家 = 用户的选择 → 绝不覆盖');
+
+  // 边界③：填了**真实 Key**（哪怕仍停用）→ 真实配置
+  assert.strictEqual(datadir.isPlaceholderConfig(JSON.stringify({ providers: [
+    { id: 'sensenova', baseURL: 'https://token.sensenova.cn/v1', apiKey: 'sk-' + 'c'.repeat(40), enabled: false },
+  ] })), false, '★ 填过真实 Key → 绝不覆盖');
+
+  // 边界④：accounts 里填了真实 Key 同样算真实（workbuddy 那类走 accounts 的家）
+  assert.strictEqual(datadir.isPlaceholderConfig(JSON.stringify({ providers: [
+    { id: 'workbuddy', baseURL: 'https://copilot.tencent.com/v2', auth: 'workbuddy', enabled: false,
+      accounts: [{ id: 'acct1', apiKey: 'sk-' + 'd'.repeat(40) }] },
+  ] })), false, '★ accounts 里的真实 Key 同样算真实配置');
+
+  // 边界⑤：出现**非预置**家（用户自己加的中转）→ 真实配置
+  assert.strictEqual(datadir.isPlaceholderConfig(JSON.stringify({ providers: [
+    { id: 'my-relay', baseURL: 'https://relay.example.org/v1', apiKey: 'sk-llm-gatway-xxxxxxxx', enabled: false },
+  ] })), false, '★ 用户自建家 → 绝不覆盖');
+
+  // 边界⑥：codex 供应商（机器提供鉴权、无 Key）不得被误判成占位
+  assert.strictEqual(datadir.isPlaceholderConfig(JSON.stringify({ providers: [
+    { id: 'codex-sub', baseURL: 'https://x/v1', auth: 'codex', enabled: true },
+  ] })), false, 'codex 供应商是合法真实配置');
+});
+
 t('datadir.importGatewayConfig：目标已是真实配置时不动（返回 skipped）', () => {
   const dir = fs.mkdtempSync(path.join(tmp, 'dd-'));
   const real = JSON.stringify({

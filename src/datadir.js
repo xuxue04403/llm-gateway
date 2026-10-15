@@ -113,6 +113,43 @@ const SAMPLE_URL_RE = /^https?:\/\/(api\.example\d?\.com|copilot\.tencent\.com|a
 /** 示例专属 id：真实用户不会这么命名（这是判定的**锚点**）。 */
 const SAMPLE_ANCHOR_RE = /^provider-[a-z]\d*$/i;
 
+/* 2026-10-15（v1.0.0 回归修复）：上面那套锚点（`provider-a`）只认**旧版**出厂示例。
+ *
+ * v1.0.0 的示例换成了 9 家**真实供应商**的预置模板（全部停用 + 统一占位 Key），
+ * `provider-a` 锚点随之消失 → `isPlaceholderConfig(示例)` 返回 **false**，
+ * 也就是把"没动过的出厂示例"误判成"用户的真实配置"。后果（实测）：
+ *   · 首次运行/升级时不再自动导入既有配置（main.js 先 import 再 init，全新安装侥幸不受影响）；
+ *   · 用户点"导入配置"被静默拒绝 —— 界面只回 `已有真实配置`，而那份配置明明一个字都没改过。
+ *
+ * 现在补一条**同样正向**的识别：预置 id 全命中 + **全部停用** + **没有任何真实 Key**。
+ * 仍然保守到底 —— 用户启用任意一家、或填过任意一个真实 Key，就判为真实配置，绝不覆盖。
+ * 漏判的代价只是示例没被替换（用户看得见）；误判的代价是用户数据没了。 */
+const PRESET_PROVIDER_IDS = new Set([
+  'sensenova', 'agentrouter', 'commandcode', 'amd', 'opencode-go',
+  'nvidia', 'cline', 'workbuddy', 'agnes',
+]);
+/** 占位凭据特征（与 looksReal 里那组同源，改一处必须两处一起改）。 */
+const PLACEHOLDER_KEY_RE = /change[-_]?me|xxxx|yyyy|在此填入|your[_-]?key|placeholder/i;
+
+/**
+ * 是不是 **v1.0.0 起的出厂示例**（预置 9 家、全部停用、Key 全是占位串）。
+ * 每一家都必须同时满足三条；任何一条不满足就判为"用户的真实配置"。
+ */
+function isShippedPresetExample(ps) {
+  return ps.every((p) => {
+    if (!p || typeof p !== 'object') return false;
+    if (!PRESET_PROVIDER_IDS.has(String(p.id || ''))) return false;   // 出现非预置家 = 用户加的
+    if (p.enabled !== false) return false;                           // 启用任意一家 = 用户动过了
+    // 没有任何"真实"凭据：顶层 apiKey / apiKeys / accounts[].apiKey 都必须是占位串或缺席。
+    // （workbuddy 这类由本机程序提供鉴权的家本来就没有 Key，这里是合法的空集。）
+    const keys = [p.apiKey]
+      .concat(Array.isArray(p.apiKeys) ? p.apiKeys : [])
+      .concat((Array.isArray(p.accounts) ? p.accounts : []).map((a) => (a && (a.apiKey || a.key)) || ''))
+      .filter(Boolean).map(String);
+    return keys.every((k) => PLACEHOLDER_KEY_RE.test(k));
+  });
+}
+
 /**
  * 判断一份网关配置是不是"出厂示例"而不是用户的真实配置。
  *
@@ -152,12 +189,16 @@ function isPlaceholderConfig(text) {
     // ⚠ 注意与"有供应商但全停用"的区别：那才是有数据、必须保护（见下方 every 判定）。
     return true;
   }
-  // ① 锚点：没有示例专属 id，就不是出厂示例
-  if (!ps.some((p) => p && SAMPLE_ANCHOR_RE.test(String(p.id || '')))) return false;
-  // ② 每一项都必须落在示例范围内
-  return ps.every((p) => p && typeof p === 'object'
-    && SAMPLE_PROVIDER_IDS.has(String(p.id || ''))
-    && SAMPLE_URL_RE.test(String(p.baseURL || '')));
+  // ① 旧版示例：以 `provider-a` 这类示例专属 id 为锚点
+  if (ps.some((p) => p && SAMPLE_ANCHOR_RE.test(String(p.id || '')))) {
+    // 每一项都必须落在示例范围内
+    return ps.every((p) => p && typeof p === 'object'
+      && SAMPLE_PROVIDER_IDS.has(String(p.id || ''))
+      && SAMPLE_URL_RE.test(String(p.baseURL || '')));
+  }
+  // ② 新版（v1.0.0 起）示例：预置 9 家真实供应商，全部停用、Key 全占位。
+  // 没有这条，出厂示例会被误判成"用户的真实配置"（见 PRESET_PROVIDER_IDS 上方的事故说明）。
+  return isShippedPresetExample(ps);
 }
 
 /**

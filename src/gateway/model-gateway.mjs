@@ -6237,8 +6237,27 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         return rawMode ? { retryable: upstream.status } : false;
       }
       const status = DETERMINISTIC_4XX_STATUS[upstream.status] || 400;
-      log(`upstream ${provider.id} 确定性 4xx HTTP ${upstream.status} → 终止 failover（回 ${status}，不回显上游原文）`);
-      return { stop: { status, upstreamStatus: upstream.status } };
+      // ⚠ rawMode（Responses 子资源路由：GET/DELETE/cancel）保持**原语义**不变：
+      // 那里换家没有意义（"这个 response id 在别家不存在"），调用方按资源语境回错误。
+      if (rawMode) {
+        log(`upstream ${provider.id} 确定性 4xx HTTP ${upstream.status} → 终止 failover（回 ${status}，不回显上游原文）`);
+        return { stop: { status, upstreamStatus: upstream.status } };
+      }
+      log(`upstream ${provider.id} 确定性 4xx HTTP ${upstream.status} → 记为候选失败，**继续 failover**（回 ${status}，不回显上游原文）`);
+      // 2026-10-15（用户明确要求）：**不再 terminate**，而是记下"最后那个确定性 4xx"并继续走完候选。
+      //
+      // 旧行为（"确定性 4xx 一律终止 failover"）的代价在实测里非常具体：commandcode 偶尔回
+      //   HTTP 400 {"error":{"message":"{\"message\":\"invalid request error trace_id: …\"}"}}
+      // 而它**不是**请求侧问题 —— 同一家同一模型前后各一次都 200（实测 14:54:10 成功 →
+      // 14:54:25 这个 400 → 14:54:19 又成功）。旧实现就地 return 终止 → 用户整轮任务拿到 400 而死，
+      // 而 amd / x666 / cline / nvidia / muyuan.do 这些候选**一次都没被尝试**。
+      //
+      // 用户要求：任何一家失败都必须继续按优先级往下走，"最终由 commandcode 兜底"。
+      // 因此这里改成：记住这次失败（含状态码），继续 for 循环；只有**全部候选都失败**时，
+      // 调用方才把记下的确定性 4xx（优先于泛化的 503 "all providers unavailable"）回给客户端 ——
+      // 这样既保住了"N 倍计费"的顾虑，又不会让优先级高的一家的抽风打死整轮任务。
+      breakerReleaseSlot(provider.id, bModel);   // 上游连接性是健康的 → 交还半开名额（不清失败计数）
+      return { deterministic4xx: { status, upstreamStatus: upstream.status } };
     }
     log(`upstream ${provider.id} HTTP ${upstream.status} 判定为内容拦截 → 继续 failover（换供应商/降敏）`);
     return false;
@@ -6458,18 +6477,24 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     };
   }
   // success: stream through
-  try {
+  // 2026-10-15（用户规则：任何一家失败都要继续往下走）：**惰性写响应头**。
+  //
+  // 旧实现无条件先 writeHead —— 一旦写出 `res.headersSent` 即为真，调用方的
+  // `if (res.headersSent) return` 守卫就把 failover 彻底挡死。于是"上游接了连接、
+  // 回了 200 头，然后一个字节都不发就断开"这种形态（实测 commandcode 42 秒后被掐断、
+  // 已产出 0 字符）只能就地报错，其余候选一次都不试。
+  // 现在把写头推迟到"真的要有正文写出去"的那一刻；若到死都没有正文，就一个字节都不写，
+  // 由下面的 `if (!headWritten)` 分支交回 failover。
+  let headWritten = false;
+  const writeHeadOnce = () => {
+    if (headWritten) return;
+    headWritten = true;
     res.writeHead(upstream.status, {
       'content-type': ctype,
       'cache-control': 'no-cache',
       'access-control-allow-origin': '*',
     });
-  } catch (writeHeadErr) {
-    log(`client disconnected before headers: ${writeHeadErr.message}`);
-    try { await upstream.body?.cancel(); } catch { }
-    res.destroy();
-    return false;
-  }
+  };
   // ④ 解码速度计量：只统计"真正流出正文"的那段时间（reasoning token 剔除，见上方说明）。
   // 内存上界 8KB，不随流长度增长；失败绝不影响转发。
   // ⚠ 必须建在 pendingHead 补发**之前**：偷看过的首事件是直接写给客户端的，
@@ -6485,7 +6510,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     if (opts && typeof opts.onSniff === 'function') {
       try { opts.onSniff(pendingHead.toString('utf8')); } catch { /* 忽略 */ }
     }
-    try { res.write(pendingHead); } catch { /* 客户端可能已断开，下面循环会兜住 */ }
+    try { writeHeadOnce(); res.write(pendingHead); } catch { /* 客户端可能已断开，下面循环会兜住 */ }
   }
   if (bodyStream) {
     const reader = bodyStream.getReader();
@@ -6567,6 +6592,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
           // D10（审计修复）：write 返回 false = 下游内部缓冲已满（慢客户端 + 快上游）。
           // 旧实现丢弃返回值继续读上游 → 缓冲无上限增长（网关内存暴涨直至 OOM）。
           // 现在等待 drain 或客户端断开后再继续读，把背压如实传回上游。
+          writeHeadOnce();   // 惰性写头：到这一刻（真有正文要写）才写出去
           if (res.write(Buffer.from(value)) === false) {
             await new Promise((resolve) => {
               const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
@@ -6614,6 +6640,16 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     if (dec) log(`[decode] ${(body && body.model) || '(no model)'} via=${provider.id} ${decodeMeterText(dec)}`);
   }
   if (res.destroyed || res.writableEnded) return false;
+  // 2026-10-15（用户规则）：**一个字节正文都没写出去**时不该就地判死，应换下一家。
+  // 现场：上游回了 200 头就断开（零 SSE 帧），旧实现会写一个 error 事件收尾 → 用户拿到
+  // "上游响应被中断"，而其余候选一次都没试。零交付意味着客户端还什么都没收到，
+  // 换一家重发是安全且正确的（惰性写头保证了此时 headersSent 仍为假）。
+  if (!headWritten) {
+    log(`直通路径：上游 ${provider.id} 未发送任何正文就被断开`
+      + '（响应头已回但零 SSE 帧）→ **尚未向客户端写入任何内容**，交回 failover 让下一家接手');
+    try { if (opts && typeof opts.onFirstEmpty === 'function') opts.onFirstEmpty(); } catch { /* 忽略 */ }
+    return false;
+  }
   // ⚠ 上游被干净腰斩 → 明确告知客户端，别让它以为答完了（见上面 tail 的说明）。
   // 响应头与部分内容**已经发出**，所以不能改状态码，只能补一个协议内的错误事件。
   if (isSseStream() && !tailHasTerminal()) {
@@ -8414,7 +8450,7 @@ function sseWrite(res, type, payload) {
  * @param {object} o { res, upstream, model, inputTokens, onDone }
  * @returns {Promise<{ok:boolean, usage?:object, text?:string}>} 聚合结果（非流式客户端用它拼完整消息）
  */
-async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTokens, aggregateOnly, headBytes }) {
+async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTokens, aggregateOnly, headBytes, writeHeadOnce }) {
   const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
@@ -8428,6 +8464,26 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
   const toolCalls = new Map();  // index → { id, name, args }
   const toolCallState = { last: 0 };   // 第二轮审计修复：缺 index 的分片按"新调用/续片"分流，不再一律落 0
   let usage = null;
+
+  // 2026-10-15（用户实测事故）：**翻译路径此前没有任何空闲超时**。
+  //
+  // 直通路径（forward）早就有 IDLE_READ_MS=90s 的看门狗，这条路径一直漏着 ——
+  // 上游"连上了、响应头也回来了，然后一个字节都不吐"（反代挂起 / 供应商排队卡死）时，
+  // `reader.read()` 会**永远不返回**：客户端无限等待、连接与半开探测名额都被占着，
+  // 而日志里**一行都不会有**（这正是"调用卡住/任务莫名中断"最难查的形态）。
+  // 这里补上同一口径的看门狗：到点取消 reader，让下面的收尾逻辑如实报"回复不完整"。
+  const IDLE_READ_MS = 90_000;
+  let lastRead = Date.now();
+  let idleFired = false;
+  const idleTimer = setInterval(() => {
+    if (Date.now() - lastRead > IDLE_READ_MS) {
+      log(`流翻译：上游 ${IDLE_READ_MS}ms 无数据（首字节为空转或中途卡死）→ 主动断开`
+        + `（已产出 ${outText.length} 字符；让客户端尽快知道要重试，而不是无限等待）`);
+      idleFired = true;
+      clearInterval(idleTimer);
+      try { reader.cancel(); } catch { /* 忽略 */ }
+    }
+  }, 5000);
 
   const startBlock = (kind, block) => {
     blockIndex++;
@@ -8445,6 +8501,10 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
     if (started) return;
     started = true;
     if (!aggregateOnly) {
+      // 2026-10-15：响应头是**惰性**的 —— 到这一刻（第一条真正要写的内容）才写出去。
+      // 这样"上游接上却一个字节都不吐、随后被掐断"时，客户端还没收到任何东西，
+      // 调用方可以安全地 failover 到下一家（见 truncation 分支的 deliveredNothing）。
+      try { if (typeof writeHeadOnce === 'function') writeHeadOnce(); } catch { /* 忽略 */ }
       sseWrite(res, 'message_start', {
         type: 'message_start',
         message: {
@@ -8606,11 +8666,13 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
       // eslint-disable-next-line no-await-in-loop
       const { done, value } = await reader.read();
       if (done) break;
+      lastRead = Date.now();   // 看门狗口径：只认"真的读到了数据"
       feed(decoder.decode(value, { stream: true }));
     }
   } catch (e) {
     log(`流翻译读取失败：${e && e.message}`);
   } finally {
+    clearInterval(idleTimer);   // ⚠ 必须在 finally 里清：正常结束/异常/客户端断开三条路都要清
     try { res.removeListener('close', onClose); } catch { /* 忽略 */ }
     try { reader.releaseLock(); } catch { /* 忽略 */ }
   }
@@ -8668,8 +8730,30 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
   // 这正是用户报的"任务会不时的自动终止，但是不会报任何错误"（2026-10-09）。
   // 日志侧的印证：`stream-broken: 0`、`status=fail: 0` —— 这种截断从未被记录过。
   if (!finished) {
+    // 2026-10-15（用户实测事故）：**一个字节都没交付**时不该就地判死，应该换下一家。
+    //
+    // 现场（用户 16:17:51 实测）：commandcode 收下请求、42 秒后被掐断 ——
+    //   `流翻译读取失败：terminated` + `已产出 0 字符`。
+    // 旧实现照样走下面的分支：先 ensureStart() 写出 message_start（= 向客户端宣告"开始了"），
+    // 再发一个 error 事件收尾 → 用户看到"本轮运行失败：上游响应被中断…"，
+    // **而 amd / x666 / cline / nvidia / muyuan.do 这些候选一次都没被尝试**。
+    //
+    // 用户要求：任何一家失败都要继续按优先级往下走。这里"零字节交付"正是可以安全 failover 的
+    // 情形 —— 客户端还没收到任何内容块，换一家重发不会造成"两个回复拼在一起"。
+    // 判定用 `started`（= ensureStart 是否已经写过 message_start）：它为假说明
+    // 除了 HTTP 响应头之外什么都没发。
+    const deliveredNothing = !started;
     log(`流翻译：上游流被截断（未收到 finish_reason / [DONE] / usage 收尾帧）`
-      + `—— 已产出 ${outText.length} 字符；明确告知客户端"回复不完整"`);
+      + `—— 已产出 ${outText.length} 字符`
+      + (idleFired ? '（因上游长时间无数据被网关主动断开）' : '')
+      + (deliveredNothing && !aggregateOnly
+        ? '；**尚未向客户端写入任何内容** → 交回 failover，让下一家候选接手'
+        : '；明确告知客户端"回复不完整"'));
+    if (deliveredNothing && !aggregateOnly) {
+      // 未写任何内容 → 返回 falsy 触发 failover（调用方有 headersSent 守卫；
+      // 而"零内容"恰恰意味着响应体还没开始，守卫不会拦住我们 —— 见调用处的惰性写头）。
+      return { ok: false, truncated: true, deliveredNothing: true, usage: anthropicUsage(usage, inputTokens || 0, 0) };
+    }
     ensureStart();
     closeBlock();
     if (!aggregateOnly) {
@@ -9083,8 +9167,13 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         return false;
       }
       const status = DETERMINISTIC_4XX_STATUS[upstream.status] || 400;
-      log(`upstream ${provider.id} 确定性 4xx HTTP ${upstream.status} → 终止 failover（回 ${status}，不回显上游原文）`);
-      return { stop: { status, upstreamStatus: upstream.status } };
+      log(`upstream ${provider.id} 确定性 4xx HTTP ${upstream.status} → 记为候选失败，**继续 failover**（回 ${status}，不回显上游原文）`);
+      // 2026-10-15（用户明确要求）：与直通路径同一处修正 —— **不再终止 failover**。
+      // 详见 forward() 里那条同源注释：commandcode 的瞬时 400（`invalid request error trace_id`）
+      // 被当成"请求本身有错"时，用户整轮任务直接拿到 400，而其余候选一次都没被尝试。
+      // 这条路是 Anthropic 客户端 → OpenAI 上游，**DSH 走得最多的那条**。
+      breakerReleaseSlot(provider.id, bModel);   // 上游连接性是健康的 → 交还半开名额（不清失败计数）
+      return { deterministic4xx: { status, upstreamStatus: upstream.status } };
     }
 
     // 成功：OpenAI 响应 → Anthropic
@@ -9159,12 +9248,26 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
           try { peekReader.releaseLock(); } catch { /* 已释放/已取消 → 忽略 */ }
         }
         if (wantsStream && !opts?.aggregateOnly) {
-          res.writeHead(200, {
-            'content-type': 'text/event-stream; charset=utf-8',
-            'cache-control': 'no-cache',
-            'access-control-allow-origin': '*',
-          });
-          const r = await translateOpenAIStreamToAnthropic({ res, upstream, model: body.model, inputTokens, aggregateOnly: false, headBytes });
+          // 2026-10-15（用户实测事故）：**惰性写响应头**。
+          //
+          // 旧实现无条件先 `res.writeHead(200, …)` —— 一旦写出，`res.headersSent` 即为真，
+          // 于是"流在零内容时被掐断"就**再也无法 failover**（调用方的 headersSent 守卫会拦下），
+          // 用户只能拿到 `event: error`，而其余候选一次都没试。
+          // 现场：commandcode 收下请求、42 秒后被掐断，`已产出 0 字符`（16:17:51 实测）。
+          //
+          // 现在把写头推迟到"真的要有内容写出去"的那一刻（见翻译函数里的 writeHeadOnce 调用）。
+          // 若整个流到死都没有内容，就一个字节都不写 → 交回 failover 让下一家接手。
+          let headWritten = false;
+          const writeHeadOnce = () => {
+            if (headWritten) return;
+            headWritten = true;
+            res.writeHead(200, {
+              'content-type': 'text/event-stream; charset=utf-8',
+              'cache-control': 'no-cache',
+              'access-control-allow-origin': '*',
+            });
+          };
+          const r = await translateOpenAIStreamToAnthropic({ res, upstream, model: body.model, inputTokens, aggregateOnly: false, headBytes, writeHeadOnce });
           recUsage(r && r.usage, r && r.ok ? 'ok' : 'fail');
           return r.ok ? true : false;
         }
@@ -9469,6 +9572,9 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
   //    候选顺序 = priority 升序、同级按配置数组顺序（见 providersForModel）
   //  - "round-robin"：轮询——同一模型每次请求从不同起点开始，流量分摊到各家；失败同样切下一家
   let tryOrder = ordered;
+  // 2026-10-15：本轮的"确定性 4xx"记忆（见下方 `out.deterministic4xx` 分支）。
+  // 只有全部候选都失败时才用它回客户端 —— 它比泛化的 503 更有诊断价值。
+  let lastDeterministic4xx = null;
   if (cfg.routing === 'round-robin' && ordered.length > 1) {
     // 审计修复（P3）：rrCounters 的 key 是**客户端可控**的 model 字符串——无界增长。
     // 加一个粗粒度上限（超限即整体重置，轮询起点偏差可忽略）。
@@ -9576,12 +9682,36 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
         : stopFailoverMessage(p.id, model, out.stop.upstreamStatus);
       return json(res, out.stop.status, { error: { message: msg } });
     }
+    // 2026-10-15（用户明确要求）：确定性 4xx 只**记住**，不终止 —— 继续走完剩余候选。
+    //
+    // 为什么不能就地终止：实测 commandcode 会对同一个模型、同一份请求**偶尔**回
+    //   HTTP 400 {"error":{"message":"{\"message\":\"invalid request error trace_id: …\"}"}}
+    // 而它是上游自己的抽风（前后各一次都 200）。旧实现就地 return 400 → 用户整轮任务被打死，
+    // 而 amd / x666 / cline / nvidia / muyuan.do 一次都没被尝试。
+    // 现在：先把错误记下来，继续 for；只有**全部候选都失败**时，才把最后那个确定性 4xx
+    // 回给客户端（比泛化的 503 "all providers unavailable" 更有诊断价值）。
+    if (out && out.deterministic4xx) {
+      if (!lastDeterministic4xx) lastDeterministic4xx = { ...out.deterministic4xx, providerId: p.id };
+      log(`upstream ${p.id} 确定性 4xx HTTP ${out.deterministic4xx.upstreamStatus}`
+        + ` → 已记下并继续尝试其余候选（不终止本轮任务）`);
+    }
     // R25（审计修复）：响应头已发出（流中途失败/客户端断开）→ failover 无意义，
     // 继续只会对剩余供应商重复计费/风控
     if (res.headersSent || res.destroyed) {
       logCall('stream-broken', 'fail');
       return;
     }
+  }
+  // 走完全部候选仍无一家成功。若期间见过"确定性 4xx"，优先回它 ——
+  // 它比泛化的 503 更能说明问题（且与旧行为对客户端的状态码保持兼容）。
+  if (lastDeterministic4xx) {
+    log(`failover exhausted (${model})：全部候选失败，回最后一次确定性 4xx`
+      + `（via ${lastDeterministic4xx.providerId} HTTP ${lastDeterministic4xx.upstreamStatus}`
+      + ` → ${lastDeterministic4xx.status}）`);
+    logCall(`via=${lastDeterministic4xx.providerId}`, 'fail:' + lastDeterministic4xx.status);
+    return json(res, lastDeterministic4xx.status, {
+      error: { message: stopFailoverMessage(lastDeterministic4xx.providerId, model, lastDeterministic4xx.upstreamStatus) },
+    });
   }
   logCall('all-providers', 'fail');
   json(res, 503, { error: { message: `all providers for model "${model}" are unavailable` } });
@@ -9817,6 +9947,9 @@ async function handleMessages(cfg, req, res, body) {
   }
 
   let tryOrder = ordered;
+  // 2026-10-15：本轮的"确定性 4xx"记忆（见下方 `out.deterministic4xx` 分支）。
+  // 只有全部候选都失败时才用它回客户端 —— 它比泛化的 503 更有诊断价值。
+  let lastDeterministic4xx = null;
   if (cfg.routing === 'round-robin' && ordered.length > 1) {
     // 审计修复（P3）：rrCounters 的 key 是**客户端可控**的 model 字符串——无界增长。
     // 加一个粗粒度上限（超限即整体重置，轮询起点偏差可忽略）。
@@ -9888,11 +10021,31 @@ async function handleMessages(cfg, req, res, body) {
           : stopFailoverMessage(p.id, model, out.stop.upstreamStatus),
       } });
     }
+    // 2026-10-15（用户明确要求）：确定性 4xx 只**记住**，不终止 —— 继续走完剩余候选。
+    // 与 handleCompletion 同一处修正（详见那里的注释）：commandcode 的瞬时 400
+    // 曾被当成"请求本身有错"而就地终止，用户整轮任务拿到 400 而死。
+    // ⚠ 这条路是 Anthropic 客户端 → OpenAI 上游，**DSH 走得最多的那条**。
+    if (out && out.deterministic4xx) {
+      if (!lastDeterministic4xx) lastDeterministic4xx = { ...out.deterministic4xx, providerId: p.id };
+      log(`upstream ${p.id} 确定性 4xx HTTP ${out.deterministic4xx.upstreamStatus}`
+        + ` → 已记下并继续尝试其余候选（不终止本轮任务）`);
+    }
     // R25（审计修复）：响应头已发出（流中途失败/客户端断开）→ failover 无意义
     if (res.headersSent || res.destroyed) {
       logCall('stream-broken', 'fail');
       return;
     }
+  }
+  // 走完全部候选仍无一家成功：见过确定性 4xx 就优先回它（与旧行为的状态码保持兼容）。
+  if (lastDeterministic4xx) {
+    log(`failover exhausted (${model})：全部候选失败，回最后一次确定性 4xx`
+      + `（via ${lastDeterministic4xx.providerId} HTTP ${lastDeterministic4xx.upstreamStatus}`
+      + ` → ${lastDeterministic4xx.status}, anthropic）`);
+    logCall(`via=${lastDeterministic4xx.providerId}`, 'fail:' + lastDeterministic4xx.status);
+    return json(res, lastDeterministic4xx.status, { type: 'error', error: {
+      type: lastDeterministic4xx.status >= 500 ? 'api_error' : 'invalid_request_error',
+      message: stopFailoverMessage(lastDeterministic4xx.providerId, model, lastDeterministic4xx.upstreamStatus),
+    } });
   }
   logCall('all-providers', 'fail');
   json(res, 503, { type: 'error', error: { type: 'api_error', message: `all providers for model "${model}" are unavailable` } });

@@ -980,8 +980,162 @@ let upstreamPort = 0;
   const killGw = (g) => { try { g.proc.kill(); } catch { } };
   const closeUp = (u) => { try { u.server.close(); } catch { } };
 
-  // ---- 修复项 1：确定性 4xx 终止 failover（不再 N 倍重发 / 不再回 503）----
-  t('网关：上游确定性 400 → 只打一次上游、客户端拿 400（旧版会重发给每一家并回 503）', async () => {
+  t('网关（2026-10-15 用户规则）：高优先级家回"确定性 400"不再打死任务 —— 继续走完候选，由下一家（最终 commandcode）兜底', async () => {
+    // 用户原话："即使 commandcode 排在了 sensenova 和 amd 后面，调用时也不应该失败了就直接中断，
+    // 而应该继续按优先级往下调用，最终 commandcode 兜底！！"
+    //
+    // 实测形态（commandcode 14:54:25 / 12:27:02）：它会对同一模型偶尔回
+    //   HTTP 400 {"error":{"message":"{\"message\":\"invalid request error trace_id: …\"}"}}
+    // 而前后各一次都 200 —— 这是**上游抽风**，不是"你的请求有问题"。
+    const up1 = await startFakeUpstream({
+      status: 400,
+      errorBody: { error: { message: '{"message":"invalid request error trace_id: d5b7e8fa57bfc14bf228cb87d61db6fc","type":"invalid_request_error"}' } },
+    });
+    const up2 = await startFakeUpstream({ status: 500, errorBody: { error: { message: 'temporarily down' } } });
+    const up3 = await startFakeUpstream({ status: 200 });   // 相当于"commandcode 兜底"
+    const gw = await startGatewayWith([
+      providerOf('sensenova-like', up1, { priority: 1 }),
+      providerOf('amd-like', up2, { priority: 2 }),
+      providerOf('commandcode-like', up3, { priority: 3 }),
+    ], 'det4xx-continue');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200,
+        '第一家回确定性 400 后必须继续 failover，由第三家兜底（旧实现就地回 400 打死任务）：'
+        + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(up1.st.calls, 1, '第一家只应被尝试一次，实际 ' + up1.st.calls);
+      assert.ok(up2.st.calls >= 1, '第二家必须被尝试到，实际 ' + up2.st.calls);
+      assert.ok(up3.st.calls >= 1, '第三家（兜底）必须被尝试到，实际 ' + up3.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/记为候选失败，\*\*继续 failover/.test(logText),
+        '日志须写明"记为候选失败、继续 failover"：' + logText.slice(-500));
+      assert.ok(!/failover stopped/.test(logText),
+        '不得再出现 failover stopped（那正是打死任务的旧行为）：' + logText.slice(-500));
+    } finally { killGw(gw); closeUp(up1); closeUp(up2); closeUp(up3); }
+  });
+
+  t('网关（同上）：**全部候选**都回确定性 4xx 时，仍回那个 4xx（状态码语义不倒退）', async () => {
+    // 新语义的边界：继续 failover ≠ 丢掉诊断信息。全部候选都失败时优先回"确定性 4xx"，
+    // 而不是泛化的 503 "all providers … are unavailable"。
+    const up1 = await startFakeUpstream({
+      status: 400,
+      errorBody: { error: { message: 'invalid parameter: temperature must be <= 2' } },
+    });
+    const up2 = await startFakeUpstream({
+      status: 400,
+      errorBody: { error: { message: 'invalid parameter: temperature must be <= 2' } },
+    });
+    const gw = await startGatewayWith([
+      providerOf('badA', up1, { priority: 1 }),
+      providerOf('badB', up2, { priority: 2 }),
+    ], 'det4xx-allfail');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 400, '全部候选都是确定性 4xx 时应回 400（不是 503），实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(up1.st.calls, 1, '第一家的请求次数，实际 ' + up1.st.calls);
+      assert.ok(up2.st.calls >= 1, '第二家也必须被尝试（这正是本次修复的意义），实际 ' + up2.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/failover exhausted/.test(logText),
+        '日志须写明"走完全部候选、回最后一次确定性 4xx"：' + logText.slice(-500));
+    } finally { killGw(gw); closeUp(up1); closeUp(up2); }
+  });
+
+  t('网关：流式响应**零内容**就被掐断 → 交回 failover 换下一家（不再直接把整轮任务打死）', async () => {
+    // 现场（用户 16:17:51）：commandcode 收下请求、42 秒后被掐断，
+    //   `流翻译读取失败：terminated` + `已产出 0 字符`
+    // → 客户端收到 `event: error`「上游响应被中断」，而其余候选一次都没被尝试。
+    // 零内容意味着客户端还什么都没收到 → 换一家重发是安全且正确的。
+    const cut = await startFakeUpstream({
+      sseBody: '',            // 一个字节内容都不发
+      sseGapMs: 0,
+    });
+    // 特制：让假上游"发响应头后立刻断开、不带任何内容"
+    const server = http.createServer((req, res) => {
+      if (req.url.startsWith('/v1/models')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"data":[{"id":"test-model"}]}');
+        return;
+      }
+      req.resume();
+      req.on('end', () => {
+        cut.st.calls++;
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        res.end();            // ← 干净地断开，没有任何 SSE 帧
+      });
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const dead = { server, st: cut.st, port: server.address().port };
+    // 第二家：**翻译路径**（provider 声明 openai-chat，客户端 anthropic → 上游 chat）。
+    // 这条才是 DSH 实际走的路（commandcode / nvidia / cline 都是 openai-chat）。
+    const good = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      providerOf('cutsilent', dead, { priority: 1 }),
+      Object.assign(providerOf('goodafter', good, { priority: 2 }), { protocol: 'openai-chat' }),
+    ], 'zerocut');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, stream: true, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200,
+        '零内容被掐断后应由下一家接手（旧实现直接发 event: error 把任务打死）：' + r.status + ' ' + r.text.slice(0, 300));
+      assert.ok(/upstream-ok/.test(r.text), '内容应来自第二家：' + r.text.slice(0, 300));
+      assert.ok(/event: message_stop/.test(r.text), '应是正常收尾：' + r.text.slice(-300));
+      assert.ok(!/event: error/.test(r.text), '不得出现 error 事件：' + r.text.slice(0, 300));
+      assert.ok(good.st.calls >= 1, '第二家必须真的被调用，实际 ' + good.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/尚未向客户端写入任何内容.*交回 failover/.test(logText),
+        '日志须写明"零交付 → 交回 failover"：' + logText.slice(-600));
+    } finally { killGw(gw); closeUp(dead); closeUp(good); }
+  });
+
+  t('网关：流已交付**部分内容**才被掐断 → 仍如实报"不完整"（不得换家导致两个回复拼一起）', async () => {
+    // 这是上一条的边界：只有"零内容"才允许换家。已经发过内容块后再换家会把
+    // 第二个模型的回复续写进同一条响应，客户端看到两段内容拼接 —— 更糟。
+    //
+    // ⚠ 这里必须用**自定义上游**：`startFakeUpstream` 的选项里没有 tailMode
+    // （那是模块级 upstream fixture 的属性），传了会被静默忽略，用例就测不到想测的东西。
+    const cutCount = { calls: 0 };
+    const srv = http.createServer((req, res) => {
+      if (req.url.startsWith('/v1/models')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"data":[{"id":"test-model"}]}');
+        return;
+      }
+      req.resume();
+      req.on('end', () => {
+        cutCount.calls++;
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        // 先交付**真实内容**，然后不带 message_stop 干净地断开（复刻"代理掉线"）
+        res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","content":[],"model":"test-model"}}\n\n');
+        res.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"半截回复"}}\n\n');
+        res.end();
+      });
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const up1 = { server: srv, st: cutCount, port: srv.address().port };
+    const up2 = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      providerOf('partcut', up1, { priority: 1 }),
+      // 第二家走**翻译路径**（DSH 实际形态），这样"有没有换家"在客户端响应上看得出来
+      Object.assign(providerOf('neverused', up2, { priority: 2 }), { protocol: 'openai-chat' }),
+    ], 'partcut');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, stream: true, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.ok(/半截回复/.test(r.text), '第一家交付的部分内容应已发出：' + r.text.slice(0, 400));
+      assert.ok(/event: error/.test(r.text), '已交付部分内容时必须发 error 事件：' + r.text.slice(0, 400));
+      assert.ok(!/upstream-ok/.test(r.text), '不得把第二家的内容拼进来：' + r.text.slice(0, 400));
+      assert.strictEqual(up2.st.calls, 0, '已有内容交付 → 不得换下一家（否则两段回复拼接），实际 ' + up2.st.calls);
+    } finally { killGw(gw); closeUp(up1); closeUp(up2); }
+  });
+
+  // ---- 契约（2026-10-15 用户规则变更）：确定性 4xx **不再终止 failover** ----
+  // 旧契约（2026-10-13 之前）：确定性 4xx → 只打一次上游、终止 failover、客户端拿 4xx。
+  // 新契约：确定性 4xx → 记为候选失败并**继续走完候选**；只有全部候选都失败时才回那个 4xx。
+  // 起因（用户实测）：commandcode 偶尔对同一模型回 400 `invalid request error trace_id`，
+  // 而前后各一次都 200 —— 那是上游抽风，不是"请求本身有错"。旧实现就地把整轮任务打死。
+  t('网关：上游确定性 400 → 继续 failover 由下一家服务（新契约；旧版就地终止回 400）', async () => {
     const up1 = await startFakeUpstream({ status: 400, errorBody: { error: { message: 'invalid parameter: temperature must be <= 2' } } });
     const up2 = await startFakeUpstream({ status: 200 });
     const gw = await startGatewayWith([
@@ -991,12 +1145,12 @@ let upstreamPort = 0;
     try {
       assert.ok(gw.ready, '独立网关实例应就绪');
       const r = await call({ port: gw.port });
-      assert.strictEqual(r.status, 400, '应把确定性 400 映射回客户端（不是 503、也不是下一家的 200），实际 ' + r.status + ' ' + r.text.slice(0, 200));
-      assert.strictEqual(up1.st.calls, 1, 'p1 只应被请求一次（含降敏重试在内），实际 ' + up1.st.calls);
-      assert.strictEqual(up2.st.calls, 0, '同一个"请求本身有错"的 body 不得再发给 p2（N 倍计费），实际 ' + up2.st.calls);
+      assert.strictEqual(r.status, 200,
+        '确定性 400 后必须继续 failover，由 p2 服务（旧契约会就地回 400 打死任务），实际 '
+        + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(up1.st.calls, 1, 'p1 只应被请求一次，实际 ' + up1.st.calls);
+      assert.ok(up2.st.calls >= 1, 'p2 必须被尝试到（这正是本次修复的意义），实际 ' + up2.st.calls);
       assert.ok(!/temperature must be/.test(r.text), '不得回显上游错误体原文：' + r.text.slice(0, 200));
-      const parsed = JSON.parse(r.text);
-      assert.ok(parsed.error && parsed.error.message.includes('p1'), '错误信息应指出是哪个供应商拒绝的：' + r.text.slice(0, 200));
     } finally { killGw(gw); closeUp(up1); closeUp(up2); }
   });
 
@@ -1057,7 +1211,7 @@ let upstreamPort = 0;
     } finally { killGw(gwB); closeUp(b1); closeUp(b2); }
   });
 
-  t('网关：Anthropic 路径（/v1/messages）同样在确定性 4xx 上终止 failover（Anthropic 错误体形状）', async () => {
+  t('网关：Anthropic 路径（/v1/messages）同样契约 —— 确定性 4xx 继续 failover（Anthropic 错误体形状）', async () => {
     const up1 = await startFakeUpstream({ status: 422, errorBody: { type: 'error', error: { type: 'invalid_request_error', message: 'upstream raw detail: unprocessable entity' } } });
     const up2 = await startFakeUpstream({ status: 200 });
     const gw = await startGatewayWith([
@@ -1070,8 +1224,29 @@ let upstreamPort = 0;
         port: gw.port, p: '/v1/messages',
         body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
       });
-      assert.strictEqual(r.status, 422, '应回 422，实际 ' + r.status + ' ' + r.text.slice(0, 200));
-      assert.strictEqual(up2.st.calls, 0, '不得把同一个错误请求再发给第二家，实际 ' + up2.st.calls);
+      assert.strictEqual(r.status, 200,
+        'Anthropic 路径同样要继续 failover 到第二家（旧契约就地回 422），实际 '
+        + r.status + ' ' + r.text.slice(0, 200));
+      assert.ok(up2.st.calls >= 1, '不得把同一个错误请求只发给第一家，实际 ' + up2.st.calls);
+      assert.ok(!/upstream raw detail/.test(r.text), '不得回显上游错误体原文：' + r.text.slice(0, 200));
+    } finally { killGw(gw); closeUp(up1); closeUp(up2); }
+  });
+
+  t('对照（Anthropic 路径）：全部候选都回确定性 4xx → 回该 4xx（Anthropic 错误体形状，不倒退）', async () => {
+    const up1 = await startFakeUpstream({ status: 422, errorBody: { type: 'error', error: { type: 'invalid_request_error', message: 'upstream raw detail: unprocessable entity' } } });
+    const up2 = await startFakeUpstream({ status: 422, errorBody: { type: 'error', error: { type: 'invalid_request_error', message: 'upstream raw detail: unprocessable entity' } } });
+    const gw = await startGatewayWith([
+      providerOf('a1', up1, { priority: 1 }),
+      providerOf('a2', up2, { priority: 2 }),
+    ], 'det422all');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 422, '全部候选都是 422 时应回 422（不是 503），实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.ok(up2.st.calls >= 1, '第二家也必须被尝试，实际 ' + up2.st.calls);
       const parsed = JSON.parse(r.text);
       assert.strictEqual(parsed.type, 'error', 'Anthropic 错误体形状：' + r.text.slice(0, 200));
       assert.strictEqual(parsed.error.type, 'invalid_request_error');
@@ -4421,7 +4596,12 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up1); closeUp(up2); }
   });
 
-  t('对照：真正的"请求本身有错"（参数非法）仍终止 failover（不 N 倍重发）', async () => {
+  t('对照（新契约）：参数非法的 400 也**继续 failover**（用户要求"任何一家失败都要往下走"）', async () => {
+    // ⚠ 契约变更（2026-10-15，用户明确要求）。旧契约是"参数错终止 failover，不 N 倍重发"。
+    // 用户原话："即使 commandcode 排在了 sensenova 和 amd 后面，调用时也不应该失败了就直接中断，
+    // 而应该继续按优先级往下调用，最终 commandcode 兜底！！"
+    // 取舍：真正请求侧错误时会在各候选上多打几发（各家都是秒回的 400，基本不计费），
+    // 换来"优先级高的一家的抽风/误报不再打死整轮任务"。全部候选都失败时仍回原 4xx（见下一条）。
     const up1 = await startFakeUpstream({
       status: 400,
       errorBody: { error: { message: 'invalid temperature: must be <= 2' } },
@@ -4434,9 +4614,33 @@ let upstreamPort = 0;
     try {
       assert.ok(gw.ready, '独立网关实例应就绪');
       const r = await call({ port: gw.port });
-      assert.strictEqual(r.status, 400, '参数错应原样回 400，实际 ' + r.status);
-      assert.strictEqual(up2.st.calls, 0,
-        '参数错不得重发给下一家（N 倍计费），实际 ' + up2.st.calls);
+      assert.strictEqual(r.status, 200,
+        '参数非法的 400 后仍要走完候选，由第二家服务（旧契约就地回 400），实际 ' + r.status);
+      assert.ok(up2.st.calls >= 1,
+        '必须尝试下一家，实际 ' + up2.st.calls);
+    } finally { killGw(gw); closeUp(up1); closeUp(up2); }
+  });
+
+  t('对照（新契约）：参数非法且**所有**候选都拒绝 → 仍回 400（状态码语义不倒退）', async () => {
+    const up1 = await startFakeUpstream({
+      status: 400,
+      errorBody: { error: { message: 'invalid temperature: must be <= 2' } },
+    });
+    const up2 = await startFakeUpstream({
+      status: 400,
+      errorBody: { error: { message: 'invalid temperature: must be <= 2' } },
+    });
+    const gw = await startGatewayWith([
+      providerOf('badparam1', up1, { priority: 1 }),
+      providerOf('badparam2', up2, { priority: 2 }),
+    ], 'badparamall');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 400, '全部候选都回 400 时应回 400（不是 503），实际 ' + r.status);
+      assert.ok(up2.st.calls >= 1, '第二家也必须被尝试，实际 ' + up2.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/failover exhausted/.test(logText), '日志须写明走完全部候选：' + logText.slice(-400));
     } finally { killGw(gw); closeUp(up1); closeUp(up2); }
   });
 
@@ -5389,9 +5593,11 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(bad); closeUp(ok); }
   });
 
-  t('日志事故①负例：有明确说明的 400 仍须终止 failover（别把"请求本身有错"也放过去）', async () => {
-    // 判据必须保守：上游**说了**是什么问题时（这里 "invalid request body"），
-    // 那是"你的请求有问题"的可靠信号，重发给每一家只是 N 倍计费 + N 倍风控画像。
+  t('日志事故①负例（新契约）：有明确说明的 400 也继续 failover，但**全部**候选失败时仍回 400', async () => {
+    // ⚠ 契约变更（2026-10-15，用户明确要求"任何一家失败都不许中断"）。
+    // 旧契约：上游"说了"是什么问题时（如 "invalid request body"）就终止 failover。
+    // 新契约：照样走完候选；**全部候选都失败**时才回那个 400。
+    // 判据仍然保守的意义变了：400 只被"记住"，不再当场打死任务。
     const bad = await startFakeUpstream({
       status: 400,
       errorBody: { error: { message: 'invalid request body: messages must not be empty', type: 'invalid_request_error' } },
@@ -5404,11 +5610,34 @@ let upstreamPort = 0;
     try {
       assert.ok(gw.ready, '独立网关实例应就绪');
       const r = await call({ port: gw.port });
-      assert.strictEqual(r.status, 400, '有明确说明的 400 应原样终止（回 400），实际 ' + r.status);
-      assert.strictEqual(ok.st.calls, 0, '不该把同一个坏请求重发给下一家：' + ok.st.calls);
+      assert.strictEqual(r.status, 200, '有明确说明的 400 之后仍要继续 failover（新契约），实际 ' + r.status);
+      assert.ok(ok.st.calls >= 1, '必须尝试下一家：' + ok.st.calls);
       const logText = fs.readFileSync(gw.logPath, 'utf8');
-      assert.ok(/确定性 4xx HTTP 400 → 终止 failover/.test(logText), '应走确定性 4xx 分支：' + logText.slice(-400));
+      assert.ok(/确定性 4xx HTTP 400 → 记为候选失败/.test(logText),
+        '日志须写明"记为候选失败、继续 failover"：' + logText.slice(-400));
     } finally { killGw(gw); closeUp(bad); closeUp(ok); }
+  });
+
+  t('日志事故①负例边界：有明确说明的 400 且**所有**候选都拒绝 → 仍回 400（不倒退成 503）', async () => {
+    const mk = () => startFakeUpstream({
+      status: 400,
+      errorBody: { error: { message: 'invalid request body: messages must not be empty', type: 'invalid_request_error' } },
+    });
+    const bad1 = await mk();
+    const bad2 = await mk();
+    const gw = await startGatewayWith([
+      providerOf('told1', bad1, { priority: 1 }),
+      providerOf('told2', bad2, { priority: 2 }),
+    ], 'told400all', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 400, '全部候选都拒绝时应回 400，实际 ' + r.status);
+      assert.ok(bad2.st.calls >= 1, '第二家也必须被尝试：' + bad2.st.calls);
+      const parsed = JSON.parse(r.text);
+      assert.ok(parsed.error && /told1/.test(parsed.error.message),
+        '错误信息应指出是哪个供应商拒绝的（取第一家）：' + r.text.slice(0, 200));
+    } finally { killGw(gw); closeUp(bad1); closeUp(bad2); }
   });
 
   t('日志事故②：账户级失败（429）必须照记模型级失败 —— 否则坏家永远攒不到阈值（amd 实测 7 败 0 熔断）', async () => {
@@ -5565,9 +5794,10 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up); closeUp(ok2); }
   });
 
-  t('commandcode 负例：真·请求参数错误仍须终止 failover（别把"请求有错"一起放过去）', async () => {
-    // 判据必须保守：只有"模型不在这个端点上"才放行；
-    // 真的参数错误（上游说了是哪个字段）仍然终止，否则会把坏请求重发给每一家。
+  t('commandcode 负例（新契约）：真·请求参数错误也继续 failover，不打死整轮任务', async () => {
+    // ⚠ 契约变更（2026-10-15，用户明确要求）。旧契约：有明确说明的参数错误终止 failover。
+    // 新契约：照样走完候选，由下一家服务；**全部候选都失败**时才回那个 400。
+    // 这条同时钉住"翻译路径"（DSH 走得最多的那条）与新契约一致。
     const up = await startFakeOpenAIUpstream({
       script: ['badReq', 'badReq', 'badReq'],
       badReqMsg: 'invalid request body: messages must not be empty',
@@ -5580,11 +5810,32 @@ let upstreamPort = 0;
     try {
       assert.ok(gw.ready, '独立网关实例应就绪');
       const r = await call({ port: gw.port });
-      assert.strictEqual(r.status, 400, '有明确说明的参数错误应原样终止（回 400），实际 ' + r.status);
-      assert.strictEqual(ok2.st.calls, 0, '不该把同一个坏请求重发给下一家：' + ok2.st.calls);
+      assert.strictEqual(r.status, 200,
+        '参数错误之后必须继续 failover（新契约），实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.ok(ok2.st.calls >= 1, '必须落到第二家：' + ok2.st.calls);
       const logText = fs.readFileSync(gw.logPath, 'utf8');
-      assert.ok(/确定性 4xx HTTP 400 → 终止 failover/.test(logText), '应走确定性 4xx 分支：' + logText.slice(-400));
+      assert.ok(/确定性 4xx HTTP 400 → 记为候选失败/.test(logText),
+        '日志须写明"记为候选失败、继续 failover"：' + logText.slice(-400));
     } finally { killGw(gw); closeUp(up); closeUp(ok2); }
+  });
+
+  t('commandcode 负例边界：参数错误且**所有**候选都拒绝 → 仍回 400（翻译路径，不倒退）', async () => {
+    const mk = () => startFakeOpenAIUpstream({
+      script: ['badReq', 'badReq', 'badReq', 'badReq', 'badReq', 'badReq'],
+      badReqMsg: 'invalid request body: messages must not be empty',
+    });
+    const up1 = await mk();
+    const up2 = await mk();
+    const gw = await startGatewayWith([
+      openaiProvider('told1', up1, { priority: 1 }),
+      openaiProvider('told2', up2, { priority: 2 }),
+    ], 'ccbadreqall', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 400, '全部候选都拒绝时应回 400，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.ok(up2.st.calls >= 1, '第二家也必须被尝试：' + up2.st.calls);
+    } finally { killGw(gw); closeUp(up1); closeUp(up2); }
   });
 
   t('规则2 修正：模型级冷却**首档必须是短冷却**（瞬时 429 不能一上来就锁 30 分钟）', async () => {
