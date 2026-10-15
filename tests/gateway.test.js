@@ -1916,6 +1916,17 @@ let upstreamPort = 0;
           } }));
           return;
         }
+        // 2026-10-15（amd 并发上限实测）：带 `Retry-After` 的瞬时 429 —— 原地重试必须等够。
+        if (behavior === 'busy429ra') {
+          const h = { 'content-type': 'application/json' };
+          if (opts.busyRa) h['retry-after'] = String(opts.busyRa);
+          res.writeHead(429, h);
+          res.end(JSON.stringify({ error: {
+            message: opts.busyMsg || "Model 'x' is at its concurrency limit (16); please retry later",
+            type: 'rate_limit_error',
+          } }));
+          return;
+        }
         // 2026-10-14：模型被上游下架/退役 —— 长得像整家 403，其实只针对一个模型。
         if (behavior === 'retired403') {
           res.writeHead(403, { 'content-type': 'application/json' });
@@ -5718,6 +5729,29 @@ let upstreamPort = 0;
       const logText = fs.readFileSync(gw.logPath, 'utf8');
       assert.ok(/breaker OPEN: authfail 失败（403）/.test(logText),
         '裸 403（整家鉴权失败）仍须熔断**整家**：' + logText.slice(-700));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('429 原地重试必须**尊重上游 Retry-After**（amd 回 1 秒，固定 400ms 会再撞并发上限）', async () => {
+    // 2026-10-15 实测（amd `Model 'DeepSeek-V4.1-Flash' is at its concurrency limit (16)`）：
+    // 上游带 `Retry-After: 1`（秒）。旧实现原地重试固定等 400ms → 必然再撞同一个并发上限，
+    // 日志里满屏"429 原地重试仍失败"，重试形同虚设。
+    // 这条用例：上游第一次 429（带 Retry-After: 1），第二次才 200；
+    // 断言客户端最终 200 且日志写明遵循了 Retry-After。
+    const up = await startFakeOpenAIUpstream({
+      script: ['busy429ra', 'ok'],
+      busyRa: '1',
+      busyMsg: "Model 'x' is at its concurrency limit (16); please retry later",
+    });
+    const prov = openaiProvider('ra429', up, { priority: 1 });
+    const gw = await startGatewayWith([prov], 'ra429case', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200, '应被原地重试救回（等待足够久），实际 ' + r.status + ' ' + r.text.slice(0, 160));
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/遵循上游 Retry-After/.test(logText),
+        '日志须写明遵循了上游 Retry-After（否则等待时长可能不足）：' + logText.slice(-600));
     } finally { killGw(gw); closeUp(up); }
   });
 

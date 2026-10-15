@@ -175,6 +175,19 @@ const INLINE_429_RETRY_DELAY_MS = (() => {
 })();
 
 /**
+ * 429 原地重试的**等待上限**（2026-10-15，amd 并发上限实测）。
+ *
+ * 等待时长取 `max(INLINE_429_RETRY_DELAY_MS, 上游 Retry-After)`，但必须封顶：
+ * 上游偶尔会给很夸张的 Retry-After（几百秒），照等会把用户请求挂死 —— 那就失去了
+ * "原地快速重试"的意义（超过这个量级应该交给熔断/换家，而不是原地干等）。
+ * 实测 amd 对 `concurrency limit (16)` 回 `Retry-After: 1`（秒），故 3 秒足够覆盖这类瞬时并发冲突。
+ */
+const INLINE_429_RETRY_MAX_WAIT_MS = (() => {
+  const n = Number(process.env.DSH_GW_429_RETRY_MAX_WAIT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 3000;
+})();
+
+/**
  * 一次客户端请求内，对「上游自己忙」429 的**重试总次数**。
  *
  * 为什么默认 2（而不是 1）：实测该免费模型的成功率约 1/3，单次重试只能把整体拉到 ~55%，
@@ -5854,9 +5867,16 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         && UPSTREAM_BUSY_429_RE.test(String(detail || ''))
         && !/insufficient[_a-z]*quota|balance|credit|欠费|余额|额度/i.test(String(detail || ''))
         && !(opts && opts.retried429)) {
-      log(`upstream ${provider.id} 429 判定为"上游自己忙"（正文请求稍后重试）→ 原地重试一次`);
+      // ⚠ 2026-10-15（amd 并发上限实测）：等待时长必须**尊重上游的 Retry-After**。
+      // 旧实现固定等 400ms，而 amd 对 `concurrency limit (16)` 明确回 `Retry-After: 1`（秒）——
+      // 等 400ms 必然再撞同一个并发上限，于是日志里满屏"429 原地重试仍失败"，
+      // 重试完全没起到作用。现在：取 max(固定值, Retry-After)，并设上限避免被超长值拖死。
+      const raMs = retryAfterMs(upstream);
+      const waitMs = Math.min(Math.max(INLINE_429_RETRY_DELAY_MS, raMs), INLINE_429_RETRY_MAX_WAIT_MS);
+      log(`upstream ${provider.id} 429 判定为"上游自己忙"（正文请求稍后重试）→ 原地重试一次`
+        + `（等待 ${fmtMs(waitMs)}${raMs > 0 ? `，遵循上游 Retry-After ${fmtMs(raMs)}` : ''}）`);
       if (opts) opts.retried429 = true;
-      await new Promise((r) => setTimeout(r, INLINE_429_RETRY_DELAY_MS));
+      await new Promise((r) => setTimeout(r, waitMs));
       // 重发（与首次同路径、同 headers/body）
       try {
         const c3 = new AbortController();
@@ -8937,9 +8957,13 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
           && UPSTREAM_BUSY_429_RE.test(String(lastDetail || ''))
           && !/insufficient[_a-z]*quota|balance|credit|欠费|余额|额度/i.test(String(lastDetail || ''))) {
         busy429RetriesLeft -= 1;
+        // 与直通路径同一处理：等待时长尊重上游 Retry-After（amd 回 1 秒，固定 400ms 会再撞并发上限）。
+        const raMs = retryAfterMs(upstream);
+        const waitMs = Math.min(Math.max(INLINE_429_RETRY_DELAY_MS, raMs), INLINE_429_RETRY_MAX_WAIT_MS);
         log(`upstream ${provider.id} 429 判定为"上游自己忙"（正文请求稍后重试）→ 原地重试一次`
-          + `（本次请求剩余重试预算 ${busy429RetriesLeft}）`);
-        await new Promise((r) => setTimeout(r, INLINE_429_RETRY_DELAY_MS));
+          + `（等待 ${fmtMs(waitMs)}${raMs > 0 ? `，遵循上游 Retry-After ${fmtMs(raMs)}` : ''}`
+          + `；本次请求剩余重试预算 ${busy429RetriesLeft}）`);
+        await new Promise((r) => setTimeout(r, waitMs));
         ai -= 1;
         continue;
       }
