@@ -49,6 +49,20 @@ const DECLARED = [
   { name: 'modelBreakerRecordFail', why: '改动（用户报「ling-3.1-flash 调用失败 503」）：模型级冷却**首档改为短冷却**并接上指数退避阶梯。旧实现 `let ms = MODEL_BREAKER_COOLDOWN_MS` —— 首次开闸就直接 30 分钟；而上游当时回的是 429「Upstream model provider is temporarily unavailable. Please try again in a moment.」（明说"稍后重试"），我们却把该模型锁死半小时。该模型只有一家候选 → 用户整轮任务直接死掉。现在与**供应商级**熔断的既有设计对齐：90s → 3m → 6m → 12m → 24m → **上限 30 分钟**（`breaker.cooldownMs` 仍是上限，规则 3 语义不变）。每次冷却到点后半开探测放行一次 → 上游恢复后最多 90 秒即可重新用上' },
   { name: 'breakerCooldownSecs', why: '改动（同一个 503 事故）：必须**两级都看**。旧实现只读 `breaker`（供应商级），而规则 2 的模型级冷却存在 `modelBreaker` 里 → 模型级冷却时算出 until=0 → 落到兜底 BREAKER_SHORT_MS → **503 文案写 "retry in ~90s"，实际要等 30 分钟**。用户照提示重试仍然 503，只会判定"网关坏了"，而这句提示本是他唯一的线索。新增第二个参数 `model`，四处调用点都传入当前模型' },
 
+  // —— 2026-10-14：瞬时 429「上游自己忙」原地重试（ling-3.1-flash 仍不可用）——
+  { name: 'TRANSIENT_NET_CODES', why: '改动：紧随其后新增了 UPSTREAM_BUSY_429_RE / INLINE_429_* 三个常量（429 原地重试），本清单按邻近符号记账' },
+  { name: 'UPSTREAM_BUSY_429_RE', why: '新增：判据「上游**自己**忙」（temporarily unavailable / try again / overloaded / 上游忙…）。实测 commandcode 的 `inclusionai/ling-3.1-flash:free` 回 `429 "Upstream model provider is temporarily unavailable. Please try again in a moment."` —— 上游明说"稍后重试"。间隔 6 秒、三种请求形态各 3 次的实测：该模型只有约 **1/3 成功率**、随机 200/429，而同家 deepseek 一直 200。旧实现一次 429 就记一次模型级失败 → 3 次开闸；且半开探测**只放行一次**，撞上 2/3 的失败率极易再次开闸 → 该模型在用户看来"永远不可用"' },
+  { name: 'INLINE_429_RETRY_DELAY_MS', why: '新增：429 原地重试前的等待（默认 400ms，DSH_GW_429_RETRY_DELAY_MS 可调）。**刻意不用 `envMs()`** —— 它定义在 L714 而本常量在 L169，`const` 的 TDZ 会让模块加载时直接抛 ReferenceError（实测：写成 envMs 后 import 即崩）' },
+  { name: 'INLINE_429_MAX_RETRIES', why: '新增：一次客户端请求内对"上游忙"429 的重试预算（默认 2 次，DSH_GW_429_MAX_RETRIES 可调，上限 5）。默认 2 而非 1 的理由：成功率约 1/3 时，1 次重试只能把整体拉到 ~55%，2 次可到 ~70%；代价仅是失败路径多等 2×400ms，且只在命中这一窄判据时发生' },
+  { name: 'forward', why: '改动：`upstreamErrBlock` 内新增"上游忙 429 → 原地重发同一上游请求"，成功后 `break upstreamErrBlock` 按 2xx 继续。**不递归 `forward()`** —— 那会在 L5482 再走一次 `breakerAcquire`，重复占用半开探测名额；`opts` 在本函数可能为 undefined，故用 `opts && opts.retried429` 读取、写入前判空（否则 TypeError 会被 startServer 兜底 catch 包装成一句无关的 `400 invalid JSON body: Cannot read property …`，实测踩到）' },
+  { name: 'forwardAnthropicViaOpenAI', why: '改动（同一需求的第二处，**必须有**）：DSH 走的就是这条翻译路径。实测只在 `forward()` 加、没加这里时，一次 429 仍然直接判失败（日志只有 `upstream p1 HTTP 429` 然后 `all-providers status=fail`，重试根本没发生）。实现要点：循环改为带下标的 `for (let ai …)`，重试时 `ai -= 1` **重跑同一个账户** —— 用 `continue` 会走到下一个账户，只有一个账户时直接"全部账户不可用"（实测踩到：日志说"原地重试一次"，紧接着上游仍只被调用 1 次）；预算变量必须在循环**外**声明，否则每次迭代被重置成死循环' },
+
+  // —— 2026-10-14：模型被上游下架的 403 把整家连坐 30 分钟 ——
+  { name: 'MODEL_RETIRED_403_RE', why: '新增：判据「**这个模型**被下架/退役了」（has been retired / now a paid model / no longer available…）。实测 commandcode 退役 `inclusionai/ling-3.1-flash:free` 时回 `403 permission_error`，正文点名该模型并给出替代 id；旧实现一律按"鉴权/欠费/权限类 → 与具体模型无关 → 冷却**整家** 30 分钟"，把同家 deepseek-v4.1-flash / glm-5.3-flash（curl 实测都还是 200）一起停了半小时，日志紧接着一片 `skip commandcode (breaker open)`' },
+  { name: 'isModelRetired403', why: '新增：把上面的正则与 `permission_error` **同时**要求 —— 判据刻意收窄，避免把真正的整家鉴权失败（裸 `403 Authorization failed` / `account suspended` / `invalid api key`）误判成"只是这个模型的问题"。7 条正负例逐一验证过（含 sensenova 的 `permission_denied_error` 仍走原路径）' },
+  { name: 'isProviderWideFailure', why: '改动：文档注释补充"模型退役 403"这一例外说明；判定逻辑本身不变（仍是 401/402/403 → 整家），例外在 `breakerRecordFail` 里按 detail 收窄 —— 这样**不传 detail 的既有调用点语义完全不变**' },
+  { name: 'breakerRecordFail', why: '改动：新增可选第 6 个参数 `detail`，用于识别"该模型被下架"的 403 → 降级为**模型级**冷却（不连坐整家）。不传时行为与旧版逐字一致。同时在"全部账户耗尽"的收尾分支（原来写死空模型名 → 必然整家）加了同一判定 —— 账户池只剩一个账户时，一次 403 就会落到那里，实测正是这条路径把 commandcode 整家熔断的' },
+
   // —— 2026-09-30：客户端仿真 / 防封禁专项改进（依据是官方 SDK/CLI 一手源码）——
   { name: 'clientIdentityOverrides', why: '新增：版本/身份统一覆盖入口（env > 配置 > 默认），避免版本号写死后被上游最低版本门禁拒掉' },
   { name: 'osRelease', why: '新增：os.release() 安全包装，供 UA 与平台头构造使用' },

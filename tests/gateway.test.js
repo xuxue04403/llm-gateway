@@ -1905,6 +1905,32 @@ let upstreamPort = 0;
           res.end(JSON.stringify({ error: { message: "Model '" + (body && body.model) + "' is at its concurrency limit (32); please retry later" } }));
           return;
         }
+        // 2026-10-14（用户报「ling-3.1-flash 还是调用不成功」）：commandcode 免费模型的真实形态 ——
+        // 上游**自己**说"我暂时不可用，稍后重试"，不是对我们限流。实测该模型约 1/3 成功率、
+        // 随机 200/429（同家 deepseek 一直 200）→ 必须原地重试，否则一次失败就白记一次模型级失败。
+        if (behavior === 'busy429') {
+          res.writeHead(429, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: {
+            message: opts.busyMsg || 'Upstream model provider is temporarily unavailable. Please try again in a moment.',
+            type: 'rate_limit_error',
+          } }));
+          return;
+        }
+        // 2026-10-14：模型被上游下架/退役 —— 长得像整家 403，其实只针对一个模型。
+        if (behavior === 'retired403') {
+          res.writeHead(403, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: {
+            message: opts.retiredMsg || 'The free Ling 3.1 Flash tier has been retired. Ling 3.1 Flash is now a paid model -- run /model and pick Ling 3.1 Flash (inclusionai/ling-3.1-flash) to keep going.',
+            type: 'permission_error', code: 'FORBIDDEN',
+          } }));
+          return;
+        }
+        // 真·整家鉴权失败（裸 403）：必须仍按整家处理。
+        if (behavior === 'auth403') {
+          res.writeHead(403, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ status: 403, title: 'Forbidden', detail: opts.authMsg || 'Authorization failed' }));
+          return;
+        }
         // 2026-10-14：商汤 sensenova 对 RPM/TPM 限流的**真实形态** ——
         // 措辞里写着额度类的 `insufficient_quota`，但语义是瞬时限流。
         // 旧实现被 WORKBUDDY_CREDIT_RE 里的 `insufficient[_a-z]*quota` 抓成"欠费"→ 锁 1800 秒。
@@ -5602,6 +5628,96 @@ let upstreamPort = 0;
       const secs = Number((r.text.match(/retry in ~(\d+)s/) || [])[1] || 0);
       assert.ok(secs > 600,
         `文案必须报真实剩余（约 1200 秒），不能是兜底的 90 秒；实际 ~${secs}s 全文：${r.text.slice(0, 200)}`);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('瞬时 429「上游自己忙」→ 必须原地重试（约 1/3 成功率的免费模型，不能一次就记失败开闸）', async () => {
+    // 2026-10-14 用户报「ling-3.1-flash 还是调用不成功」。
+    // 现场：commandcode 的 `inclusionai/ling-3.1-flash:free` 回
+    //   `429 {"error":{"message":"Upstream model provider is temporarily unavailable.
+    //                       Please try again in a moment.","type":"rate_limit_error"}}`
+    // —— 上游**自己**说"稍后重试"，不是对我们限流。
+    // 实测（间隔 6s、三种形态各 3 次）：该模型约 1/3 成功率、随机 200/429，同家 deepseek 一直 200。
+    // 旧实现一次 429 就记一次模型级失败 → 3 次开闸冷却；且半开探测**只放行一次**，
+    // 撞上 2/3 的失败率极易再次开闸 → 该模型在用户看来"永远不可用"。
+    // 修法：命中"上游自己忙"这一窄判据时原地重发（默认 2 次预算），成功后照常 200。
+    const up = await startFakeOpenAIUpstream({ script: ['busy429', 'ok', 'busy429', 'ok', 'busy429', 'ok'] });
+    const prov = openaiProvider('busy', up, { priority: 1 });
+    const gw = await startGatewayWith([prov], 'busy429case', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200,
+        '首次 429 应被原地重试救回（旧实现直接失败/开闸），实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/判定为"上游自己忙".*原地重试/.test(logText),
+        '日志须写明按"上游自己忙"处理并重试：' + logText.slice(-600));
+      assert.ok(!/breaker OPEN: busy\[test-model\]/.test(logText),
+        '重试成功不该记模型级失败、更不该开闸：' + logText.slice(-600));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('瞬时 429 负例：**账户侧**额度不足（insufficient_quota）不得被当成"上游忙"重试', async () => {
+    // 判据必须保守：sensenova 那类 `insufficient_quota` 与"上游自己忙"处置不同 ——
+    // 前者由账户池换 Key / 短期限流处理，重发同一个 Key 没有意义。
+    const up = await startFakeOpenAIUpstream({
+      script: ['quota429', 'quota429', 'quota429', 'quota429'],
+      quotaMsg: 'inference exceeds tpm/rpm limit',
+    });
+    const prov = openaiProvider('acctquota', up, { priority: 1, apiKeys: ['k1', 'k2'] });
+    const gw = await startGatewayWith([prov], 'busyneg', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      await call({ port: gw.port });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(!/判定为"上游自己忙"/.test(logText),
+        'insufficient_quota 属账户侧，不得走"上游忙"原地重试：' + logText.slice(-600));
+      assert.ok(/标记为 rate|账户级失败/.test(logText),
+        '应按账户级限流处理（换 Key / 短冷却）：' + logText.slice(-600));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('模型被上游下架（permission_error 403）→ **只冷却该模型**，不连坐整家 30 分钟', async () => {
+    // 2026-10-14 实测（commandcode 退役 ling 免费档）：
+    //   403 {"error":{"message":"The free Ling 3.1 Flash tier has been retired. Ling 3.1 Flash
+    //        is now a paid model -- run /model and pick Ling 3.1 Flash
+    //        (inclusionai/ling-3.1-flash) to keep going.","type":"permission_error","code":"FORBIDDEN"}}
+    // 旧实现按"鉴权/欠费/权限类 → 与具体模型无关 → 冷却**整家** 30 分钟"处理，
+    // 于是同家**仍然完全正常**的别的模型（deepseek-v4.1-flash / glm-5.3-flash，curl 都是 200）
+    // 被一起停用半小时 —— 日志紧接着就是一片 `skip commandcode (breaker open)`。
+    // 修法：`permission_error` + 正文点名"该模型退役/转付费" → 降级为模型级冷却。
+    const up = await startFakeOpenAIUpstream({
+      script: ['retired403', 'retired403', 'retired403', 'retired403'],
+      retiredMsg: 'The free Ling 3.1 Flash tier has been retired. Ling 3.1 Flash is now a paid model -- run /model and pick Ling 3.1 Flash (inclusionai/ling-3.1-flash) to keep going.',
+    });
+    const prov = openaiProvider('retired', up, { priority: 1 });
+    const gw = await startGatewayWith([prov], 'retired403case', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      for (let i = 0; i < 3; i++) await call({ port: gw.port });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(!/breaker OPEN: retired 失败（403）/i.test(logText),
+        '**不得**把整家按 403 熔断（这正是误伤同家其它模型的原因）：' + logText.slice(-700));
+      assert.ok(/breaker OPEN: retired\[test-model\]/.test(logText),
+        '应降级为**模型级**冷却：' + logText.slice(-700));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('模型下架 403 负例：真正的整家鉴权失败仍须熔断整家（别把裸 403 也放成模型级）', async () => {
+    // 判据必须保守：`Authorization failed` 这类裸 403 是整家性的（换模型也没用），
+    // 仍要冷却整家，否则每个模型都会各自去打一遍必然失败的鉴权。
+    const up = await startFakeOpenAIUpstream({
+      script: ['auth403', 'auth403', 'auth403', 'auth403'],
+      authMsg: 'Authorization failed',
+    });
+    const prov = openaiProvider('authfail', up, { priority: 1 });
+    const gw = await startGatewayWith([prov], 'auth403case', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      for (let i = 0; i < 3; i++) await call({ port: gw.port });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/breaker OPEN: authfail 失败（403）/.test(logText),
+        '裸 403（整家鉴权失败）仍须熔断**整家**：' + logText.slice(-700));
     } finally { killGw(gw); closeUp(up); }
   });
 

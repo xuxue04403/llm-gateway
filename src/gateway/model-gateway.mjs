@@ -150,6 +150,44 @@ const TRANSIENT_NET_CODES = new Set([
 ]);
 
 /**
+ * 瞬时 429「**上游自己忙**」的判据（2026-10-14，用户报「ling-3.1-flash 调用不成功」）。
+ *
+ * 现场：commandcode 的免费模型 `inclusionai/ling-3.1-flash:free` 回
+ *   `429 {"error":{"message":"Upstream model provider is temporarily unavailable.
+ *                       Please try again in a moment.","type":"rate_limit_error"}}`
+ * **上游在正文里明说自己忙、让我稍后重试** —— 这不是对我们的限流。
+ * 实测（间隔 6 秒、三种形态各 3 次）：该模型只有约 1/3 成功率、随机 200/429，
+ * 而同家 deepseek 一直 200。多试一次就有很大概率成功，而旧实现一次 429 就记一次
+ * 模型级失败 → 3 次开闸冷却（且半开探测只放行**一次**，撞上 2/3 失败率极易再次开闸），
+ * 于是这个模型在用户看来"永远不可用"。
+ *
+ * 判据刻意收窄，只认"上游自己忙/过载"这一类说法。
+ */
+const UPSTREAM_BUSY_429_RE = /temporarily\s+unavailable|try\s+again|please\s+retry|overloaded|too\s+many\s+requests|server\s+busy|service\s+unavailable|上游(?:忙|暂时不可用|过载)|请稍后重试/i;
+
+/** 429 原地重试前的等待（很短：只为避开同一瞬间的抖动；给环境变量留口子便于压测）。 */
+// ⚠ 这里**不能**用 `envMs()` —— 它定义在 L714，而本常量在 L169，
+// `const` 的 TDZ 会让模块加载时直接抛 ReferenceError。用与上方 NET_RETRY_MAX_ELAPSED_MS
+// 相同的自执行写法读环境变量。
+const INLINE_429_RETRY_DELAY_MS = (() => {
+  const n = Number(process.env.DSH_GW_429_RETRY_DELAY_MS);
+  return Number.isFinite(n) && n >= 0 ? n : 400;
+})();
+
+/**
+ * 一次客户端请求内，对「上游自己忙」429 的**重试总次数**。
+ *
+ * 为什么默认 2（而不是 1）：实测该免费模型的成功率约 1/3，单次重试只能把整体拉到 ~55%，
+ * 用户仍会频繁撞失败；2 次重试可到 ~70%。代价是失败路径多等 2×400ms（可忽略），
+ * 且**只有**命中"上游自己忙"这一窄判据时才会发生，不影响正常限流/欠费的处置。
+ * 想更保守可设 DSH_GW_429_MAX_RETRIES=1，想更激进可调大（不建议超过 3：会拖长失败路径）。
+ */
+const INLINE_429_MAX_RETRIES = (() => {
+  const n = Number(process.env.DSH_GW_429_MAX_RETRIES);
+  return Number.isFinite(n) && n >= 0 ? Math.min(5, Math.floor(n)) : 2;
+})();
+
+/**
  * 把 fetch 的异常链压成一行可读文本（undici 的网络错误 message 恒为 "fetch failed"，
  * 真正原因在 cause 链里：ECONNRESET / ENOTFOUND / UND_ERR_SOCKET / 代理连接失败…）。
  */
@@ -981,6 +1019,33 @@ function isProviderWideFailure(httpStatus, timedOutByUs) {
   return false;   // 上游给了响应（4xx/5xx/429）→ 按模型级处理（护栏会兜住"整家都坏"的情形）
 }
 
+/**
+ * 「**这个模型被下架/退役了**」——长得像整家 403，其实只针对一个模型。
+ *
+ * 2026-10-14 实测（commandcode 退役免费档）：
+ *   `403 {"error":{"message":"The free Ling 3.1 Flash tier has been retired. Ling 3.1 Flash
+ *                     is now a paid model — run /model and pick Ling 3.1 Flash
+ *                     (inclusionai/ling-3.1-flash) to keep going.",
+ *           "type":"permission_error","code":"FORBIDDEN"}}`
+ * 旧实现按"鉴权/欠费/权限类 → 与具体模型无关 → 冷却**整家** 30 分钟"处理 ——
+ * 于是 commandcode 上**其它仍然完全正常**的模型（deepseek-v4.1-flash / glm-5.3-flash …）
+ * 被一起停用半小时。实测紧接着就是一片 `skip commandcode (breaker open)`，
+ * 而那些模型直连 curl 都是 200。
+ *
+ * 判据收得很窄（必须**同时**满足），避免把真正的鉴权失败误判成"只是这个模型的问题"：
+ *   · `permission_error` —— 明确是权限类；
+ *   · 且正文把范围限定在某个模型（retired / now a paid model / pick <model> 之类）。
+ * **不认**裸 403（`Forbidden` / `Authorization failed`）—— 那才是整家性问题。
+ */
+const MODEL_RETIRED_403_RE = /has\s+been\s+retired|now\s+a\s+paid\s+model|no\s+longer\s+(?:available|free|supported)|is\s+retired|pick\s+\S+\s+to\s+keep\s+going|model\s+is\s+not\s+available/i;
+
+function isModelRetired403(detail) {
+  const d = String(detail || '');
+  if (!d) return false;
+  if (!/permission_error/i.test(d)) return false;
+  return MODEL_RETIRED_403_RE.test(d);
+}
+
 /** 人读时长（日志与断言都用它，保持一致） */
 function fmtMs(ms) {
   return ms >= 60_000 ? Math.round(ms / 60_000) + ' 分钟' : ms + 'ms';
@@ -1118,9 +1183,21 @@ function noteModelCooled(providerId, model) {
  * @param {number} serverRetryMs 上游 Retry-After
  * @param {boolean} timedOutByUs 这次失败是**我们自己的超时**掐掉的
  * @param {string} model 逻辑模型名（缺省 = 只记供应商级，= 旧行为）
+ * @param {string} detail 上游响应体（可选）。**只用于一条判据**：识别"这个模型被下架了"的 403
+ *   —— 那种 403 长得像整家鉴权失败，但实际只针对一个模型，不该把整家冷却 30 分钟
+ *   （实测：commandcode 退役 ling 免费档，把同家 deepseek/glm 一起停了）。
+ *   不传时行为与旧版完全一致（403 仍按整家处理），保证既有调用点语义不变。
  */
-function breakerRecordFail(providerId, httpStatus, serverRetryMs, timedOutByUs, model) {
+function breakerRecordFail(providerId, httpStatus, serverRetryMs, timedOutByUs, model, detail) {
   if (isProviderWideFailure(httpStatus, timedOutByUs)) {
+    // 例外：403 但属于"该模型被下架/退役" → 降级为**模型级**冷却，不连坐整家。
+    if (httpStatus === 403 && model && isModelRetired403(detail)) {
+      const key = modelBreakerKey(providerId, model);
+      if (key) {
+        modelBreakerRecordFail(providerId, model, key, httpStatus, serverRetryMs, timedOutByUs);
+        return;
+      }
+    }
     providerBreakerRecordFail(providerId, httpStatus, serverRetryMs, timedOutByUs);
     return;
   }
@@ -5752,6 +5829,59 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       detail = await readTextWithTimeout(upstream, 5000, 500);
     }
     log(`upstream ${provider.id} HTTP ${upstream.status}: ${maskSecrets(detail)}`);   // V1：日志脱敏
+    // ── 瞬时 429「上游忙」原地重试一次（2026-10-14）────────────────────────────
+    //
+    // 现场（用户报「ling-3.1-flash 调用不成功」）：commandcode 的免费模型
+    // `inclusionai/ling-3.1-flash:free` 回
+    //   `429 {"error":{"message":"Upstream model provider is temporarily unavailable.
+    //                       Please try again in a moment.","type":"rate_limit_error"}}`
+    // 它**不是**对"我们"的限流，而是上游自己那一刻没接住 —— **上游在正文里明说"稍后重试"**。
+    //
+    // 实测（间隔 6 秒、三种请求形态各 3 次）：该模型只有约 1/3 成功率、随机 200/429，
+    // 而同家 deepseek 一直 200。也就是说：**多试一次就有很大概率成功**，
+    // 而旧实现一次 429 就记一次模型级失败 → 3 次即开闸冷却 → 用户整轮任务失败/要等冷却。
+    // 关键在于：半开探测**只放行一次**，撞上 2/3 的失败率很容易再次开闸，于是这个模型
+    // 在用户看来"永远不可用"。
+    //
+    // 判据收得很窄（只认"上游自己忙"这一类，且**只在 429**）：
+    //   · 必须 429；
+    //   · 正文含 temporarily unavailable / try again / overloaded / 上游忙 之类；
+    //   · **不含**账户侧的额度字样（insufficient_quota / balance / credit 等）——
+    //     那类换一次也没用，且 sensenova 那条路径要单独判成短期限流（见 TRANSIENT_QUOTA_429_RE）。
+    // 与网络错保持一致：只重试一次。用带标签的块 + `continue` 重发**同一个上游请求**
+    // （不能递归 `forward()` —— 那会在 L5482 再走一次 `breakerAcquire`，重复占用半开名额）。
+    if (upstream.status === 429
+        && UPSTREAM_BUSY_429_RE.test(String(detail || ''))
+        && !/insufficient[_a-z]*quota|balance|credit|欠费|余额|额度/i.test(String(detail || ''))
+        && !(opts && opts.retried429)) {
+      log(`upstream ${provider.id} 429 判定为"上游自己忙"（正文请求稍后重试）→ 原地重试一次`);
+      if (opts) opts.retried429 = true;
+      await new Promise((r) => setTimeout(r, INLINE_429_RETRY_DELAY_MS));
+      // 重发（与首次同路径、同 headers/body）
+      try {
+        const c3 = new AbortController();
+        const t3 = setTimeout(() => c3.abort(), providerTimeoutMs(provider, body && body.model));
+        try {
+          const retried = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
+            ...init,
+            signal: c3.signal,
+          });
+          upstream = retried;
+          firstDetail = null;          // 新响应的 body 要重新读
+          if (retried.ok) {
+            log(`upstream ${provider.id} 429 原地重试成功`);
+          } else {
+            const d2 = await readTextWithTimeout(retried, 5000, 500);
+            firstDetail = d2;
+            detail = d2;
+            log(`upstream ${provider.id} 429 原地重试仍失败：HTTP ${retried.status} ${maskSecrets(d2)}`);
+          }
+        } finally { clearTimeout(t3); }
+      } catch (e3) {
+        log(`upstream ${provider.id} 429 原地重试异常：${describeFetchError(e3)}`);
+      }
+      if (upstream.ok) break upstreamErrBlock;   // 重试成功 → 按正常 2xx 继续走
+    }
     // 账户池（2026-09-16）：把状态码与错误体回传给包装函数，由它判定"该换账户还是换供应商"
     if (opts && opts.failureSink) {
       opts.failureSink.status = upstream.status;
@@ -5936,7 +6066,9 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       // R25：429（限流）计入熔断——不熔断会加剧限流；短熔断（90s）已足够退避
       catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
       // 429 时把服务端的 Retry-After 传下去（真实客户端会遵循它）
-      breakerRecordFail(provider.id, upstream.status, upstream.status === 429 ? retryAfterMs(upstream) : 0, false, bModel);   // V2：按状态码分级熔断（401/403 → 30 分钟）
+      // 传 detail：让 breakerRecordFail 能识别"这个模型被下架了"的 403（只冷却该模型，
+      // 不把整家连坐 30 分钟 —— 实测 commandcode 退役 ling 免费档时误伤了 deepseek/glm）。
+      breakerRecordFail(provider.id, upstream.status, upstream.status === 429 ? retryAfterMs(upstream) : 0, false, bModel, detail);   // V2：按状态码分级熔断（401/403 → 30 分钟）
       // raw 模式（资源子路由）：这不是"资源不存在"而是"这家上游暂时不可用"，
       // 把状态码带回去让调用方回 502，避免误导客户端以为 response 已被删除
       return rawMode ? { retryable: upstream.status } : false;
@@ -8648,7 +8780,11 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
   let lastDetail = '';
   let lastStatus = 0;
 
-  for (const acct of attemptAccounts) {
+  // 「上游自己忙」429 的原地重试预算（**本次调用**内共享，不是每账户一份）。
+  // ⚠ 必须在循环**外面**声明：放在循环体内会在每次迭代被重置 → `ai--` 变成死循环。
+  let busy429RetriesLeft = INLINE_429_MAX_RETRIES;
+  for (let ai = 0; ai < attemptAccounts.length; ai++) {
+    const acct = attemptAccounts[ai];
     const startedAt = Date.now();
     /**
      * 用量记账（2026-10-13 审计补）。
@@ -8777,6 +8913,36 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       lastStatus = upstream.status;
       lastDetail = await readTextWithTimeout(upstream, 5000, 500);
       log(`upstream ${provider.id} HTTP ${upstream.status}: ${maskSecrets(lastDetail)}`);
+      // ── 瞬时 429「上游自己忙」原地重试一次（2026-10-14，与直通路径同一判据）──────────
+      //
+      // DSH（Anthropic 客户端）走的就是**这条翻译路径**，所以直通路径修了这里也必须修 ——
+      // 实测：只在 forward() 里加、没加这里时，一次 429 仍然直接判失败
+      //（日志只有 `upstream p1 HTTP 429` 然后 `all-providers status=fail`，重试根本没发生）。
+      //
+      // 现场：commandcode 的免费模型回
+      //   `429 {"error":{"message":"Upstream model provider is temporarily unavailable.
+      //                       Please try again in a moment.","type":"rate_limit_error"}}`
+      // 上游自己说"稍后重试"，实测该模型约 1/3 成功率、随机 200/429，同家 deepseek 一直 200。
+      // 多试一次就有很大概率成功；而旧实现一次 429 就记一次模型级失败 → 3 次开闸冷却，
+      // 且半开探测**只放行一次**、极易再次开闸 → 该模型在用户看来"永远不可用"。
+      //
+      // 用 `continue` 回到同一个 `for (const acct of attemptAccounts)` 循环重发一次：
+      // 此时**还没向客户端写过任何字节**（这是本循环 early-continue 的既定前提），
+      // 所以重发是安全的。同一账户只重试一次（opts.retried429 记在本次请求上）。
+      // 用 `ai--` **重跑同一个账户**，而不是 `continue`（那会走到下一个账户 → 只有一个账户时
+      // 直接"全部账户不可用"，请求根本没重发 —— 实测踩到：日志说"原地重试一次"，
+      // 紧接着就是 `provider p1 全部账户不可用`，上游仍只被调用 1 次）。
+      if (upstream.status === 429
+          && busy429RetriesLeft > 0
+          && UPSTREAM_BUSY_429_RE.test(String(lastDetail || ''))
+          && !/insufficient[_a-z]*quota|balance|credit|欠费|余额|额度/i.test(String(lastDetail || ''))) {
+        busy429RetriesLeft -= 1;
+        log(`upstream ${provider.id} 429 判定为"上游自己忙"（正文请求稍后重试）→ 原地重试一次`
+          + `（本次请求剩余重试预算 ${busy429RetriesLeft}）`);
+        await new Promise((r) => setTimeout(r, INLINE_429_RETRY_DELAY_MS));
+        ai -= 1;
+        continue;
+      }
       // ⚠ 这两类判定必须排在**账户级**判定与**状态码通配**之前，理由各有不同：
       //  ① 排在账户级之后 → 一个"地区受限"的模型会被 `classifyAccountFailure(403, …)` 判成
       //     `session`，把该家**所有 Key** 逐个标记冷却 1 小时。连坐效果与"熔断整家"等价：
@@ -8866,7 +9032,8 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       }
       if (upstream.status === 401 || upstream.status === 403 || upstream.status === 429 || upstream.status >= 500) {
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-        breakerRecordFail(provider.id, upstream.status, upstream.status === 429 ? retryAfterMs(upstream) : 0, false, bModel);
+        // 传 lastDetail：识别"该模型被下架"的 403 → 只冷却该模型，不连坐整家（2026-10-14）。
+        breakerRecordFail(provider.id, upstream.status, upstream.status === 429 ? retryAfterMs(upstream) : 0, false, bModel, lastDetail);
         return false;
       }
       breakerReleaseSlot(provider.id, bModel);
@@ -9097,9 +9264,21 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
     return false;
   }
   if (lastStatus === 401 || lastStatus === 403 || lastStatus === 429 || lastStatus >= 500) {
+    // ⚠ 2026-10-14：先判「该模型被下架」的 403。它同样会走到这里（账户池只剩一个账户时，
+    // 一次 403 就把账户判失败 → 落到这个收尾），而旧实现写死空模型名 → **整家**冷却 30 分钟。
+    // 实测 commandcode 退役 `ling-3.1-flash:free` 时，正文明确只针对该模型
+    //（`permission_error` + "has been retired … pick inclusionai/ling-3.1-flash"），
+    // 却把同家 deepseek-v4.1-flash / glm-5.3-flash 一起停了半小时。
+    if (lastStatus === 403 && bModel && isModelRetired403(lastDetail)) {
+      log(`provider ${provider.id} 的失败原因是"该模型已被上游下架/退役"（${maskSecrets(String(lastDetail || '')).slice(0, 90)}）`
+        + ' → **只冷却该模型**，不连坐整家（该家对别的模型仍然正常）');
+      catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
+      breakerRecordFail(provider.id, 403, 0, false, bModel, lastDetail);
+      return false;
+    }
     catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
     // 走到这里是"该家**所有账户**都不行"（账户池耗尽）→ 与模型无关，显式传空模型名走供应商级
-    breakerRecordFail(provider.id, lastStatus, 0, false, '');
+    breakerRecordFail(provider.id, lastStatus, 0, false, '', lastDetail);
   } else {
     // 未拿到可判定的上游状态码（如凭据解析失败、账户全部处于冷却而直接跳过）：
     // 该家这轮没被证明是坏的，但半开名额已占用 —— 交还名额，避免永久 half-open
