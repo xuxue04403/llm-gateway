@@ -23,6 +23,7 @@
     "test": "node tests/unit.js && node tests/writers.test.js && node tests/edge.test.js && node tests/security.test.js && node tests/renderer.test.js && node tests/gateway.test.js",
     "check": "node --check src/main.js && node --check src/gateway-manager.js && node --check src/writers/index.js",
     "parity": "node scripts/check-engine-parity.mjs",
+    "verify-artifact": "node scripts/verify-artifact.mjs",
     "icon": "node scripts/make-icon.mjs",
     "portable": "node scripts/build-portable.mjs",
     "pack": "node scripts/make-icon.mjs && electron-builder --dir",
