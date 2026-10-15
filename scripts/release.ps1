@@ -12,6 +12,7 @@
 #              → _scratch\.gh-token（未跟踪）。绝不把密钥写进这个脚本（它是要进仓库的）。
 #   -SkipTests 跳过 npm test（不建议；门禁仍会跑）
 #   -NoAppStop 构建时不停止运行中的应用（仅当你确认没有文件锁时用）
+#   -TagNote   标签注解（缺省 "LLM Gateway v<版本>"）。⚠ 不能含双引号。
 #   -OutName   产物目录名，默认 LLM-Gateway（配合 -OnlyGate 可验别的目录，如 .verify-test）
 #   -OnlyGate  只跑门禁后退出（构建完想单独复验，或发布中断后重验）
 #   -DryRun    只打印步骤，不做任何改动
@@ -41,6 +42,7 @@ param(
   [switch]$SkipTests,
   [switch]$NoAppStop,
   [string]$OutName = 'LLM-Gateway',
+  [string]$TagNote = '',
   [switch]$OnlyGate,
   [switch]$DryRun
 )
@@ -236,7 +238,9 @@ Step 6 "附注标签 v$Version"
 if ($DryRun) { Info "将执行 git tag -a v$Version（⚠ 注解里不能有双引号）并推送" }
 else {
   & $GIT -C $ROOT tag -d "v$Version" 2>&1 | Out-Null
-  $note = "LLM Gateway v$Version"
+  $note = if ($TagNote) { $TagNote } else { "LLM Gateway v$Version" }
+  # ⚠ 注解里不能有双引号 —— PowerShell 传参时会被吃掉（实测踩到），所以这里只在传入值里做校验
+  if ($note -match '"') { & $fail '标签注解里不能有双引号（PowerShell 传参会吃掉它）' }
   & $GIT -C $ROOT tag -a "v$Version" -m $note main
   $tagged = $false
   for ($i = 1; $i -le 6; $i++) {
