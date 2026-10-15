@@ -52,7 +52,9 @@
     "     配 clientProfile: \"cline\" 即可自动带全套（最小充分集是 X-CLIENT-TYPE: cline-sdk）；",
     "  ⑤ 实测可免费调用（余额 $0.00）：cline-free/* 五个 + z-ai/glm-5.3-flash + deepseek/deepseek-v4-flash",
     "     + 部分 :free 档；**z-ai/glm-5.3（不带 flash）与 moonshotai/kimi-k3 需付费**。",
-    "  ⑥ 注意 max_tokens 不能太小：这些模型会把 token 先用于思考，过小会得到 HTTP 500 empty response content。"
+    "  ⑥ 注意 max_tokens 不能太小：这些模型会把 token 先用于思考，过小会得到 HTTP 500 empty response content。",
+    "【预置供应商】下面 9 家（sensenova / agentrouter / commandcode / amd / opencode-go / nvidia / cline / workbuddy / agnes）是**预置模板**：结构、baseURL、模型清单都已备好，但**默认全部 enabled: false**，且 apiKey 统一是占位值 `sk-llm-gatway-xxxxxxxx`。要用哪家就填上**你自己的** key 并把 enabled 改成 true（设置页勾选即可）。",
+    "⚠ 预置里**不含**任何真实密钥、账号或本机路径。workbuddy 走桌面端凭据（auth: \"workbuddy\"），需要你在设置页填自己的 authFile 路径（示例里 accounts 只给了 id）。"
   ],
   "port": 3091,
   "apiKey": "dsh-gateway-change-me",
@@ -62,60 +64,387 @@
   },
   "providers": [
     {
-      "id": "provider-a",
-      "baseURL": "https://api.example.com/v1",
-      "apiKey": "sk-xxxxxxxx",
+      "_说明": "SenseNova（商汤）：OpenAI 兼容；对 RPM/TPM 限流会回 429 insufficient_quota —— 网关已识别为\"瞬时限流\"而非欠费。",
+      "id": "sensenova",
+      "baseURL": "https://token.sensenova.cn/v1",
+      "priority": 1,
+      "enabled": false,
       "models": [
-        "glm-5.2",
-        { "id": "glm-5.3", "vision": true }
+        {
+          "id": "deepseek-v4-flash",
+          "contextWindow": 1048576,
+          "maxTokens": 65536
+        },
+        {
+          "id": "glm-5.2",
+          "vision": true,
+          "contextWindow": 1048576,
+          "maxTokens": 131072
+        },
+        {
+          "id": "sensenova-6.8-flash-lite",
+          "vision": true,
+          "contextWindow": 262144,
+          "maxTokens": 65536
+        },
+        {
+          "id": "kimi-k3",
+          "vision": true,
+          "contextWindow": 1048576,
+          "maxTokens": 65536
+        },
+        {
+          "id": "deepseek-v4.1-flash",
+          "vision": true,
+          "contextWindow": 1048576,
+          "maxTokens": 65536
+        },
+        {
+          "id": "sensenova-u1.5-lite",
+          "contextWindow": 262144,
+          "maxTokens": 65536
+        }
+      ],
+      "reasoningEffortMap": {
+        "off": "none",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "max": "xhigh"
+      },
+      "protocol": "openai-chat",
+      "proxy": false,
+      "timeoutMs": 30000,
+      "apiKey": "sk-llm-gatway-xxxxxxxx"
+    },
+    {
+      "_说明": "AgentRouter：Anthropic 原生协议（protocol: anthropic-messages）+ claude 客户端仿真。",
+      "id": "agentrouter",
+      "baseURL": "https://agentrouter.org/",
+      "priority": 1,
+      "enabled": false,
+      "models": [
+        "deepseek-v4-flash",
+        {
+          "id": "gpt-6-astra",
+          "vision": true
+        },
+        {
+          "id": "claude-opus-5",
+          "vision": true
+        }
+      ],
+      "reasoningEffortMap": {
+        "off": "disabled",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "max": "max"
+      },
+      "timeoutMs": 25000,
+      "clientProfile": "claude",
+      "protocol": "anthropic-messages",
+      "apiKey": "sk-llm-gatway-xxxxxxxx"
+    },
+    {
+      "_说明": "Command Code Provider API：**只支持** /chat/completions（其 /messages 不服务这些模型），故 protocol: openai-chat。",
+      "id": "commandcode",
+      "baseURL": "https://api.commandcode.ai/provider/v1",
+      "models": [
+        {
+          "id": "deepseek/deepseek-v4.1-flash",
+          "as": "deepseek-v4.1-flash",
+          "vision": true,
+          "contextWindow": 1000000,
+          "maxTokens": 384000
+        },
+        {
+          "id": "deepseek/deepseek-v4.1-flash-fast",
+          "as": "deepseek-v4.1-flash",
+          "vision": true,
+          "contextWindow": 1000000,
+          "maxTokens": 384000
+        },
+        {
+          "id": "z-ai/glm-5.3-flash",
+          "as": "glm-5.3-flash",
+          "vision": true,
+          "contextWindow": 1048576,
+          "maxTokens": 64000
+        }
       ],
       "priority": 1,
-      "enabled": true
+      "enabled": false,
+      "protocol": "openai-chat",
+      "apiKey": "sk-llm-gatway-xxxxxxxx"
     },
     {
-      "id": "provider-b",
-      "baseURL": "https://api.example2.com/v1",
-      "apiKey": "sk-yyyyyyyy",
+      "_说明": "AMD AI 开发者计划（ROCm）：sglang-router 排队导致延迟波动极大（实测 GLM-5.3-Flash 可达 107 秒），timeoutMs 已放到 180 秒。",
+      "id": "amd",
+      "baseURL": "https://developer.amd.com.cn/radeon/api/v1",
       "models": [
-        "glm-5.2",
-        { "id": "deepseek-ai/deepseek-v4-flash", "as": "deepseek-v4-flash", "vision": true },
-        { "id": "deepseek-v4-flash0731", "as": "deepseek-v4-flash" }
+        {
+          "id": "MiMo-V2.6-Flash",
+          "as": "mimo-v2.6-flash",
+          "vision": true
+        },
+        {
+          "id": "DeepSeek-V4.1-Flash",
+          "as": "deepseek-v4.1-flash",
+          "vision": true
+        },
+        {
+          "id": "GLM-5.3-Flash",
+          "as": "glm-5.3-flash",
+          "vision": true
+        },
+        {
+          "id": "Qwen3.8-Flash-Next",
+          "as": "qwen3.8-flash",
+          "vision": true
+        },
+        {
+          "id": "DeepSeek-V4.1-Flash",
+          "as": "claude-haiku-5-5",
+          "vision": true
+        }
+      ],
+      "priority": 1,
+      "enabled": false,
+      "timeoutMs": 180000,
+      "quirks": [
+        "drop-thinking"
+      ],
+      "proxy": false,
+      "apiKey": "sk-llm-gatway-xxxxxxxx"
+    },
+    {
+      "_说明": "opencode zen（go 档）：按模型分 api 类型（openai-responses / openai-chat）。",
+      "id": "opencode-go",
+      "baseURL": "https://opencode.ai/zen/go",
+      "clientProfile": "opencode",
+      "models": [
+        {
+          "id": "gpt-6-luna",
+          "api": "openai-responses",
+          "vision": true
+        },
+        {
+          "id": "claude-haiku-5-5",
+          "as": "claude-sonnet-5-5",
+          "vision": true
+        },
+        {
+          "id": "space-bunny",
+          "api": "openai-chat",
+          "vision": true
+        },
+        {
+          "id": "deepseek-v4.1-flash",
+          "vision": true,
+          "contextWindow": 1048576,
+          "maxTokens": 384000
+        },
+        {
+          "id": "deepseek-v4-pro",
+          "vision": true,
+          "contextWindow": 1000000,
+          "maxTokens": 128000
+        },
+        {
+          "id": "glm-5.3-flash",
+          "vision": true,
+          "contextWindow": 200000,
+          "maxTokens": 64000
+        },
+        {
+          "id": "deepseek-v4.1-flash",
+          "as": "claude-haiku-5-5",
+          "vision": true,
+          "contextWindow": 1048576,
+          "maxTokens": 384000
+        }
       ],
       "priority": 2,
-      "enabled": true
+      "enabled": false,
+      "apiKey": "sk-llm-gatway-xxxxxxxx"
     },
     {
+      "_说明": "NVIDIA integrate API：走 OpenAI 兼容 /v1。",
+      "id": "nvidia",
+      "baseURL": "https://integrate.api.nvidia.com/v1",
+      "models": [
+        {
+          "id": "deepseek-ai/deepseek-v4.1-flash",
+          "as": "deepseek-v4.1-flash",
+          "vision": true,
+          "contextWindow": 1048576,
+          "maxTokens": 384000
+        },
+        {
+          "id": "moonshotai/kimi-k3",
+          "as": "kimi-k3",
+          "vision": true,
+          "contextWindow": 262144,
+          "maxTokens": 65536
+        },
+        {
+          "id": "z-ai/glm-5.3",
+          "as": "glm-5.3",
+          "contextWindow": 200000,
+          "maxTokens": 64000
+        },
+        {
+          "id": "z-ai/glm-5.3-flash",
+          "as": "glm-5.3-flash",
+          "vision": true,
+          "contextWindow": 200000,
+          "maxTokens": 64000
+        },
+        {
+          "id": "deepseek-ai/deepseek-v4.1-flash",
+          "as": "claude-haiku-5-5",
+          "vision": true
+        }
+      ],
+      "priority": 2,
+      "enabled": false,
+      "protocol": "openai-chat",
+      "timeoutMs": 20000,
+      "apiKey": "sk-llm-gatway-xxxxxxxx"
+    },
+    {
+      "_说明": "Cline（api.cline.bot）：必须 force-stream（非流式响应是非标准 envelope）；免费桶不在上游目录里，模型必须显式声明；clientProfile: cline 带身份头。",
+      "id": "cline",
+      "baseURL": "https://api.cline.bot/api/v1",
+      "protocol": "openai-chat",
+      "quirks": [
+        "force-stream"
+      ],
+      "headers": {
+        "User-Agent": "Cline/3.0.47",
+        "HTTP-Referer": "https://cline.bot",
+        "X-Title": "Cline",
+        "X-IS-MULTIROOT": "false",
+        "X-CLIENT-TYPE": "cline-sdk",
+        "X-CLIENT-VERSION": "3.0.47",
+        "X-PLATFORM": "terminal",
+        "X-PLATFORM-VERSION": "3.0.47",
+        "X-CORE-VERSION": "0.0.66"
+      },
+      "clientProfile": "cline",
+      "models": [
+        {
+          "id": "cline-free/deepseek-v4.1-flash",
+          "as": "deepseek-v4.1-flash",
+          "vision": true,
+          "contextWindow": 1048576,
+          "maxTokens": 384000
+        },
+        {
+          "id": "cline-free/mimo-v2.6-flash",
+          "as": "mimo-v2.6-flash",
+          "contextWindow": 262144
+        },
+        {
+          "id": "z-ai/glm-5.3-flash",
+          "as": "glm-5.3-flash",
+          "vision": true,
+          "contextWindow": 1310720
+        },
+        {
+          "id": "deepseek/deepseek-v4-flash",
+          "as": "deepseek-v4-flash",
+          "contextWindow": 1048576,
+          "maxTokens": 384000
+        }
+      ],
+      "proxy": false,
+      "enabled": false,
+      "priority": 2,
+      "timeoutMs": 30000,
+      "apiKey": "sk-llm-gatway-xxxxxxxx"
+    },
+    {
+      "_说明": "WorkBuddy / CodeBuddy：走**桌面端凭据**（auth: \"workbuddy\"）—— 请在 accounts 里填你自己的 authFile 路径；必需 force-stream 与 stringify-tool-choice。",
       "id": "workbuddy",
       "baseURL": "https://copilot.tencent.com/v2",
       "protocol": "openai-chat",
       "auth": "workbuddy",
-      "quirks": ["force-stream", "stringify-tool-choice"],
-      "headers": { "User-Agent": "CLI/2.63.2 CodeBuddy/2.63.2", "X-Product": "SaaS" },
-      "accounts": [
-        { "id": "acct1" }
+      "quirks": [
+        "force-stream",
+        "stringify-tool-choice"
       ],
-      "models": ["glm-5.3", "glm-5.2", "deepseek-v4-pro", "deepseek-v4-flash", "kimi-k3"],
-      "enabled": false
+      "headers": {
+        "User-Agent": "CLI/2.63.2 CodeBuddy/2.63.2",
+        "X-Product": "SaaS"
+      },
+      "accounts": [
+        {
+          "id": "acct1"
+        }
+      ],
+      "models": [
+        {
+          "id": "deepseek-v4.1-flash",
+          "vision": true,
+          "contextWindow": 1000000,
+          "maxTokens": 128000
+        },
+        {
+          "id": "deepseek-v4-flash",
+          "vision": true,
+          "contextWindow": 1000000,
+          "maxTokens": 50000
+        },
+        {
+          "id": "glm-5.3-flash",
+          "vision": true,
+          "contextWindow": 1000000,
+          "maxTokens": 32000
+        },
+        {
+          "id": "hy4-preview",
+          "vision": true,
+          "contextWindow": 1000000,
+          "maxTokens": 64000
+        },
+        {
+          "id": "deepseek-v4-pro",
+          "vision": true,
+          "contextWindow": 1000000,
+          "maxTokens": 128000
+        },
+        {
+          "id": "glm-5.3",
+          "vision": true,
+          "contextWindow": 1000000,
+          "maxTokens": 64000
+        },
+        {
+          "id": "deepseek-v4.1-flash",
+          "as": "claude-haiku-5-5",
+          "vision": true
+        },
+        {
+          "id": "space-bunny",
+          "vision": true
+        }
+      ],
+      "enabled": false,
+      "priority": 2,
+      "apiKey": "sk-llm-gatway-xxxxxxxx"
     },
     {
-      "_说明": "Cline（api.cline.bot）：免费模型接入。clientProfile 自动仿真 Cline 客户端身份头；quirks 的 force-stream 是必需的（非流式响应带非标准 envelope）；模型必须显式声明（免费桶不在上游目录里）。",
-      "id": "cline",
-      "baseURL": "https://api.cline.bot/api/v1",
-      "protocol": "openai-chat",
-      "apiKey": "sk_在此填入你的_Cline_API_Key",
-      "quirks": ["force-stream"],
-      "clientProfile": "cline",
+      "_说明": "Agnes AI：OpenAI 兼容。",
+      "id": "agnes",
+      "baseURL": "https://api.agnes-ai.cn/v1",
       "models": [
-        { "id": "cline-free/deepseek-v4.1-flash", "as": "deepseek-v4.1-flash", "vision": true, "contextWindow": 1048576 },
-        { "id": "cline-free/mimo-v2.6-flash", "as": "mimo-v2.6-flash", "contextWindow": 262144 },
-        { "id": "cline-free/muse-spark-1.3-contributor", "as": "muse-spark-1.3-contributor", "vision": true, "contextWindow": 1048576 },
-        { "id": "cline-free/solar-pro4", "as": "solar-pro4", "contextWindow": 262144 },
-        { "id": "poolside/laguna-s-2.1:free", "as": "laguna-s-2.1:free", "contextWindow": 262144 },
-        { "id": "z-ai/glm-5.3-flash", "as": "glm-5.3-flash", "contextWindow": 1310720 }
+        "agnes-3.0-flash"
       ],
-      "timeoutMs": 60000,
-      "priority": 6,
-      "enabled": false
+      "priority": 1,
+      "enabled": false,
+      "apiKey": "sk-llm-gatway-xxxxxxxx"
     }
   ]
 }

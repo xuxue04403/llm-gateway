@@ -511,4 +511,51 @@ t('渲染层：配置的代理连不上时概览页必须写明（否则用户�
     '有替代代理时必须写明改用了谁（写成"直连"就是谎报）：' + el().innerHTML);
 });
 
+t('渲染层：预置配置的首启引导必须出现，配好后必须消失（v1.0.0 预置 9 家模板）', () => {
+  // 背景：v1.0.0 起 example 里预置 9 家供应商（全部 enabled:false、apiKey 统一占位值），
+  // 而顶层 Key 仍是 `dsh-gateway-change-me` 时 validateConfigText **拒绝保存**。
+  // 旧界面没有任何提示 —— 新用户点保存只看到失败、不知道要先生成 Key。
+  const S = makeSandbox();
+  const { refs, sandbox } = S;
+  refs.LG.state = { gateway: { running: true, ready: true, port: 3091, configPath: 'C:\\x\\gateway.config.json' } };
+  const card = () => sandbox.document.querySelector('#firstRunCard');
+  const bodyOf = () => sandbox.document.querySelector('#firstRunBody').innerHTML;
+
+  // ① 全新安装：占位顶层 Key + 9 家全停用 + 占位供应商 Key → 三条待办都要出现
+  refs.LG.config = {
+    apiKey: 'dsh-gateway-change-me',
+    providers: [
+      { id: 'sensenova', enabled: false, apiKey: 'sk-llm-gatway-xxxxxxxx' },
+      { id: 'amd', enabled: false, apiKey: 'sk-llm-gatway-xxxxxxxx' },
+    ],
+  };
+  refs.LG.health = { accounts: [], proxy: { url: '' } };
+  refs.LG.renders.dashboard();
+  assert.notStrictEqual(card().style.display, 'none', '首启时引导卡必须显示');
+  const b1 = bodyOf();
+  assert.ok(/生成本机统一 Key/.test(b1), '要提示生成统一 Key：' + b1);
+  assert.ok(/启用至少一家供应商/.test(b1), '要提示启用供应商：' + b1);
+  assert.ok(/填入你自己的供应商 Key/.test(b1), '要提示填自己的供应商 Key：' + b1);
+  assert.ok(/sk-llm-gatway-xxxxxxxx/.test(b1), '要点出占位 Key 的值，用户才知道该换掉什么：' + b1);
+  assert.strictEqual((b1.match(/tag warn/g) || []).length, 3, '三条都应是"待办"：' + b1);
+
+  // ② 只生成了 Key、还没启用供应商 → 剩两条待办
+  refs.LG.config.apiKey = 'lgw-' + 'a'.repeat(48);
+  refs.LG.renders.dashboard();
+  const b2 = bodyOf();
+  assert.ok(/tag ok/.test(b2), '已完成的步骤要标出来：' + b2);
+  assert.strictEqual((b2.match(/tag warn/g) || []).length, 2, '应剩两条待办：' + b2);
+
+  // ③ 全部配好 → 整块隐藏（老用户升级上来不该看到多余引导）
+  refs.LG.config.providers = [{ id: 'sensenova', enabled: true, apiKey: 'sk-mine-1234567890' }];
+  refs.LG.renders.dashboard();
+  assert.strictEqual(card().style.display, 'none', '配好后引导卡必须隐藏；残留会长期占屏');
+
+  // ④ workbuddy 例外：走桌面端凭据（auth: workbuddy + accounts），不该被要求填 apiKey
+  refs.LG.config.providers = [{ id: 'workbuddy', enabled: true, auth: 'workbuddy', accounts: [{ id: 'acct1' }] }];
+  refs.LG.renders.dashboard();
+  assert.strictEqual(card().style.display, 'none',
+    'workbuddy 靠 accounts 凭据可用，不该被误判成"没填 Key"而一直显示引导');
+});
+
 run();

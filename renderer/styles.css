@@ -177,6 +177,17 @@ code { font-family: var(--mono); font-size: 12px; background: #0c1017; padding: 
 
 .hint { color: var(--text-mute); font-size: 11.5px; }
 .hint.block { display: block; margin: 0 0 12px; line-height: 1.7; }
+
+/* 首次使用引导（v1.0.0）：按步骤列，做完的划掉并变暗 */
+.firstrun { margin: 0; padding-left: 20px; }
+.firstrun li { margin: 0 0 10px; line-height: 1.65; }
+.firstrun li.done { opacity: .55; }
+.firstrun li.done b { text-decoration: line-through; }
+.firstrun li .hint { display: block; margin-top: 3px; }
+.firstrun code {
+  background: #0c1017; border: 1px solid var(--border-soft); border-radius: 4px;
+  padding: 1px 5px; font-size: 11.5px;
+}
 .spacer { flex: 1; }
 .hidden { display: none !important; }
 .empty { color: var(--text-mute); padding: 22px 8px; text-align: center; font-size: 12.5px; }

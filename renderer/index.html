@@ -119,6 +119,14 @@
 
       <!-- ---------- 概览 ---------- -->
       <section class="view active" id="view-dashboard">
+        <!-- 首次使用引导（v1.0.0）：预置的 9 家供应商默认停用、且统一 Key 是占位值，
+             用户必须先生成自己的 Key 才能保存配置。旧版没有这条提示，
+             用户点保存只会看到失败却不知原因。没有待办时整块隐藏。 -->
+        <div class="card" id="firstRunCard" style="display:none;">
+          <div class="card-head"><h2>开始使用</h2><span class="hint">按顺序做完即可调通</span></div>
+          <div id="firstRunBody"></div>
+        </div>
+
         <div class="grid grid-3">
           <div class="card stat-card">
             <div class="stat-label">网关状态</div>

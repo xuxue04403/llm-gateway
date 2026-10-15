@@ -600,7 +600,7 @@ F1 的修法不是"加一句 `tomlValidate(before)`"就完事 —— 旧实现**
 
 | 事实 | 证据 |
 |---|---|
-| 官方程序确实读 `~/.dsh` | 官方自己设的环境变量：`DSH_HOME=C:\Users\xuexu\.dsh`、`DSH_PROFILE=desktop`、`DSH_PROFILE_DIR=...\.dsh\profiles\desktop` |
+| 官方程序确实读 `~/.dsh` | 官方自己设的环境变量：`DSH_HOME=%USERPROFILE%\.dsh`、`DSH_PROFILE=desktop`、`DSH_PROFILE_DIR=...\.dsh\profiles\desktop` |
 | **`settings.yaml` 已不存在** | 只剩 `settings.yaml.imported`（11 KB，含 gateway + 31 个模型） |
 | **官方把它标记为 removed** | 源码 `importLegacyDocument()` 注释：*"Move the sections of **the removed `settings.yaml`** into the active profile"* |
 | 它是**一次性导入** | `const path = join(profile.home, "settings.yaml"); if (!existsSync(path)) return; await rename(path, \`${path}.imported\`);` |

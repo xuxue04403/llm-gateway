@@ -310,6 +310,9 @@ function switchView(name) {
     try { LG.renders[name](); } catch (e) { console.error(e); }
   }
 }
+// 暴露给其它渲染模块（首屏引导里的"去供应商页"按钮要用）。
+// 命名跟随现有的 `LG.renders` 约定，不另造一套。
+LG.go = switchView;
 
 /* ---------------- 通用：账号池展示 ---------------- */
 

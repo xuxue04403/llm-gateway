@@ -63,6 +63,18 @@ LG.renders.dashboard = function renderDashboard() {
     }
   }
 
+  /* --- 首次使用引导（v1.0.0）---
+   *
+   * 为什么需要它：本版起 example 里预置了 9 家供应商模板（全部 enabled:false、
+   * apiKey 统一是占位值）。而 gateway-manager.validateConfigText 会**拒绝保存**
+   * 顶层仍是 `dsh-gateway-change-me` 的配置（那是刻意的安全闸：仓库里公开的 Key
+   * 等于谁都能白用你的上游额度）。结果是新用户点「保存」只看到一句失败、
+   * 却不知道要先去生成 Key —— 旧界面没有任何地方提示这件事。
+   *
+   * 这里把"还差哪几步"直接摆在首屏，做完哪步就划掉哪步，全做完就整块隐藏。
+   */
+  renderFirstRun();
+
   /* --- 接入信息 --- */
   // Key 取**工作副本**而不是磁盘上的快照：点「重新生成统一 Key」只改工作副本，
   // 若这里读磁盘值，卡片会继续显示并允许复制那个即将失效的旧 Key（实测踩到）。
@@ -97,6 +109,91 @@ LG.renders.dashboard = function renderDashboard() {
  * "在冷却"就是 state !== 'ok'。
  */
 function isCooling(a) { return !!a && a.state && a.state !== 'ok'; }
+
+/**
+ * 首次使用引导：把"还差哪几步"摆在首屏。
+ *
+ * 判据都取自**配置实际内容**，不依赖"是否第一次启动"这类状态：
+ *  ① 统一 Key 是否还是占位值（validateConfigText 会因此拒绝保存）；
+ *  ② 有没有启用中的供应商（预置的 9 家默认全停用 → 一个模型都调不通）；
+ *  ③ 有没有真填了 Key 的已启用供应商（只勾启用、没填 Key 也调不通）。
+ * 三条都满足就隐藏整块 —— 老用户升级上来不会看到多余的引导。
+ */
+function renderFirstRun() {
+  const card = $('#firstRunCard');
+  const body = $('#firstRunBody');
+  if (!card || !body) return;
+
+  const key = String((LG.config && LG.config.apiKey) || '').trim();
+  const PLACEHOLDER = 'dsh-gateway-change-me';
+  const keyIsPlaceholder = key === PLACEHOLDER || key.length < 16;
+
+  const provs = (LG.config && LG.config.providers) || [];
+  const enabled = provs.filter((p) => p && p.enabled !== false);
+  const placeholderKey = 'sk-llm-gatway-xxxxxxxx';
+  const usable = enabled.filter((p) => {
+    const k = String((p.apiKey || '') || '').trim();
+    if (k && k !== placeholderKey && k.length >= 8) return true;
+    // workbuddy 走桌面端凭据（auth: workbuddy），不靠 apiKey
+    if (p.auth === 'workbuddy' && Array.isArray(p.accounts) && p.accounts.length) return true;
+    return false;
+  });
+
+  const steps = [];
+  steps.push({
+    done: !keyIsPlaceholder,
+    text: '生成本机统一 Key',
+    detail: keyIsPlaceholder
+      ? '当前还是占位值 <code>' + esc(key || '(空)') + '</code>，保存会被拒绝（仓库里的公开 Key 等于谁都能白用你的额度）。'
+        + '点下面按钮生成一个随机 Key。'
+      : '已设置（<code>' + esc(key.slice(0, 6)) + '…' + esc(key.slice(-4)) + '</code>）。',
+    action: keyIsPlaceholder ? { label: '生成并填入', act: 'genkey' } : null,
+  });
+  steps.push({
+    done: enabled.length > 0,
+    text: '启用至少一家供应商',
+    detail: enabled.length > 0
+      ? `已启用 ${enabled.length} 家。`
+      : `预置了 ${provs.length} 家模板，但**全部默认停用**。去「供应商」页勾选你要用的那家。`,
+    action: enabled.length === 0 ? { label: '去供应商页', act: 'nav:providers' } : null,
+  });
+  steps.push({
+    done: usable.length > 0,
+    text: '填入你自己的供应商 Key',
+    detail: usable.length > 0
+      ? `已有 ${usable.length} 家填好 Key。`
+      : '预置条目的 Key 统一是 <code>' + esc(placeholderKey) + '</code>，需要换成你自己的。'
+        + '（workbuddy 例外：它读桌面端凭据，在 accounts 里填 authFile 路径即可。）',
+    action: null,
+  });
+
+  if (steps.every((s) => s.done)) { card.style.display = 'none'; return; }
+
+  card.style.display = '';
+  body.innerHTML = '<ol class="firstrun">' + steps.map((s) => {
+    const mark = s.done ? '<span class="tag ok">已完成</span>' : '<span class="tag warn">待办</span>';
+    const btn = s.action
+      ? ` <button class="btn btn-sm" data-firstrun="${attr(s.action.act)}">${esc(s.action.label)}</button>`
+      : '';
+    return `<li class="${s.done ? 'done' : ''}">${mark} <b>${esc(s.text)}</b>${btn}<div class="hint">${s.detail}</div></li>`;
+  }).join('') + '</ol>';
+
+  // 动作委托（只绑一次：用 dataset 标记，避免每次渲染重复叠加监听）
+  if (!body.dataset.bound) {
+    body.dataset.bound = '1';
+    body.addEventListener('click', async (ev) => {
+      const btn = ev.target && ev.target.closest ? ev.target.closest('[data-firstrun]') : null;
+      if (!btn) return;
+      const act = btn.getAttribute('data-firstrun');
+      if (act === 'nav:providers') { LG.go('providers'); return; }
+      if (act === 'genkey') {
+        // 复用已有的「重新生成统一 Key」按钮逻辑（它带确认弹窗与写盘）
+        const b = $('#btnRegenKey');
+        if (b) b.click();
+      }
+    });
+  }
+}
 
 function renderHealth() {
   const box = $('#healthBox');
