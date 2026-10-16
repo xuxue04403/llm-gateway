@@ -22,6 +22,7 @@ const { Logger, registerSecret, scrubDeepSecrets } = require('./logger');
 const { Settings } = require('./settings');
 const { GatewayManager, validateConfigText } = require('./gateway-manager');
 const writers = require('./writers');
+const writersModels = require('./writers/models');   // 模型清单/别名表（与引擎规则一致，有回归测试锁死）
 const probe = require('./probe');
 const modelMeta = require('./model-meta');
 const clientHeaders = require('./client-headers');
@@ -545,6 +546,39 @@ function registerIpc() {
    *（实测 150 万行 2624ms，期间窗口/托盘/菜单全部无响应）。
    * `summarizeAsync` 与同步版共用同一个累加器，结果一致，但会定期让出事件循环。
    */
+  /**
+   * 模型名归并表（2026-10-16）：把历史使用记录里的**上游 ID** 折回逻辑名。
+   *
+   * 为什么需要：引擎在 2026-10-16 之前记账写的是上游 ID，于是同一个逻辑模型
+   *（如 `deepseek-v4.1-flash`，三家上游分别叫 `deepseek/deepseek-v4.1-flash` /
+   * `DeepSeek-V4.1-Flash` / `deepseek-v4.1-flash`）在「模型分布」里被拆成三行。
+   * 引擎侧已改为落盘即归一，但**已落盘的历史记录改不了**，只能在这里兜。
+   *
+   * 缓存 30 秒：聚合会被界面频繁触发（切天数、点刷新），而配置很少变。
+   * 缓存的是**纯数据**（Map），不依赖配置对象引用，所以保存配置后最多 30 秒内自动跟上。
+   */
+  let usageAliasCache = { at: 0, val: null };
+  function usageModelAlias() {
+    const now = Date.now();
+    if (usageAliasCache.val && now - usageAliasCache.at < 30000) return usageAliasCache.val;
+    let val = null;
+    try {
+      const cfg = (gateway && typeof gateway.configObject === 'function' ? gateway.configObject() : null) || {};
+      const byProvider = writersModels.buildUpstreamAliasMap(cfg);
+      const names = writersModels.collectModelNames(cfg);
+      const lower = writersModels.buildLowerIndex(names);
+      // logicalSet 让归并**幂等**：新记录里已经是逻辑名，不能再被别名表映射一次
+      //（见 src/usage.js 里 logicalOf 的顺序说明）。
+      val = { byProvider, lower, logicalSet: new Set(names) };
+    } catch (e) {
+      // 配置读不到就不归并（原样展示），绝不因为归并失败而让使用记录页白屏
+      logger.warn('使用记录：模型归并表构建失败，本次按原样展示：' + ((e && e.message) || e));
+      val = { byProvider: new Map(), lower: new Map(), logicalSet: new Set() };
+    }
+    usageAliasCache = { at: now, val };
+    return val;
+  }
+
   handle('gw:usage', async (_e, opts) => {
     try {
       const o = opts && typeof opts === 'object' ? opts : {};
@@ -553,6 +587,9 @@ function registerIpc() {
         days,
         detailLimit: o.detailLimit,
         filter: o.filter && typeof o.filter === 'object' ? o.filter : null,
+        // 模型名归并（2026-10-16）：把历史记录里的**上游 ID** 折回逻辑名，详见 src/usage.js 文件头。
+        // 表由配置推导，带 30 秒缓存 —— 聚合本身可能被频繁刷新，而配置很少变。
+        modelAlias: usageModelAlias(),
       });
     } catch (e) {
       // 读不到/算不出都不该让界面白屏 —— 回一个空结果 + 原因

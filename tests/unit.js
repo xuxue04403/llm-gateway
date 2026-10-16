@@ -496,6 +496,130 @@ t('用量聚合：范围过滤 / 各维度统计 / 缓存命中率 / 明细倒�
   fs2.rmSync(tmp, { recursive: true, force: true });
 });
 
+t('usage：模型名归并 —— 历史记录里的**上游 ID** 必须折回逻辑名（同一模型不再被拆成多行）', () => {
+  // 现场（2026-10-16 用户报）：使用记录「模型分布」里红框标出多行，其实是同一个模型：
+  //   deepseek-v4.1-flash(528) / deepseek/deepseek-v4.1-flash(802) / DeepSeek-V4.1-Flash(113)
+  // 三家上游的 `up` 各不相同，但 `as` 都是 deepseek-v4.1-flash。
+  // 引擎侧已改为"落盘即归一"，但**已落盘的历史记录改不了** —— 本测试锁住兜底归并。
+  // ⚠ fs2 / path2 / u 是上一个测试块里的**局部**变量，这里必须自己 require。
+  const fs2 = require('node:fs');
+  const os2 = require('node:os');
+  const path2 = require('node:path');
+  const u = require('../src/usage');
+  const tmp = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'usealias-'));
+  const dir = path2.join(tmp, 'usage');
+  fs2.mkdirSync(dir, { recursive: true });
+  const now = Date.now();
+  const rows = [
+    // 历史形态：记的是上游 ID（provider 字段带得动映射）
+    { ts: now - 3000, model: 'deepseek/deepseek-v4.1-flash', provider: 'cc', endpoint: '/messages', status: 'ok', stream: 1, durMs: 10, ttfbMs: 0, inTok: 1, outTok: 1, cacheRead: 0, cacheWrite: 0 },
+    { ts: now - 2000, model: 'DeepSeek-V4.1-Flash', provider: 'amd', endpoint: '/messages', status: 'ok', stream: 1, durMs: 10, ttfbMs: 0, inTok: 1, outTok: 1, cacheRead: 0, cacheWrite: 0 },
+    { ts: now - 1000, model: 'deepseek-v4.1-flash', provider: 'x666', endpoint: '/messages', status: 'ok', stream: 1, durMs: 10, ttfbMs: 0, inTok: 1, outTok: 1, cacheRead: 0, cacheWrite: 0 },
+    // 大小写不同但逻辑名相同（实测 glm-5.3-flash / GLM-5.3-Flash 同时存在）
+    { ts: now - 900, model: 'GLM-5.3-Flash', provider: 'h-e.top', endpoint: '/messages', status: 'ok', stream: 1, durMs: 10, ttfbMs: 0, inTok: 1, outTok: 1, cacheRead: 0, cacheWrite: 0 },
+    // 已经不在配置里声明过的模型（用户删过供应商）—— **必须原样保留，不许猜**
+    { ts: now - 800, model: 'inclusionai/ling-3.1-flash', provider: 'cc', endpoint: '/messages', status: 'ok', stream: 1, durMs: 10, ttfbMs: 0, inTok: 1, outTok: 1, cacheRead: 0, cacheWrite: 0 },
+  ];
+  fs2.writeFileSync(path2.join(dir, u.dayKey(now) + '.jsonl'), rows.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8');
+
+  const cfg = {
+    providers: [
+      { id: 'cc', enabled: true, models: [{ id: 'deepseek/deepseek-v4.1-flash', as: 'deepseek-v4.1-flash' }, 'inclusionai/other'] },
+      { id: 'amd', enabled: true, models: [{ id: 'DeepSeek-V4.1-Flash', as: 'deepseek-v4.1-flash' }] },
+      { id: 'x666', enabled: true, models: [{ id: 'deepseek-v4.1-flash', as: 'deepseek-v4.1-flash' }] },
+      { id: 'h-e.top', enabled: true, models: [{ id: 'GLM-5.3-Flash', as: 'glm-5.3-flash' }] },
+    ],
+  };
+  const modelsMod = require('../src/writers/models');
+  const alias = {
+    byProvider: modelsMod.buildUpstreamAliasMap(cfg),
+    lower: modelsMod.buildLowerIndex(modelsMod.collectModelNames(cfg)),
+  };
+  const r = u.summarize(tmp, { days: 30, detailLimit: 10, modelAlias: alias });
+
+  const models = r.byModel.map((m) => m.model);
+  assert.ok(models.includes('deepseek-v4.1-flash'), '三家上游 ID 必须合成 deepseek-v4.1-flash：' + JSON.stringify(models));
+  assert.strictEqual(models.filter((m) => /deepseek/i.test(m)).length, 1,
+    '不许再出现第二行 deepseek*：' + JSON.stringify(models));
+  assert.strictEqual(r.byModel.find((m) => m.model === 'deepseek-v4.1-flash').requests, 3, '三行合一后请求数应累加');
+  assert.ok(models.includes('glm-5.3-flash') && !models.includes('GLM-5.3-Flash'),
+    '大小写不同的上游名也要归并：' + JSON.stringify(models));
+  assert.ok(models.includes('inclusionai/ling-3.1-flash'),
+    '★ 配置里查不到的模型必须原样保留 —— 归并宁可不动也不能猜：' + JSON.stringify(models));
+
+  // 明细同样显示逻辑名，且**上游 ID 与逻辑名不同时**不丢原名。
+  // ⚠ 要挑真正有差异的那条：x666 的上游 ID 恰好就等于逻辑名（`deepseek-v4.1-flash`），
+  //   对它断言 upstream 存在是错的（本来就没有"原名"可保留）—— 我第一次就这么写错了。
+  const dcc = r.detail.find((x) => x.provider === 'cc' && /deepseek/.test(x.model));
+  assert.strictEqual(dcc.model, 'deepseek-v4.1-flash', '明细也要显示逻辑名');
+  assert.strictEqual(dcc.upstream, 'deepseek/deepseek-v4.1-flash', '上游原名不能丢（放进 upstream 字段）');
+  const dx666 = r.detail.find((x) => x.provider === 'x666');
+  assert.strictEqual(dx666.upstream, undefined, '上游名与逻辑名相同时不写多余的 upstream 字段');
+
+  // 筛选项也要是归并后的名字（否则下拉框选不到、选了又筛不出）
+  assert.ok(r.options.models.includes('deepseek-v4.1-flash'), '筛选项用归并后的名字');
+  assert.ok(!r.options.models.includes('DeepSeek-V4.1-Flash'), '筛选项里不该再出现上游 ID');
+
+  // 不带 modelAlias 时必须保持原行为（老调用方不受影响）
+  const raw = u.summarize(tmp, { days: 30, detailLimit: 10 });
+  assert.strictEqual(raw.byModel.filter((m) => /deepseek/i.test(m.model)).length, 3,
+    '不传归并表时保持原样（不该悄悄改变老调用方的结果）');
+
+  fs2.rmSync(tmp, { recursive: true, force: true });
+});
+
+t('usage：归并表的构建必须**按供应商**分表（全局表在冲突时结果不确定）', () => {
+  const modelsMod = require('../src/writers/models');
+  // 同一个上游 ID 在两家映射成不同的逻辑名 —— 全局表只能留一个，结果取决于遍历顺序。
+  // 记录里带着 provider 字段，所以按 (provider, up) 查是确定的。
+  const cfg = {
+    providers: [
+      { id: 'p1', models: [{ id: 'X', as: 'A' }] },
+      { id: 'p2', models: [{ id: 'X', as: 'B' }] },
+    ],
+  };
+  const byProv = modelsMod.buildUpstreamAliasMap(cfg);
+  assert.strictEqual(byProv.get('p1').get('X'), 'A');
+  assert.strictEqual(byProv.get('p2').get('X'), 'B', '同一个上游 ID 在不同家必须是不同结果');
+});
+
+t('usage：归并必须是**幂等**的（新旧记录混存时不能越归越偏）', () => {
+  // 为什么必须单独测这个：引擎改成"落盘即归一"之后，同一个 jsonl 目录里会**同时**存在
+  //   旧记录（上游 ID）与新记录（逻辑名）。归并逻辑要能安全地对两者各跑一遍 ——
+  //   对已经是逻辑名的那种，再跑一次必须原样返回。
+  // 最容易踩的反例：某家同时声明了 `{id:'A', as:'B'}` 与 `{id:'B', as:'C'}` 两条。
+  //   若先查别名表而不先判"是否已是逻辑名"，逻辑名 `B` 会被再映射成 `C` ——
+  //   同一条记录每跑一次就偏一点。
+  const fs2 = require('node:fs');
+  const os2 = require('node:os');
+  const path2 = require('node:path');
+  const u = require('../src/usage');
+  const modelsMod = require('../src/writers/models');
+  const cfg = {
+    providers: [
+      { id: 'p1', enabled: true, models: [{ id: 'A', as: 'B' }, { id: 'B', as: 'C' }] },
+    ],
+  };
+  const names = modelsMod.collectModelNames(cfg);
+  const alias = {
+    byProvider: modelsMod.buildUpstreamAliasMap(cfg),
+    lower: modelsMod.buildLowerIndex(names),
+    logicalSet: new Set(names),
+  };
+  const mapOne = (name) => {
+    const agg = u.makeAggregator({ days: 30, modelAlias: alias });
+    agg.add({ ts: Date.now(), model: name, provider: 'p1', status: 'ok', durMs: 1, inTok: 0, outTok: 0, cacheRead: 0, cacheWrite: 0 });
+    return agg.result().byModel[0].model;
+  };
+  assert.strictEqual(mapOne('A'), 'B', '上游 ID A 应归并到逻辑名 B');
+  assert.strictEqual(mapOne('B'), 'B', '★ B 已是逻辑名，再映射一次必须还是 B（不能变成 C）');
+  assert.strictEqual(mapOne('C'), 'C', 'C 已是逻辑名，原样返回');
+  // 连跑两轮（模拟同一目录被反复聚合）结果不得变化
+  let cur = 'A';
+  for (let i = 0; i < 5; i++) cur = mapOne(cur);
+  assert.strictEqual(cur, 'B', '反复归并必须收敛到 B，实际 ' + cur);
+});
+
 t('validateConfigText：合法配置通过', () => {
   const r = validateConfigText(JSON.stringify(OK_CFG));
   assert.strictEqual(r.ok, true, r.error);

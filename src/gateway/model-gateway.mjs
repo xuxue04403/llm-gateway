@@ -6418,7 +6418,9 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       try {
         recordUsage({
           ts: startedAt,
-          model: (mx.model || (body && body.model) || ''),
+          // 同上（直通路径）：折回逻辑名，避免同一模型因上游 ID 不同被拆成多行。
+          // 矩阵路径的 `mx.model` 是上游 ID，所以这里也统一走 logicalModelOf。
+          model: logicalModelOf(provider, mx.model || (body && body.model)) || '',
           provider: provider.id,
           endpoint: upstreamPath,
           status: mxRet === false ? 'fail' : (mxRet && mxRet.stop ? 'fail:' + (mxRet.stop.status || '') : 'ok'),
@@ -6685,7 +6687,16 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     const u = usageFromTail(tail);
     recordUsage({
       ts: startedAt,
-      model: (body && body.model) || '',
+      // 2026-10-16 修复：记账必须折回**逻辑模型名**，否则使用记录里同一个模型会被拆成好几行。
+      // 实测（10-15 的 2365 条记录）：
+      //   commandcode 的 up=`deepseek/deepseek-v4.1-flash`、amd 的 up=`DeepSeek-V4.1-Flash`、
+      //   x666 的 up=`deepseek-v4.1-flash` —— 三家的**上游 ID 各不相同**，但 as 都是
+      //   `deepseek-v4.1-flash`。旧实现直接记 `body.model`（上游 ID），于是"模型分布"里
+      //   出现 605 / 149 / 113 三行，看起来像三个模型。
+      // 为什么在**记账前**折而不是在展示端折：同一条链路上模型级熔断（breakerAcquire 的 bModel）
+      //   与路由筛选用的都是逻辑名，记账再记上游名就成了第三套口径 —— 本项目已多次吃过
+      //   "同一逻辑多处实现 → 悄悄漂移"的亏。落盘即归一，消费端不必再懂映射。
+      model: logicalModelOf(provider, body && body.model) || '',
       provider: provider.id,
       endpoint: upstreamPath,
       status: truncated ? 'truncated' : 'ok',
@@ -8912,7 +8923,12 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         // 统一由 recordUsage() 负责，避免"三个调用点各减一次、漏一个就重复计数"。
         recordUsage({
           ts: startedAt,
-          model: (body && body.model) || '',
+          // 2026-10-16 修复：折回**逻辑模型名**，不要记上游 ID（`body.model` 此处已被
+          // bodyForProvider 映射成上游 ID）。复用本函数已算好的 `bModel` —— 它与上面
+          // breakerAcquire 用的是同一个值，记账与熔断口径因此不可能漂移。
+          // 实测影响：commandcode 的 `deepseek/deepseek-v4.1-flash` 与 amd 的
+          // `DeepSeek-V4.1-Flash` 本应是同一行 `deepseek-v4.1-flash`，旧实现记成三行。
+          model: bModel || '',
           provider: provider.id,
           endpoint: upstreamPath,
           status: status || 'ok',

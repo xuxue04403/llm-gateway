@@ -127,6 +127,72 @@ function chosenModelProblem(cfg, chosen) {
   return '';
 }
 
+/**
+ * 建一个"上游模型 ID → 逻辑模型名"的**按供应商**查找表（供使用记录的历史数据归并）。
+ *
+ * 为什么需要它：2026-10-16 之前引擎在记账时写的是**上游 ID**（如 commandcode 的
+ * `deepseek/deepseek-v4.1-flash`、amd 的 `DeepSeek-V4.1-Flash`），而它们其实是同一个逻辑模型
+ * `deepseek-v4.1-flash`。引擎侧已修正为落盘即归一，但**已经写进 jsonl 的历史记录改不了** ——
+ * 旧记录不归并的话，"模型分布"里同一个模型会永远显示成好几行（越老的日期越明显）。
+ *
+ * ⚠ 为什么按供应商分开建表，而不是建一张全局的 up→as 大表：
+ *   实测配置里 `deepseek-v4.1-flash` 在 commandcode 的 up 恰好也是 `deepseek-v4.1-flash`，
+ *   而 x666 的 up 也是同名字符串。若用全局表，一旦某家把 `X` 映射成 `A`、另一家把同一个 `X`
+ *   映射成 `B`，全局表只能留一个，归并结果就取决于遍历顺序 —— 那是不确定的。
+ *   记录里**带着 provider 字段**，按 (provider, up) 查表是确定的，且不依赖任何猜测。
+ *
+ * @returns {Map<string, Map<string,string>>} providerId → (upstreamId → logicalName)
+ */
+function buildUpstreamAliasMap(cfg) {
+  const byProvider = new Map();
+  for (const p of ((cfg && cfg.providers) || [])) {
+    if (!p) continue;
+    const id = String(p.id || '');
+    if (!id) continue;
+    let m = byProvider.get(id);
+    if (!m) { m = new Map(); byProvider.set(id, m); }
+    for (const e of modelEntries(p)) {
+      if (!m.has(e.up)) m.set(e.up, e.as || e.up);
+    }
+  }
+  return byProvider;
+}
+
+/**
+ * 把一条使用记录里的模型名归并到**逻辑模型名**。
+ *
+ * 顺序（每一步都有理由）：
+ *   ① 先按 (provider, 记录里的名字) 查上游别名表 —— 这是历史记录里那种"上游 ID"的解法；
+ *   ② 查不到就按**不区分大小写**匹配已声明的逻辑模型名 ——
+ *      实测记录里同时存在 `glm-5.3-flash` 与 `GLM-5.3-Flash`（同一家的上游大小写不同），
+ *      逻辑名是前者；不做这一步它们就仍是两行；
+ *   ③ 还查不到就原样返回（用户改过配置、删过供应商、或本来就没在配置里声明过的模型 ——
+ *      归并**宁可不动也不能猜**，猜错会把两个不相干的模型合成一行，比拆开更误导）。
+ *
+ * @param {Map<string,Map<string,string>>} aliasMap buildUpstreamAliasMap() 的结果
+ * @param {Set<string>} logicalNames 配置里声明的全部逻辑模型名
+ * @param {string} lowerIndex  预留：逻辑名的小写 → 逻辑名（由调用方缓存，避免每条记录重建）
+ */
+function resolveLogicalModel(aliasMap, lowerIndex, provider, name) {
+  const raw = String(name || '');
+  if (!raw) return raw;
+  const m = aliasMap && aliasMap.get(String(provider || ''));
+  if (m && m.has(raw)) return m.get(raw);
+  const hit = lowerIndex && lowerIndex.get(raw.toLowerCase());
+  if (hit) return hit;
+  return raw;
+}
+
+/** 逻辑名的小写 → 逻辑名（归并用的①号索引；同名不同大小写只保留先出现的那一个） */
+function buildLowerIndex(names) {
+  const idx = new Map();
+  for (const n of names || []) {
+    const k = String(n).toLowerCase();
+    if (!idx.has(k)) idx.set(k, String(n));
+  }
+  return idx;
+}
+
 module.exports = {
   modelEntries,
   logicalModelNames,
@@ -136,4 +202,7 @@ module.exports = {
   collectModelNames,
   pickDefaultModel,
   chosenModelProblem,
+  buildUpstreamAliasMap,
+  resolveLogicalModel,
+  buildLowerIndex,
 };

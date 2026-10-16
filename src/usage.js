@@ -9,6 +9,23 @@
 // 所以「总输入 = inTok + cacheRead + cacheWrite」在两种协议下都成立，
 // 这里**不要**再去做协议判断（那是引擎的职责，做两遍必然漂移）。
 //
+// ── 模型名归并（2026-10-16）────────────────────────────────────────────────
+//
+// 2026-10-16 之前引擎记账写的是**上游 ID**，于是同一个逻辑模型在使用记录里被拆成好几行：
+//   commandcode 的 `deepseek/deepseek-v4.1-flash`、amd 的 `DeepSeek-V4.1-Flash`、
+//   x666 的 `deepseek-v4.1-flash` —— 三家的 up 各不相同，但 `as` 都是 `deepseek-v4.1-flash`。
+//   实测 10-15 的 2365 条记录被拆成 605 / 149 / 113 三行，看着像三个模型。
+//
+// 引擎侧已改成"落盘即归一"（新记录直接是逻辑名）。**但已经写进 jsonl 的历史记录改不了** ——
+// 所以这里还要再兜一层：按记录里的 provider 字段查"上游 ID → 逻辑名"映射表，把旧记录也归并掉。
+//
+// ⚠ 归并表由**调用方传入**（`opts.modelAlias`，纯数据 `{ byProvider: Map, lower: Map }`），
+//   而不是本模块去 require 配置模块 —— 本文件刻意保持"只用 node: 内置模块"。
+//   表的构建见 src/writers/models.js 的 buildUpstreamAliasMap()。
+//
+// ⚠ 归并**宁可不动也不能猜**：查不到的一律原样保留（用户改过配置/删过供应商/本来就没声明过的
+//   模型）。猜错会把两个不相干的模型合成一行，比拆开更误导人。
+//
 // ── 同步 / 异步两条入口（2026-10-13 审计后补）──────────────────────────────
 //
 // **为什么要有异步版**：`summarize()` 是纯同步的，而它被 main.js 的 IPC 直接调用 ——
@@ -140,6 +157,31 @@ function makeAggregator(opts) {
   const days = Number.isFinite(Number(o.days)) ? Number(o.days) : 30;
   const detailLimit = Math.min(5000, Math.max(1, Number(o.detailLimit) || 500));
   const f = o.filter || {};
+  // 模型名归并表（可选）。形状：{ byProvider: Map<providerId, Map<up, logical>>, lower: Map<lower, logical> }
+  const alias = o.modelAlias || null;
+
+  /**
+   * 把记录里的模型名归并到逻辑名（详见文件头「模型名归并」）。
+   * 查不到就原样返回 —— 不猜。
+   *
+   * ⚠ 顺序很关键，**必须是幂等的**：新记录里已经是逻辑名，再跑一次不能把它改掉。
+   *   反例（会出错的那种）：某家声明了 `{id:'A', as:'B'}` 与 `{id:'B', as:'C'}` 两条 ——
+   *   若先查别名表，逻辑名 `B` 会被再次映射成 `C`，同一条记录越归越偏。
+   *   所以①先判"是不是已经就是某个声明的逻辑名"，是就原样返回。
+   */
+  const logicalOf = (provider, name) => {
+    const raw = String(name || '');
+    if (!raw || !alias) return raw;
+    // ① 已经是声明的逻辑名 → 原样返回（保证幂等）
+    if (alias.logicalSet && alias.logicalSet.has(raw)) return raw;
+    // ② 按 (provider, 上游 ID) 查别名表 —— 历史记录里那种"上游 ID"的解法
+    const per = alias.byProvider && alias.byProvider.get(String(provider || ''));
+    if (per && per.has(raw)) return per.get(raw);
+    // ③ 上游大小写不同但逻辑名相同（实测 glm-5.3-flash / GLM-5.3-Flash）
+    const low = alias.lower && alias.lower.get(raw.toLowerCase());
+    if (low) return low;
+    return raw;
+  };
 
   const totals = newBucket();
   const byDay = new Map();
@@ -158,7 +200,7 @@ function makeAggregator(opts) {
   const detailBuf = [];
   const COMPACT_AT = detailLimit * 2;
 
-  const keep = (r) => (!f.model || r.model === f.model)
+  const keep = (r, model) => (!f.model || model === f.model)
     && (!f.provider || r.provider === f.provider)
     && (!f.endpoint || r.endpoint === f.endpoint)
     && (!f.status || r.status === f.status);
@@ -168,17 +210,20 @@ function makeAggregator(opts) {
     detailLimit,
     add(r) {
       if (!r || typeof r.ts !== 'number') return;
+      // ⚠ 先归并再参与**任何**判断：分桶、筛选项、过滤器、明细全都用同一个逻辑名，
+      //   否则会出现"下拉框里选不到、选了又筛不出"这类自相矛盾的表现。
+      const model = logicalOf(r.provider, r.model);
       totalRows++;
-      if (r.model) seenModels.add(r.model);
+      if (model) seenModels.add(model);
       if (r.provider) seenProviders.add(r.provider);
       if (r.endpoint) seenEndpoints.add(r.endpoint);
       if (r.status) seenStatuses.add(r.status);
-      if (!keep(r)) return;
+      if (!keep(r, model)) return;
       rowCount++;
       addTo(totals, r);
       const dims = [
         [byDay, dayKey(r.ts)],
-        [byModel, r.model || '(未知)'],
+        [byModel, model || '(未知)'],
         [byProvider, r.provider || '(未知)'],
         [byEndpoint, r.endpoint || '(未知)'],
       ];
@@ -203,7 +248,11 @@ function makeAggregator(opts) {
         ts: r.ts,
         day: dayKey(r.ts),
         time: new Date(r.ts).toLocaleTimeString('zh-CN', { hour12: false }),
-        model: r.model,
+        // 明细也显示**逻辑名**：否则用户在下拉框里选 `deepseek-v4.1-flash` 筛出来的明细
+        // 却写着 `deepseek/deepseek-v4.1-flash`，看起来像筛错了。
+        // 上游原名不丢 —— 放进 `upstream` 字段，需要时能看到"这条到底走的哪个上游 ID"。
+        model: logicalOf(r.provider, r.model),
+        upstream: r.model && logicalOf(r.provider, r.model) !== r.model ? r.model : undefined,
         provider: r.provider,
         endpoint: r.endpoint,
         status: r.status,
