@@ -2160,6 +2160,17 @@ let upstreamPort = 0;
           res.end(JSON.stringify(opts.bigBody || { error: { message: 'x'.repeat(2 * 1024 * 1024) } }));
           return;
         }
+        // 2026-10-16（commandcode 实测形态）：请求体 JSON 节点数超过上游硬上限。
+        // 上游回的是**确定性** 400，重试无用 —— 网关应在**下次**调用前就跳过这家（本次调用内）。
+        if (behavior === 'nodeCount400') {
+          st.nodeCountRejections = (st.nodeCountRejections || 0) + 1;
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: {
+            message: JSON.stringify({ message: 'Invalid request JSON: JSON node count cannot exceed 32768 trace_id: abc123' }),
+            type: 'invalid_request_error',
+          } }));
+          return;
+        }
         if (behavior === 'credit') {
           res.writeHead(402, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ code: 0, msg: 'insufficient credit: 积分不足' }));
@@ -6003,6 +6014,193 @@ let upstreamPort = 0;
       const logText = fs.readFileSync(gw.logPath, 'utf8');
       assert.ok(/遵循上游 Retry-After/.test(logText),
         '日志须写明遵循了上游 Retry-After（否则等待时长可能不足）：' + logText.slice(-600));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  /* ── 请求体过大 → 当次调用跳过该家（2026-10-16，commandcode 实测）───────────────
+   *
+   * 现场：DSH 声明 366 个工具时，commandcode 稳定回
+   *   HTTP 400 `Invalid request JSON: JSON node count cannot exceed 32768`
+   * 这是确定性失败，重试无用，但每次要白等约 3.3 秒才 failover。
+   *
+   * 用户要求（原话）：「当次调用跳过该供应商直接换一家，但是下一次调用时
+   * 如果不触发降级则继续使用当前供应商」——即**不得留任何跨请求状态**。
+   */
+  /** 造一个节点数确定超限的请求（工具多 + schema 深，实测口径远超阈值） */
+  const oversizedTools = () => Array.from({ length: 1800 }, (_, i) => ({
+    name: 'Tool' + i,
+    description: 'desc ' + i + ' ' + 'x'.repeat(200),
+    input_schema: {
+      type: 'object',
+      properties: {
+        a: { type: 'string', description: 'y'.repeat(150) },
+        b: { type: 'object', properties: { c: { type: 'number' }, d: { type: 'boolean' } } },
+        e: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['a'],
+    },
+  }));
+
+  t('请求体过大：当次调用跳过该家（不发上游请求，省掉注定 400 的往返）', async () => {
+    const up = await startFakeOpenAIUpstream({ behavior: 'ok' });
+    const prov = openaiProvider('bigbody', up, { priority: 1, jsonNodeLimit: 32768 });
+    const gw = await startGatewayWith([prov], 'bigbodycase', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }], tools: oversizedTools() } });
+      // 唯一候选被跳过 → 全部候选失败；关键是**上游一次都没被打到**
+      assert.strictEqual(up.st.calls, 0,
+        '请求体过大时不得向上游发请求（省掉注定 400 的往返），实际发了 ' + up.st.calls + ' 次');
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/请求体过大/.test(logText), '日志须写明"请求体过大"：' + logText.slice(-600));
+      assert.ok(/本次调用跳过，不记失败/.test(logText), '日志须写明"不记失败"（不得冷却该家）：' + logText.slice(-600));
+      assert.ok(r.status >= 400, '无其它候选时客户端应收到错误，实际 ' + r.status);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('请求体过大**不影响后续调用**：小请求照常走这家（无跨请求状态）', async () => {
+    const up = await startFakeOpenAIUpstream({ behavior: 'ok' });
+    const prov = openaiProvider('bigbody2', up, { priority: 1, jsonNodeLimit: 32768 });
+    const gw = await startGatewayWith([prov], 'bigbody2case', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      // ① 先来一发超大请求 → 被跳过，上游零调用
+      await call({ port: gw.port, body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }], tools: oversizedTools() } });
+      assert.strictEqual(up.st.calls, 0, '超大请求不得触达上游，实际 ' + up.st.calls);
+
+      // ② 紧接着一发正常请求 → **必须照常成功**（用户明确要求：下一次不触发降级就继续用这家）
+      const r2 = await call({ port: gw.port });
+      assert.strictEqual(r2.status, 200,
+        '下一次正常请求必须照常走这家（不得因上次跳过而冷却/熔断它），实际 ' + r2.status + ' ' + r2.text.slice(0, 160));
+      assert.strictEqual(up.st.calls, 1, '正常请求应恰好打到上游一次，实际 ' + up.st.calls);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('请求体过大**不熔断**：连续多次超大请求后，该家仍立即可用', async () => {
+    const up = await startFakeOpenAIUpstream({ behavior: 'ok' });
+    const prov = openaiProvider('bigbody3', up, { priority: 1, jsonNodeLimit: 32768 });
+    const gw = await startGatewayWith([prov], 'bigbody3case', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      // 连打 4 次（超过默认熔断阈值 3）——若误按失败计数，这家会被冷却 30 分钟
+      for (let i = 0; i < 4; i++) await call({ port: gw.port, body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }], tools: oversizedTools() } });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(!/breaker OPEN/.test(logText),
+        '请求体过大**不得**计入失败/开闸熔断：' + logText.slice(-800));
+      // 之后正常请求必须立刻成功（没有被冷却）
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200,
+        '多次跳过之后，正常请求仍须立即成功（说明该家未被冷却），实际 ' + r.status + ' ' + r.text.slice(0, 160));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('请求体过大时会 failover 到下一家（不是整轮失败）', async () => {
+    // 第一家（优先级高）配了上限 → 会被跳过；第二家**未配置**（默认不检查）→ 应被正常调用。
+    //
+    // ⚠ 这个用例记录了本特性一次**重要的方向修正**：初版是"默认对所有家生效、
+    //   用 jsonNodeLimit:0 关闭"。但实测发现只有 commandcode 有节点数上限，
+    //   而 x666 / muyuan.do / aihubmix.com 能吃下 140012 个节点（2.83 MB）的请求 ——
+    //   对它们套用阈值就是**纯误跳**。故默认反转为"不检查"，只对已知有上限的家显式配置。
+    const upBig = await startFakeOpenAIUpstream({ behavior: 'ok' });
+    const upOk = await startFakeOpenAIUpstream({ behavior: 'ok' });
+    const pBig = openaiProvider('bbig', upBig, { priority: 1, jsonNodeLimit: 32768 });
+    const pOk = openaiProvider('bok', upOk, { priority: 2 });   // 未配置 = 不检查
+    const gw = await startGatewayWith([pBig, pOk], 'bigfailover', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }], tools: oversizedTools() } });
+      assert.strictEqual(r.status, 200,
+        '应 failover 到第二家并成功，实际 ' + r.status + ' ' + r.text.slice(0, 160));
+      assert.strictEqual(upBig.st.calls, 0, '第一家不应收到超大请求，实际 ' + upBig.st.calls);
+      assert.strictEqual(upOk.st.calls, 1, '第二家（未配置上限）应收到请求一次，实际 ' + upOk.st.calls);
+    } finally { killGw(gw); closeUp(upBig); closeUp(upOk); }
+  });
+
+  t('默认**不检查**：未配置 jsonNodeLimit 的家，超大请求照常发出去（零误跳）', async () => {
+    // 这是本特性的核心安全保证。实测 x666 / muyuan.do / aihubmix.com 能吃 140012 节点，
+    // 若默认对它们生效就会把本来能成功的请求跳过 → 凭空降低可用性。
+    const up = await startFakeOpenAIUpstream({ behavior: 'ok' });
+    const prov = openaiProvider('pdefault', up, { priority: 1 });   // 刻意不配 jsonNodeLimit
+    const gw = await startGatewayWith([prov], 'defaultoff', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }], tools: oversizedTools() } });
+      assert.strictEqual(r.status, 200, '未配置上限的家必须照常服务，实际 ' + r.status + ' ' + r.text.slice(0, 160));
+      assert.strictEqual(up.st.calls, 1, '超大请求应被正常转发到上游，实际 ' + up.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(!/请求体过大/.test(logText), '未配置的家不该出现"请求体过大"跳过记录：' + logText.slice(-500));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('上限**逐家可配**：配了的家被跳过，未配置的家不受影响', async () => {
+    // 两个家收到同一份超大请求：
+    //   · 配了 jsonNodeLimit: 32768 的家 → 被跳过，上游零调用
+    //   · 未配置的家（默认不检查）        → 照常收到请求
+    const upConfigured = await startFakeOpenAIUpstream({ behavior: 'ok' });
+    const upDefault = await startFakeOpenAIUpstream({ behavior: 'ok' });
+    const pConfigured = openaiProvider('pcfg', upConfigured, { priority: 1, jsonNodeLimit: 32768 });
+    const pDefault = openaiProvider('pdef', upDefault, { priority: 2 });   // 未配置 = 不检查
+    const gw = await startGatewayWith([pConfigured, pDefault], 'perprov', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }], tools: oversizedTools() } });
+      assert.strictEqual(r.status, 200, '应落到未配置上限的那家并成功，实际 ' + r.status + ' ' + r.text.slice(0, 160));
+      assert.strictEqual(upConfigured.st.calls, 0, '配了上限的家应被跳过（零上游调用），实际 ' + upConfigured.st.calls);
+      assert.strictEqual(upDefault.st.calls, 1, '未配置的家应收到请求，实际 ' + upDefault.st.calls);
+    } finally { killGw(gw); closeUp(upConfigured); closeUp(upDefault); }
+  });
+
+  t('判定线按**请求体形状**分别取：Anthropic 翻译路径与 chat 透传各用各的实测边界', async () => {
+    // 这条用例守的是本特性最容易搞错的一点：**两种形状的实测边界不同**。
+    //   · translated （Anthropic 客户端 → 引擎翻译 → chat，DSH 走这条）: 46152 通过 / 46452 被拒
+    //   · passthrough（客户端本身就是 chat，直接透传）              : 47884 通过 / 48384 被拒
+    //
+    // 早期版本只用一个全局阈值（由 passMax 48429 推出）→ 比 translated 的真实边界还高，
+    // 于是**生产场景（366 个工具那条）完全不会被跳过**，功能对要修的 bug 失效。
+    //
+    // 这里用同一条 Anthropic 路径、**两份刻意卡在两线之间**的请求体来验证：
+    // 口径落在 [translated.rejectMin, passthrough.rejectMin) 区间时 —— 走翻译路径的家应被跳过。
+    const mkTools = (n, descLen) => Array.from({ length: n }, (_, i) => ({
+      name: 'Tool' + i,
+      description: ('工具说明 ' + i + '。').repeat(4) + 'x'.repeat(descLen),
+      input_schema: {
+        type: 'object',
+        properties: { a: { type: 'string', description: 'y'.repeat(descLen) }, b: { type: 'object', properties: { c: { type: 'number' } } } },
+        required: ['a'],
+      },
+    }));
+
+    const up = await startFakeOpenAIUpstream({ behavior: 'ok' });
+    const prov = openaiProvider('pshape', up, { priority: 1, jsonNodeLimit: 32768 });
+    const gw = await startGatewayWith([prov], 'shapecase', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+
+      // ① 中等体量：远低于任何边界 → 必须放行（反例保护：别把正常请求也跳了）
+      await call({ port: gw.port, body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }], tools: mkTools(300, 60) } });
+      assert.strictEqual(up.st.calls, 1, '中等体量必须放行到上游，实际 ' + up.st.calls);
+
+      // ② 超大：远超两条线 → 必须跳过。
+      // ⚠ 两条约束同时要满足，否则测的不是本次新增的判定：
+      //   · 不能撞网关**自身的**请求体上限（413，约 1 MB）—— 初版用 2100 个长描述工具就撞上了；
+      //   · 又必须真的把口径推过判定线（translated = 46452）。
+      //   实测（_scratch/check-shape-payload.cjs）：光靠工具堆到 46452 会先撞 1 MB 上限
+      //   （1800 个长描述工具 = 1.24 MB 却只有 45010 口径）。故改用**对话历史**堆量：
+      //   每条历史约 9 个口径、却只占几百字节，性价比远高于工具 schema。
+      //   实测（_scratch/measure-testcase.cjs）：3000 条该形状历史 + 366 个工具
+      //   = 口径 39162 / 492 KB —— 仍低于判定线 46452，故需约 4200 条。
+      const bigHist = [];
+      for (let i = 0; i < 4200; i++) {
+        bigHist.push(i % 2 === 0
+          ? { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_' + i, name: 'Tool1', input: { a: 'v' + i } }] }
+          : { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_' + (i - 1), content: 'r' + i }] });
+      }
+      const before = up.st.calls;
+      await call({ port: gw.port, body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }].concat(bigHist), tools: mkTools(366, 120) } });
+      assert.strictEqual(up.st.calls, before, '远超两条边界时必须跳过（不上游），实际新增 ' + (up.st.calls - before));
+
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/请求体过大/.test(logText), '日志须记录跳过原因：' + logText.slice(-400));
     } finally { killGw(gw); closeUp(up); }
   });
 

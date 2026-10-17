@@ -188,6 +188,176 @@ const INLINE_429_RETRY_MAX_WAIT_MS = (() => {
 })();
 
 /**
+ * ── 请求体 JSON 节点数上限（2026-10-16，commandcode 实测）─────────────────────
+ *
+ * 现场：DSH 声明 366 个工具时，commandcode 稳定回
+ *   HTTP 400 `{"message":"Invalid request JSON: JSON node count cannot exceed 32768 …"}`
+ * 这是**确定性**失败 —— 重试多少次都一样，但每次要白等约 3.3 秒才走 failover。
+ *
+ * 标定过程（见 _scratch/calib-*.cjs、calib-real-path.cjs，全部为实测）：
+ *   · 光看"工具数"判不出来：160 个工具 196 次零失败，而 27 个工具也出现过 400；
+ *   · 真实原因 = **整个请求体的 JSON 节点总数**（工具 + 对话历史 + system 一起算）；
+ *   · 合成的小请求测不出边界，必须走**真实翻译路径**（Anthropic → openai-chat），
+ *     翻译本身会显著改变节点数 —— 早先直接发 OpenAI 格式的合成测试因此全部误通过。
+ *   · ⚠ 而且**形状会影响边界**：同一份内容，合成的 OpenAI 形状与引擎真实翻译产物的
+ *     比例不同，边界能差约 2000。因此最终标定用的是「真引擎 + 假上游**捕获引擎实际发出的
+ *     body**，再原样重放给真上游」——只有这样才能量到上游真正解析的那份 JSON。
+ *
+ * 最终实测边界（真实翻译路径，口径 = 标量值数 + 对象键数）：
+ *       46152 → 通过 ；46452 → 被拒
+ *
+ * ⚠ 上游给的是"节点数"这个**不透明的内部计数**，各家实现不同、也可能随时改。
+ * 因此这里采取"**宁可漏跳，不可误跳**"：判定线贴着**已被证明会失败**的下沿，
+ *   · 绝不把一个**本来能成功**的请求跳过（那会凭空降低可用性）；
+ *   · 代价只是少数刚好卡线的请求会漏跳（照旧发一次、吃 400 再 failover，
+ *     行为不比改动前差，只是没省下那约 3.3 秒）。
+ */
+const JSON_NODE_LIMIT_DEFAULT = (() => {
+  const n = Number(process.env.DSH_GW_JSON_NODE_LIMIT);
+  return Number.isFinite(n) && n > 0 ? n : 32768;
+})();
+
+/**
+ * ── 实测边界表：**请求体形状不同，边界就不同** ────────────────────────────────
+ *
+ * 标定方法（关键，踩过两次坑才定下来）：
+ *   必须用「真引擎 + 假上游**捕获引擎实际发出的 body**，再原样重放给真上游」。
+ *   · 合成请求测不出边界 —— 早先直接构造 openai-chat 请求打上游，结论与线上不符；
+ *   · 只测一种形状也不够 —— 下面两条线相差约 2000，用同一条线必然有一侧吃亏。
+ *
+ * 每条线的含义：`passMax` = 实测**仍然通过**的最大口径；
+ *              `rejectMin` = 实测**被拒绝**的最小口径。
+ * 判定线取 `rejectMin`（跳过条件：口径 >= rejectMin），理由见下方注释。
+ */
+const JSON_NODE_LIMITS = {
+  /**
+   * 形状 A：Anthropic 客户端 → `anthropicToOpenAIRequest` → openai-chat。
+   * **DSH / Claude Code 走的就是这条**，也是本次要修的那条（366 个工具 → 稳定 400）。
+   */
+  translated: { passMax: 46152, rejectMin: 46452 },
+  /**
+   * 形状 B：客户端本身就是 openai-chat，直接透传。
+   * ⚠ 这条线来自**合成**请求（未能捕获到经引擎的该形状大请求），故取值偏保守。
+   */
+  passthrough: { passMax: 47884, rejectMin: 48384 },
+};
+
+/**
+ * 判定线取 `rejectMin` 而不是 `passMax`，也不是两者的中点 —— 这是刻意的：
+ *
+ * 跳过条件 = `口径 >= rejectMin`，于是
+ *   · 一切**实测通过**的口径（≤ passMax）都严格小于判定线 → **永不误跳**；
+ *   · 一切**实测被拒**的口径（≥ rejectMin）都会被跳过 → 覆盖已知必失败区间；
+ *   · 两者之间的未测区间 (passMax, rejectMin) 一律**放行**（宁可漏跳）——
+ *     因为"没测过"不等于"会失败"，而误跳的代价是不可自愈的可用性损失。
+ *
+ * ⚠ 为什么不用"32768 ÷ 系数"这种推导：`jsonNodeFootprint` 是上游内部计数的**代理量**，
+ *   代理比例随请求体结构而变，没有恒定系数。早期版本正是用 0.6808 推系数，结果推出
+ *   48429 —— 比形状 A 的真实边界（46452）还高，导致**功能对生产场景完全失效**。
+ *   现在的写法把判定线直接钉在实测证据上，任何人都能用同一方法复测。
+ */
+const JSON_NODE_SAFETY_NOTE = 'passMax/rejectMin 见 JSON_NODE_LIMITS；判定用 rejectMin';
+
+/** 该家有效的本地判定线（按形状选取）。未配置 `jsonNodeLimit` → Infinity（不检查）。 */
+function providerJsonNodeBudget(provider, shape) {
+  const raw = provider && provider.jsonNodeLimit;
+  if (raw === undefined || raw === null || raw === '') return Infinity;   // 未配置 → 不检查
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return Infinity;                     // 显式不限
+  const line = JSON_NODE_LIMITS[shape] || JSON_NODE_LIMITS.translated;
+  // 按上游声明值**等比**缩放（声明 32768 = 用实测线本身；声明更大值则放宽）
+  return Math.floor(line.rejectMin * (n / JSON_NODE_LIMIT_DEFAULT));
+}
+
+/**
+ * 计算请求体的"本地节点口径"（标量值数 + 对象键数）。
+ *
+ * 为什么不直接用 `JSON.stringify(body).length`：
+ *   字节数在实测中边界间隔宽达 6575 字节，而本口径只有 500 —— 后者能更紧地贴住真实边界，
+ *   从而在"该跳的跳、不该跳的别跳"之间拿到更好的分辨力。
+ *
+ * 性能：这是**每个候选**都要付的成本，所以只遍历一次、不做任何分配。
+ * 大请求体（约 70 万节点）实测在毫秒级，相对一次上游往返（数秒）可忽略。
+ */
+function jsonNodeFootprint(value) {
+  let scalars = 0;
+  let keys = 0;
+  // 显式栈，避免深递归爆栈（真实请求里工具 schema 的嵌套深度可控但不可假设）
+  const stack = [value];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (cur === null || typeof cur !== 'object') { scalars++; continue; }
+    if (Array.isArray(cur)) {
+      for (let i = 0; i < cur.length; i++) stack.push(cur[i]);
+      continue;
+    }
+    for (const k in cur) {
+      if (!Object.prototype.hasOwnProperty.call(cur, k)) continue;
+      keys++;
+      stack.push(cur[k]);
+    }
+  }
+  return scalars + keys;
+}
+
+/**
+ * 该家允许的**本地口径**上限 —— **只在显式配置时才检查**（opt-in）。
+ *
+ * ⚠ 默认「不检查」，这不是保守起见，而是**实测结论**：本改动初次实现时默认对所有
+ * 供应商生效，随后逐家探测发现 —— 只有 commandcode 有节点数上限，
+ * 而 x666 / muyuan.do / aihubmix.com **能吃下 140012 个节点（2.83 MB）的请求并回 200**，
+ * 即它们实际上没有这个限制。对这类家套用任何阈值都是**纯粹的误跳**（把本来能成功的
+ * 请求跳过），正是本实现最想避免的损害。故改为 opt-in：只有**已知有上限**的家才配。
+ *
+ * 实测依据（探测方式：直接向各家发超大请求，看是否回 node-count 类错误）：
+ *   · commandcode  → 47612 节点即回 400 `JSON node count cannot exceed 32768`
+ *   · x666 / muyuan.do / aihubmix.com → 140012 节点仍 200（无此限制）
+ *   · 其余家因网络/端点原因未能判定（见 _scratch/probe-*.cjs）
+ *
+ * 配置：`providers[].jsonNodeLimit`（数字，单位=**上游节点数**，语义与上游报的 32768 一致）
+ *   · 不写        → **不检查**（默认；绝大多数家没有这个限制）
+ *   · 写正数      → 启用检查，按**比例**换算成本地阈值
+ *   · 写 0/负数   → 等同不写（显式表达"这家不限"）
+ *
+ * 换算用**比例**（`判定线 = 实测 rejectMin × 声明上限 / 32768`）而不是另立系数，
+ * 让这个数字与实测证据**同源**，不必维护第二个魔法数
+ *（早期版本正是另立了 JSON_NODE_SCALE 并用 passMax 推阈值，推出 48429 —— 比形状 A 的
+ *  真实边界 46452 还高，导致功能对生产场景完全失效，已废弃）。
+ */
+
+/** 该家是否启用了这项检查（供调用方跳过无谓的遍历开销）。 */
+function providerChecksJsonNodes(provider) {
+  const raw = provider && provider.jsonNodeLimit;
+  if (raw === undefined || raw === null || raw === '') return false;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0;
+}
+
+/** 该家有效的节点上限（**上游口径**，仅用于日志展示）。 */
+function providerJsonNodeLimitForLog(provider) {
+  const raw = provider && provider.jsonNodeLimit;
+  if (raw === undefined || raw === null || raw === '') return '未配置';
+  const n = Number(raw);
+  return (!Number.isFinite(n) || n <= 0) ? '不限制' : n;
+}
+
+/**
+ * 该请求体是否**会被这家上游拒绝**（估算，宁可漏跳不可误跳）。
+ *
+ * `shape` 取 'translated'（Anthropic→chat，DSH 那条）或 'passthrough'（客户端本就是
+ * openai-chat）—— 两条线的实测边界不同，必须分开判，详见 JSON_NODE_LIMITS。
+ */
+function exceedsJsonNodeBudget(body, provider, shape) {
+  const budget = providerJsonNodeBudget(provider, shape);
+  if (!Number.isFinite(budget)) return false;   // 该家未启用检查（默认）
+  try {
+    return jsonNodeFootprint(body) >= budget;
+  } catch (_) {
+    return false;   // 估算失败绝不影响转发（安全侧）
+  }
+}
+
+/**
  * 一次客户端请求内，对「上游自己忙」429 的**重试总次数**。
  *
  * 为什么默认 2（而不是 1）：实测该免费模型的成功率约 1/3，单次重试只能把整体拉到 ~55%，
@@ -5707,6 +5877,34 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     // raw 模式不带 body：显式传 undefined，避免 fetch 在没有 content-length 时挂起等待请求体
     init = { method, headers: upstreamHeaders, signal: controller.signal };
     if (!rawMode) { lastSentBody = JSON.stringify(outBody); init.body = lastSentBody; }
+
+    // ── 请求体过大 → 本次调用跳过这家（2026-10-16）──────────────────────────
+    //
+    // 判据与动机见 `exceedsJsonNodeBudget` 上方注释。要点：
+    //   · 只看**本次**的请求体，不留任何跨请求状态 —— 下次请求小了，这家立刻照常可用；
+    //   · 这家**不算失败**：不记熔断、不冷却账户、不写用量；
+    //   · 省掉一次注定 400 的往返（实测每次白等约 3.3 秒）。
+    //
+    // ⚠⚠ 必须量 `outBody`（= 真正 `JSON.stringify` 发出去的那份），不能量函数入参 `body`。
+    //   本函数在 fetch 之前会对 body 做一长串变换（translateBody / 剥参数 / 补指纹 …
+    //   见上方那些 `outBody = …`），入参与最终产物**不是同一份**。而 32768 卡的是
+    //   **上游真正解析的 JSON** —— 量错对象会让判据完全失效（要么全跳、要么全不跳）。
+    //   这正是初版把判定放在函数开头时的问题。
+    //
+    // ⚠ 结算方式沿用本文件既有约定：本函数开头**已经** `breakerAcquire` 过，所以"跳过"
+    //   必须 `breakerReleaseSlot` 交还半开名额，否则该家会被挡到 BREAKER_STALE_MS(180s)
+    //   —— 正是本文件多处修复记录反复强调的那个坑。
+    //
+    // ⚠ `providerChecksJsonNodes` 前置判断是**性能**考虑：该家若没配 `jsonNodeLimit`
+    //   （默认，绝大多数家如此），就不必白跑一次全量遍历。
+    if (providerChecksJsonNodes(provider) && exceedsJsonNodeBudget(outBody, provider, 'passthrough')) {
+      log(`skip ${provider.id} (请求体过大：超过该家节点上限约 ${providerJsonNodeLimitForLog(provider)}，`
+        + `本次调用跳过，不记失败) → 交给下一家`);
+      clearTimeout(timer);
+      breakerReleaseSlot(provider.id, bModel);
+      return false;
+    }
+
     upstream = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, init);
     clearTimeout(timer);
     // R9c 自适应降敏：上游内容拦截（sensitive words / content-blocked）时，用降敏后的
@@ -8984,6 +9182,33 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         finalBody = fp.body;
         log(`OpenCode 免费档工具指纹（翻译路径）：补声明 ${fp.added.join('/')}`);
       }
+    }
+
+    // ── 请求体过大 → 本次调用跳过这家（2026-10-16）──────────────────────────
+    //
+    // 判据与动机见 `exceedsJsonNodeBudget` 上方注释。要点：
+    //   · 只看**本次**的请求体，不留任何跨请求状态 —— 下次请求小了，这家立刻照常可用；
+    //   · 这家**不算失败**：不记熔断、不冷却账户、不写用量（不是它的错，也不是请求的错）；
+    //   · 省掉一次注定 400 的往返（实测每次白等约 3.3 秒）。
+    //
+    // ⚠⚠ 必须量 `finalBody`（= 真正要 JSON.stringify 发出去的那份），不能量传进来的
+    //   Anthropic 原始体：两者节点数**不一样**，而 32768 这个上限卡的是**上游真正解析的
+    //   那份 JSON**。标定阶段实测过这个坑 —— 量错对象会让判据完全失效（要么全跳、要么全不跳）。
+    //   放在这里还有个好处：`anthropicToOpenAIRequest` 只被调用一次（它有诊断计数副作用，
+    //   提前多调一次会把计数翻倍）。
+    //
+    // ⚠ 结算方式沿用本文件既有约定：这条路径**已经** `breakerAcquire` 过（在本函数开头），
+    //   所以"跳过"必须 `breakerReleaseSlot` 交还半开名额，否则该家会被挡到
+    //   BREAKER_STALE_MS(180s)——正是本文件多处修复记录反复强调的那个坑。
+    //
+    // ⚠ `providerChecksJsonNodes` 前置判断是**性能**考虑：没配 `jsonNodeLimit` 的家
+    //   （默认）不必白跑一次全量遍历。
+    if (providerChecksJsonNodes(provider) && exceedsJsonNodeBudget(finalBody, provider, 'translated')) {
+      log(`skip ${provider.id} (请求体过大：超过该家节点上限约 ${providerJsonNodeLimitForLog(provider)}，`
+        + `本次调用跳过，不记失败) → 交给下一家`);
+      clearTimeout(timer);
+      breakerReleaseSlot(provider.id, bModel);
+      return false;
     }
 
     let upstream = null;

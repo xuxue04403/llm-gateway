@@ -64,6 +64,19 @@ const DECLARED = [
   { name: 'isProviderWideFailure', why: '改动：文档注释补充"模型退役 403"这一例外说明；判定逻辑本身不变（仍是 401/402/403 → 整家），例外在 `breakerRecordFail` 里按 detail 收窄 —— 这样**不传 detail 的既有调用点语义完全不变**' },
   { name: 'breakerRecordFail', why: '改动：新增可选第 6 个参数 `detail`，用于识别"该模型被下架"的 403 → 降级为**模型级**冷却（不连坐整家）。不传时行为与旧版逐字一致。同时在"全部账户耗尽"的收尾分支（原来写死空模型名 → 必然整家）加了同一判定 —— 账户池只剩一个账户时，一次 403 就会落到那里，实测正是这条路径把 commandcode 整家熔断的' },
 
+  // —— 2026-10-16：请求体过大 → 当次调用跳过该家（commandcode 的 JSON 节点数上限）——
+  { name: 'JSON_NODE_LIMIT_DEFAULT', why: '新增：上游"请求体 JSON 节点数"上限的默认值（32768，DSH_GW_JSON_NODE_LIMIT 可调）。实测 commandcode 在 DSH 声明 366 个工具时稳定回 `400 Invalid request JSON: JSON node count cannot exceed 32768`，是**确定性**失败（重试无用），但每次要白等约 3.3 秒才 failover。⚠ 它**只**用于日志展示与 `jsonNodeLimit` 比例的基准 —— 判定线不再由它推导（见下）' },
+  { name: 'JSON_NODE_LIMITS', why: '新增：**按请求体形状分列的实测边界表**，每条含 passMax（实测仍通过的最大口径）与 rejectMin（实测被拒的最小口径）。为什么必须分形状：同一个上游对不同结构的 body 会在不同口径处开始拒绝 —— translated（Anthropic→chat，**DSH 走这条**）是 46152/46452，passthrough（客户端本就是 chat）是 47884/48384，两者差约 2000。⚠⚠ 这里记录一个**被实测推翻的设计**：早期版本只用一个全局阈值（由 passMax 48429 推出），结果它**比 translated 的真实边界还高** → 生产场景（366 个工具那条）完全不会被跳过，**功能对它要修的 bug 失效**。改为分形状、且判定线取 rejectMin 后修复' },
+  { name: 'JSON_NODE_SAFETY_NOTE', why: '新增：把"判定线取 rejectMin 而非 passMax"这条决定写成常量文本，避免后来者看到本文件里没有 SAFETY 系数而误以为漏了余量 —— 余量的语义已由 rejectMin 本身承担（rejectMin 就是"实测会被拒"的那条线，取它天然不误跳）' },
+  { name: 'jsonNodeFootprint', why: '新增：计算请求体的本地节点口径（标量值数 + 对象键数）。刻意不用 `JSON.stringify(body).length` —— 字节数在实测中边界间隔宽达 6575 字节，而本口径只有 500，后者能更紧地贴住真实边界。用显式栈而非递归，避免深层工具 schema 爆栈；每个候选都要付这次遍历（大请求实测毫秒级，相对一次上游往返可忽略）' },
+  { name: 'providerJsonNodeBudget', why: '改动：新增 `shape` 参数，按形状取判定线；并按 `声明值/32768` **等比缩放**（不另立系数，保持与实测证据同源）。⚠ 默认语义是**不检查**（返回 Infinity）——这不是保守，而是实测结论：逐家探测发现只有 commandcode 有节点数上限，而 x666 / muyuan.do / aihubmix.com **能吃下 140012 个节点（2.83 MB）的请求并回 200**，对它们套用任何阈值都是**纯误跳**。初版是"默认全局生效、用 jsonNodeLimit:0 关闭"，方向反了，已改为 opt-in' },
+  { name: 'providerChecksJsonNodes', why: '新增：判断该家是否配了 `jsonNodeLimit`（供调用方跳过无谓的遍历开销）。没配的家不该为一项它用不到的检查白跑全量遍历' },
+  { name: 'providerJsonNodeLimitForLog', why: '新增：把该家有效上限按**上游口径**格式化，仅用于日志展示（避免把内部口径的数字写进用户可见日志造成困惑）' },
+  { name: 'exceedsJsonNodeBudget', why: '改动：新增 `shape` 参数并把比较从 `> budget` 改为 `>= budget`（判定线语义是"实测被拒的最小口径"，故等于它就该跳）。估算失败一律返回 false（安全侧：绝不影响转发）' },
+  { name: 'forward', why: '改动：在 `if (!rawMode) { lastSentBody = JSON.stringify(outBody); … }` 之后、`fetch` 之前新增"请求体过大 → 本次调用跳过该家"（形状 passthrough）。⚠⚠ **必须量 `outBody`（真正要发出去的那份），不能量入参 `body`**：本函数在 fetch 前会对 body 做一长串变换（translateBody / 剥参数 / 补指纹…），两者不是同一份，而上限卡的是**上游真正解析的 JSON**。这也是该判定不能放在函数开头的原因（初版放错了位置，且一度引用尚未声明的 `rawMode` 触发 TDZ）。结算沿用既有约定：本函数开头已 `breakerAcquire`，故"跳过"必须 `breakerReleaseSlot` 交还半开名额，否则该家被挡到 BREAKER_STALE_MS(180s)。返回 false = "这家不可用、换下一家"，**不记熔断、不冷却账户、不写用量**，从而满足用户"不影响对该供应商后续调用"的要求' },
+  { name: 'forwardAnthropicViaOpenAI', why: '改动（同上，**必须有**）：DSH 走的正是这条翻译路径，只改 `forward()` 对 DSH 完全无效（与本月早些时候 429 原地重试踩过的同一个坑）。判定点同理放在 `finalBody` 定稿之后、`fetch` 之前、形状用 translated —— `finalBody` 才是真正 `JSON.stringify` 发出去的那份（`anthropicToOpenAIRequest` 有诊断计数副作用，故不能为了提前判定而多调一次）。结算同理：`clearTimeout(timer)` + `breakerReleaseSlot` 后 `return false`' },
+  { name: 'forwardAnthropicViaOpenAI', why: '改动（同上，**必须有**）：DSH 走的正是这条翻译路径，只改 `forward()` 对 DSH 完全无效（与本月早些时候 429 原地重试踩过的同一个坑）。同样放在 `noteToolFingerprint` 之后、`breakerAcquire` 之前' },
+
   // —— 2026-09-30：客户端仿真 / 防封禁专项改进（依据是官方 SDK/CLI 一手源码）——
   { name: 'clientIdentityOverrides', why: '新增：版本/身份统一覆盖入口（env > 配置 > 默认），避免版本号写死后被上游最低版本门禁拒掉' },
   { name: 'osRelease', why: '新增：os.release() 安全包装，供 UA 与平台头构造使用' },

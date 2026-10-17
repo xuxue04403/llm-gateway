@@ -34,6 +34,17 @@
     "  不声明时探测只给 10 秒（探测在替全家试错，不该让用户等满）。",
     "  实测教训（2026-09-22）：某家 DeepSeek-V4.1-Flash 首字节稳定 13.7–15.5s，未声明 timeoutMs 时",
     "  探测永远 10s 超时 → 熔断开了就再也恢复不了，所有请求都落到备用家。",
+    "【请求体节点数上限 jsonNodeLimit】**只在显式配置时才检查**（默认不检查）。",
+    "  有些上游会拒绝过大的请求体：commandcode 在 DSH 声明 366 个工具时稳定回",
+    "  HTTP 400 `Invalid request JSON: JSON node count cannot exceed 32768`。这是**确定性**失败",
+    "  （重试无用），但每次要白等约 3 秒才走 failover。配上 jsonNodeLimit: 32768 后，",
+    "  网关会在**发送前**估算本次请求体的规模，超限就**当次跳过这家**、直接换下一家。",
+    "  要点：① 只影响**当次**调用，不留任何跨请求状态 —— 下次请求小了这家立刻照常可用；",
+    "        ② 不算失败：不记熔断、不冷却账户、不写用量（既不是它的错也不是请求的错）；",
+    "        ③ 估算刻意偏保守（宁可漏跳不可误跳），绝不把本来能成功的请求跳过。",
+    "  ⚠ 实测只有少数上游有这个限制：x666 / muyuan.do / aihubmix.com 能吃下 2.83 MB 的请求体，",
+    "    所以**默认不检查**是对的；给它们配上反而是白白降低可用性。",
+    "  单位与上游报的数字一致（上游说 32768 就写 32768）；写 0 或负数 = 显式不限制。",
     "【限流冷却粒度】账户池里 429（限流）按「供应商+账户+模型」冷却——上游限流常是模型级",
     "  （如 Model 'X' is at its concurrency limit），不应连坐同一把 Key 上的其它模型；",
     "  额度耗尽（402）/登录失效仍是账户级（整把 Key 不可用）。",
@@ -147,9 +158,10 @@
       "apiKey": "sk-llm-gatway-xxxxxxxx"
     },
     {
-      "_说明": "Command Code Provider API：**只支持** /chat/completions（其 /messages 不服务这些模型），故 protocol: openai-chat。",
+      "_说明": "Command Code Provider API：**只支持** /chat/completions（其 /messages 不服务这些模型），故 protocol: openai-chat。jsonNodeLimit: 32768 —— 上游 JSON 解析器的节点数上限（实测：超过即回 400 `JSON node count cannot exceed 32768`，且是确定性失败）；写上它，网关会在发送前估算并**当次跳过**注定失败的请求，省掉每次约 3 秒的白等。",
       "id": "commandcode",
       "baseURL": "https://api.commandcode.ai/provider/v1",
+      "jsonNodeLimit": 32768,
       "models": [
         {
           "id": "deepseek/deepseek-v4.1-flash",
