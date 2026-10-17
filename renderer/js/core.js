@@ -322,6 +322,9 @@ const COOL_KIND = {
   rate: { text: '限流', cls: 'warn' },
   network: { text: '网络错误', cls: 'warn' },
   auth: { text: '鉴权失败', cls: 'bad' },
+  // 单 Key 供应商的"不可用"记在供应商级熔断上（它没有账户级记录）→ 单独一个语义，
+  // 避免把"渠道熔断"误显示成"额度耗尽/登录失效"这类账户问题（见 accountPoolSnapshot 注释）
+  breaker: { text: '渠道熔断', cls: 'bad' },
 };
 
 function fmtRemain(untilMs) {

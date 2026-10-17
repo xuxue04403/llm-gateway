@@ -209,7 +209,7 @@ function renderHealth() {
   }
   const accts = Array.isArray(h.accounts) ? h.accounts : [];
   if (accts.length === 0) {
-    box.innerHTML = '<div class="empty">没有使用账户池的供应商（单一 apiKey 的供应商不产生账户条目）。</div>';
+    box.innerHTML = '<div class="empty">没有已启用的供应商（或它们都还没填 Key —— 填了 Key 才会出现在这里）。</div>';
     return;
   }
   const rows = accts.map((a) => {
@@ -219,17 +219,21 @@ function renderHealth() {
       ? `<span class="tag ${kind.cls}">${esc(kind.text)}</span>`
       : '<span class="tag ok">可用</span>';
     const remain = cooling ? `<span class="mono">剩 ${esc(fmtRemain(Date.now() + Number(a.remainMs || 0)))}</span>` : '';
-    const scope = a.modelScoped
-      ? `<span class="tag sm purple">模型级 · ${esc(a.model || '')}</span>`
-      : '<span class="tag sm">账户级</span>';
+    // 冷却范围：单 Key 家没有账户池，它的状态记在**供应商级熔断**上（见引擎 accountPoolSnapshot）
+    const scope = a.singleKey
+      ? '<span class="tag sm">供应商级</span>'
+      : (a.modelScoped
+        ? `<span class="tag sm purple">模型级 · ${esc(a.model || '')}</span>`
+        : '<span class="tag sm">账户级</span>');
     const flags = []
       .concat(a.lastUsed ? ['<span class="tag sm info">最近使用</span>'] : [])
+      .concat(a.singleKey ? ['<span class="tag sm">单 Key</span>'] : [])
       .concat(a.orphan ? ['<span class="tag sm warn">配置已移除</span>'] : [])
       .join(' ');
     const detail = a.reason ? `<span class="hint">${esc(String(a.reason).slice(0, 100))}</span>` : '';
     return `<tr>
       <td><span class="mono">${esc(a.provider || (a.key || '').split('#')[0])}</span></td>
-      <td><span class="mono">${esc(a.id || (a.key || '').split('#')[1] || '—')}</span></td>
+      <td><span class="mono">${esc(a.singleKey ? '—' : (a.id || (a.key || '').split('#')[1] || '—'))}</span></td>
       <td>${state} ${flags}</td>
       <td>${scope}</td>
       <td>${remain}</td>

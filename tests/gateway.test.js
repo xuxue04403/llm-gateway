@@ -3314,9 +3314,17 @@ let upstreamPort = 0;
     const gw = await startGatewayWith([openaiProvider('one', up, { apiKey: 'sk-only-one' })], 'onekey');
     try {
       const h = JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
-      assert.strictEqual((h.accounts || []).length, 0, '单 Key（无 apiKeys）不应产生账户池：' + JSON.stringify(h.accounts));
+      // 契约变更（2026-10-17，用户两次报「账户池中渠道不全」）：
+      //   单 Key 家**要出现在 /health 快照里**（否则面板看不到它、用户无从判断状态），
+      //   但**不得**因此进入账户轮换 —— 请求仍走顶层 apiKey 的旧路径。
+      //   快照里用 `singleKey: true` + `id: 'key1'` 标记，冷却范围是"供应商级"而非"账户级"。
+      const rows = h.accounts || [];
+      assert.strictEqual(rows.length, 1, '单 Key 家应产生 1 条快照条目：' + JSON.stringify(rows));
+      assert.strictEqual(rows[0].provider, 'one', '条目应指向该供应商：' + JSON.stringify(rows[0]));
+      assert.strictEqual(rows[0].singleKey, true, '★ 必须标出 singleKey，前端才能显示"供应商级"：' + JSON.stringify(rows[0]));
       const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
       assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      // 关键：**调度没变** —— 仍然用顶层 apiKey，没有因为快照多一行就变成账户轮换
       assert.strictEqual(up.st.headers[0].authorization, 'Bearer sk-only-one', '单 Key 仍按旧路径使用');
     } finally { killGw(gw); closeUp(up); }
   });

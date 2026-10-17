@@ -2567,12 +2567,41 @@ function accountPoolSnapshot(cfg) {
     for (const p of cfg.providers) {
       if (!p || p.enabled === false) continue;
       const accts = providerAccounts(p);
-      // 单 Key 供应商（只填 `apiKey`、没有 `apiKeys`/`accounts`）**刻意不进账户池** ——
-      // 这是既有设计：它走顶层 Key 的旧路径，没有轮询/换 Key 需求，也不该产生账户级冷却记录。
-      // gateway.test.js 有专门用例锁死这一点（`单 Key（无 apiKeys）不应产生账户池`）。
-      // ⚠ 因此"账户池面板看不到全部渠道"不是这里能改的：要改得先改那条设计（并同步 UI），
-      //   2026-10-17 试过在快照里补行，会与那条用例冲突，故回退。
-      if (accts.length === 0) continue;
+      // ── 单 Key 供应商：**只在快照里补一行**（2026-10-17）──
+      //
+      // 用户两次报「账户池中渠道不全」：面板只列出 4 家（agentrouter/amd/nvidia/sensenova，
+      // 都是 `apiKeys` 多 Key 家），而实际启用了 12 家。其余只填了**单数 `apiKey`** 的家
+      // 在请求路径上不产生账户条目 → 面板上一条都不显示，用户完全看不到它们的状态。
+      //
+      // ⚠ 关键取舍：**展示与调度必须解耦**。
+      //   `providerAccounts()`（请求路径）保持原样 —— 单 Key 家继续走顶层 Key 的旧路径、
+      //   不参与账户轮换、不产生账户级冷却记录。gateway.test.js 有专门用例守这一点。
+      //   这里只往 /health 的**快照**里补行，请求路径一个字节都不动。
+      //   （2026-10-17 先试过"让 providerAccounts 也展开单 Key"，结果账户级冷却把熔断器的
+      //     **半开探测**提前拦掉、恢复路径被劫持（那条用例实测上游调用从 2 掉到 1），已回退。）
+      //
+      // 状态来源：单 Key 家没有账户级记录，它的"不可用"体现在**供应商级熔断**上，
+      // 所以读 breaker（判据同 slotIsOpen），并把冷却范围标成"供应商级"而不是"账户级"。
+      if (accts.length === 0) {
+        const single = String(p.apiKey || '').trim();
+        if (single && !upstreamKeyMissing(single)) {
+          const key = accountKey(p.id, 'key1');
+          seen.add(key);
+          const b = breaker.get(String(p.id));
+          const open = slotIsOpen(b);
+          out.push({
+            key,
+            provider: p.id,
+            id: 'key1',
+            state: open ? 'breaker' : 'ok',
+            remainMs: open ? Math.max(0, Number(b.openUntil || 0) - Date.now()) : 0,
+            ...(open ? { reason: `渠道熔断（该家只有一把 Key，冷却记在供应商级）：连续失败 ${b.fails || 0} 次` } : {}),
+            // 前端据此把冷却范围显示成"供应商级"，并把它与真正的多账户池条目区分开
+            singleKey: true,
+          });
+        }
+        continue;
+      }
       for (const acct of accts) {
         const key = accountKey(p.id, acct.id);
         seen.add(key);
