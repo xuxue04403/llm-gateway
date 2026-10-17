@@ -114,6 +114,52 @@ function modelTimeoutMs(provider, model) {
   return 0;
 }
 
+/**
+ * 一轮请求的**整体超时预算**（2026-10-17 新增）。
+ *
+ * ## 为什么必须有这个（现场：Claude Code 一直超时）
+ *
+ * 用户报 Claude Code 调用恒失败：
+ *   `Inference — Gateway was unreachable: The operation was aborted due to timeout`
+ *   `http://127.0.0.1:3091/v1/messages`
+ *
+ * 而网关进程是健康的（`/health` 82ms），小请求 2–3 秒就回。根因是**候选链的超时预算串行累加**：
+ *   deepseek-v4.1-flash 的 7 个候选 timeoutMs 之和 = 405 秒
+ *   claude-haiku-5-5   的 3 个候选 timeoutMs 之和 = 260 秒
+ * 实测当天 46 次调用超过 60 秒（最长 293 秒），而**客户端自己的超时**（Claude Code 约 60–120 秒）
+ * 先到 → 客户端断开并报 "aborted due to timeout"，可网关还在傻等下一个候选。
+ *
+ * 关键点：**客户端一旦超时断开，后面所有候选的尝试都是白费的** —— 用户早已拿到失败。
+ * 所以网关必须自己有个总预算，在客户端放弃之前收口，把"还在试"如实回给客户端（或干脆快速失败），
+ * 而不是继续耗到一个没人再听的响应上。
+ *
+ * 取值：默认 120 秒。可用 provider/model 的 timeoutMs 之外，在**网关配置顶层**用
+ * `requestBudgetMs` 覆盖（部署在不同客户端下时这个值不一样）。
+ */
+const DEFAULT_REQUEST_BUDGET_MS = 120_000;
+
+/** 本轮请求的整体预算（配置顶层 `requestBudgetMs` 可覆盖；0/非法 → 用默认）。 */
+function requestBudgetMs(cfg) {
+  const n = Number(cfg && cfg.requestBudgetMs);
+  return (Number.isFinite(n) && n > 0) ? n : DEFAULT_REQUEST_BUDGET_MS;
+}
+
+/**
+ * 本次候选实际可用的超时 = min(该家 timeoutMs, **本轮预算剩余**)。
+ *
+ * 为什么需要它（2026-10-17）：只在"开始下一个候选前"检查预算是不够的 ——
+ * 它拦不住**已经在跑的单个慢候选**。实测今天最慢的一次是 `amd#key1 233 秒`，
+ * 而 amd 的 timeoutMs 就是 180 秒：预算检查发生在它启动之前，一旦启动就要等满它自己的超时。
+ * 于是"总预算"对单家慢的情况完全失效，Claude Code 照样超时。
+ * 把剩余预算作为上限压进每次请求，才真正做到"到点就收口"。
+ */
+function effectiveTimeoutMs(provider, model, opts) {
+  const base = providerTimeoutMs(provider, model);
+  const remain = Number(opts && opts.remainingBudgetMs);
+  if (!Number.isFinite(remain) || remain <= 0) return base;
+  return Math.max(1, Math.min(base, remain));
+}
+
 function providerTimeoutMs(provider, model) {
   const perModel = modelTimeoutMs(provider, model);
   const n = perModel > 0 ? perModel : Number(provider && provider.timeoutMs);
@@ -2268,6 +2314,15 @@ function providerHasCredential(provider) {
  *  ② 否则 `apiKeys: ["k1","k2",…]`（2026-09-17 新增：同一供应商配多把 Key）→ 映射成 key1/key2…
  *     直接复用**已验证的账户池**：轮询分流 + 额度耗尽/密钥失效/限流时自动换下一把 + /health 可见；
  *  ③ 都没有 → 空数组（沿用顶层单个 apiKey 的老路径）。
+ *
+ * ## ⚠ 2026-10-17：曾试过把单数 `apiKey` 也展开成账户条目（为了修"账户池显示不全"），已回退
+ *
+ * 原因是它有**超出显示层的语义副作用**，gateway.test.js 立刻抓到了：
+ *   · 失败归类从「供应商熔断」变成「账户级冷却」（同一次欠费换了记账路径）；
+ *   · **账户级冷却会挡住熔断器的半开探测** —— 半开恢复原本是"放一个探测过去试试"，
+ *     现在被账户冷却提前拦掉，探测请求根本发不出去（用例
+ *     `半开只应放行一个探测` 实测 calls 从 2 掉到 1）。恢复路径被劫持是**功能性退化**。
+ * 所以改成**只在展示层补齐**（见 `accountPoolSnapshot`），请求路径一个字节都不动。
  */
 function providerAccounts(provider) {
   const raw = provider && provider.accounts;
@@ -2511,7 +2566,14 @@ function accountPoolSnapshot(cfg) {
   if (cfg && Array.isArray(cfg.providers)) {
     for (const p of cfg.providers) {
       if (!p || p.enabled === false) continue;
-      for (const acct of providerAccounts(p)) {
+      const accts = providerAccounts(p);
+      // 单 Key 供应商（只填 `apiKey`、没有 `apiKeys`/`accounts`）**刻意不进账户池** ——
+      // 这是既有设计：它走顶层 Key 的旧路径，没有轮询/换 Key 需求，也不该产生账户级冷却记录。
+      // gateway.test.js 有专门用例锁死这一点（`单 Key（无 apiKeys）不应产生账户池`）。
+      // ⚠ 因此"账户池面板看不到全部渠道"不是这里能改的：要改得先改那条设计（并同步 UI），
+      //   2026-10-17 试过在快照里补行，会与那条用例冲突，故回退。
+      if (accts.length === 0) continue;
+      for (const acct of accts) {
         const key = accountKey(p.id, acct.id);
         seen.add(key);
         const st = accountPool.get(key);
@@ -5743,7 +5805,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     log(`skip ${provider.id} (breaker: cooldown or half-open probe already in flight)`);
     return false;
   }
-  const timeoutMs = providerTimeoutMs(provider, body && body.model);
+  const timeoutMs = effectiveTimeoutMs(provider, body && body.model, opts);
   // 死家前置预检（2026-10-13，详见 upstreamSuspect 上方注释）：可疑的家先在 TCP 层确认连得上，
   // 连不上就**一个 HTTP 请求都不发** —— 否则要白等到整个 HTTP 超时才判定失败（用户实测 60 秒）。
   if (upstreamSuspect(provider, bModel)) {
@@ -5997,7 +6059,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     if (isTransientNetError(e) && elapsed < NET_RETRY_MAX_ELAPSED_MS) {
       log(`upstream ${provider.id} 网络错误（${causeText}，${elapsed}ms）→ 原地重试一次`);
       const c2 = new AbortController();
-      const t2 = setTimeout(() => c2.abort(), providerTimeoutMs(provider, body && body.model));
+      const t2 = setTimeout(() => c2.abort(), effectiveTimeoutMs(provider, body && body.model, opts));
       try {
         const retried = await fetch(upstreamUrl, {
           ...init,
@@ -6078,7 +6140,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       // 重发（与首次同路径、同 headers/body）
       try {
         const c3 = new AbortController();
-        const t3 = setTimeout(() => c3.abort(), providerTimeoutMs(provider, body && body.model));
+        const t3 = setTimeout(() => c3.abort(), effectiveTimeoutMs(provider, body && body.model, opts));
         try {
           const retried = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
             ...init,
@@ -9068,7 +9130,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
     const pre = await upstreamPreflight(provider);
     if (!pre.ok) {
       log(`upstream ${provider.id} 预检连不通（${pre.detail}）→ 不发请求，直接记为网络失败并换下一家`
-        + `（省掉本次最多 ${providerTimeoutMs(provider, scopeModel)}ms 的上游等待）`);
+        + `（省掉本次最多 ${effectiveTimeoutMs(provider, scopeModel, opts)}ms 的上游等待）`);
       catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
       breakerRecordFail(provider.id, 0, 0, false, bModel);
       return false;
@@ -9147,7 +9209,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       }
     };
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), providerTimeoutMs(provider, scopeModel));
+    const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs(provider, scopeModel, opts));
     let headers;
     try {
       // 与直通路径共用同一套账户头构造（凭据 / 身份头 / Bearer / 自定义头，避免两处漂移）
@@ -9222,13 +9284,13 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       const causeText = describeFetchError(e);
       const elapsed = Date.now() - startedAt;
       // 规则 1：与直通路径同一处理（详见 switchHostToDirect 的注释）
-      if (!describeAbortIfOurs(e, { signal: controller.signal, timeoutMs: providerTimeoutMs(provider, scopeModel), elapsedMs: elapsed })) {
+      if (!describeAbortIfOurs(e, { signal: controller.signal, timeoutMs: effectiveTimeoutMs(provider, scopeModel, opts), elapsedMs: elapsed })) {
         try { await switchHostToDirect(provider); } catch (_) { /* 切换绝不连累转发 */ }
       }
       if (isTransientNetError(e) && elapsed < NET_RETRY_MAX_ELAPSED_MS) {
         log(`upstream ${provider.id} 网络错误（${causeText}，${elapsed}ms）→ 原地重试一次`);
         const c2 = new AbortController();
-        const t2 = setTimeout(() => c2.abort(), providerTimeoutMs(provider, scopeModel));
+        const t2 = setTimeout(() => c2.abort(), effectiveTimeoutMs(provider, scopeModel, opts));
         try {
           upstream = await fetch(upstreamUrl, {
             method: 'POST', headers, body: JSON.stringify(finalBody), signal: c2.signal,
@@ -9241,7 +9303,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         // 与直通路径同一条判据：把"我们超时放弃"和"上游/代理掐了连接"分开。
         // 这条路径（Anthropic 客户端 → OpenAI 上游）是 DSH 走得最多的一条，
         // 少了它，日志里同样是 17 条无法区分的一模一样的行。
-        const abortInfo = describeAbortIfOurs(e, { signal: controller.signal, timeoutMs: providerTimeoutMs(provider, scopeModel), elapsedMs: Date.now() - startedAt });
+        const abortInfo = describeAbortIfOurs(e, { signal: controller.signal, timeoutMs: effectiveTimeoutMs(provider, scopeModel, opts), elapsedMs: Date.now() - startedAt });
         const why = abortInfo
           ? `上游无响应，${abortInfo.text}`
           : `${e.message}${causeText ? ' (' + causeText + ')' : ''}${proxyHintFor(upstreamUrl, causeText)}`;
@@ -9857,7 +9919,25 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
       }
     }
   }
+  // ── 整体预算（2026-10-17）：见 requestBudgetMs 上方的事故说明 ──
+  //
+  // 逐个候选的 timeoutMs 会**串行累加**（deepseek-v4.1-flash 7 个候选合计 405 秒，
+  // claude-haiku-5-5 合计 260 秒），而客户端自己的超时（Claude Code 约 60–120 秒）先到 ——
+  // 客户端断开后，后面所有候选的尝试都是白费的。所以这里设一个总闸：
+  // 超出预算就**不再开始新的候选**，把已有的最好结果/失败如实回给客户端。
+  const budgetMs = requestBudgetMs(cfg);
+  const deadline = reqStart + budgetMs;
+  let budgetExhausted = false;
+
   for (const p of tryOrder) {
+    // 进每个候选**之前**检查总预算。用 >= 而不是 >：刚好用满也不再开新的一家 ——
+    // 新开一家最坏还要等它自己的 timeoutMs，那必然超出客户端耐心。
+    if (Date.now() >= deadline) {
+      budgetExhausted = true;
+      log(`failover 总预算 ${Math.round(budgetMs / 1000)}s 已用尽（已试 ${tryOrder.indexOf(p)}/${tryOrder.length} 家）`
+        + `→ 不再开始新的候选，立刻收口（客户端早已超时的话，继续试是没人听的）`);
+      break;
+    }
     // 模型映射：把逻辑名换成该供应商的上游真实 ID（未声明映射 → 原样透传）；
     // 带图片时优先选声明了 vision 的那条上游 ID（见 upstreamIdFor）
     const attemptBody = bodyForProvider(body, p, model, bodyHasImage(body));
@@ -9880,7 +9960,8 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
       sendPath = upstreamPathOfWire(upWire);
       log(`try ${p.id} for ${model} [matrix ${clientWire} → ${upWire}]`);
     }
-    const fwdOpts = translating
+    const fwdOpts = Object.assign(
+      translating
       // ⚠ 翻译后**不能**再传 responses:true —— 那会让 forward 按 Responses 形状去处理
       // 一个已经变成别的协议的请求体（实测会在 translateResponsesBody 里把 input 拍平）。
       ? { matrix: {
@@ -9901,7 +9982,11 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
           log(`responses affinity: ${id} → ${p.id}`);
           return true;
         },
-      } : undefined);
+      } : {}),
+      // 把"本轮预算剩余"传给 forward：它用于把**单次**上游等待也压进预算（见 effectiveTimeoutMs）。
+      // 只靠"开始下一个候选前检查"拦不住已经在跑的慢候选（实测 amd 单次 233 秒）。
+      { remainingBudgetMs: Math.max(0, deadline - Date.now()) },
+    );
     const out = await forwardWithAccounts(p, sendPath + search, passthroughHeaders(req.headers, p.apiKey, cfg.clientUA, effectiveClientProfile(cfg, p), cfg), sendBody, res, fwdOpts);
     if (out === true) {
       log(`served ${model} via ${viaTag(p.id)}`);
@@ -9955,7 +10040,20 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
     });
   }
   logCall('all-providers', 'fail');
-  json(res, 503, { error: { message: `all providers for model "${model}" are unavailable` } });
+  // 预算用尽时的措辞必须与"所有家都不可用"区分开 —— 否则用户会去查供应商，
+  // 而实际原因是"候选链太慢、预算先用完了"（诊断方向完全不同）。
+  const budgetNote = budgetExhausted
+    ? `（失败前已用尽 ${Math.round(budgetMs / 1000)} 秒总预算而提前收口：候选链太慢。`
+      + `可调大网关配置的 requestBudgetMs，或检查各家 timeoutMs —— 客户端若已先超时，` +
+      `再试下去也不会有人收到结果）`
+    : '';
+  json(res, 503, {
+    error: {
+      message: `all providers for model "${model}" are unavailable`
+        + (budgetExhausted ? ` —— 本轮在 ${Math.round(budgetMs / 1000)} 秒总预算内未成功，已提前停止尝试` : '')
+        + budgetNote,
+    },
+  });
 }
 
 /* ---------------- OpenAI Responses 协议：资源子路由（GET/DELETE/cancel/input_items） ----------------
@@ -10201,7 +10299,23 @@ async function handleMessages(cfg, req, res, body) {
     if (start > 0) tryOrder = [...ordered.slice(start), ...ordered.slice(0, start)];
   }
 
+  // ── 整体预算（2026-10-17）：见 requestBudgetMs 上方的事故说明 ──
+  //
+  // ⚠ 这条路径（/v1/messages）正是 **Claude Code / DSH 最常走的**，
+  //   也是用户报 "Gateway was unreachable: aborted due to timeout" 的那条。
+  //   实测 claude-haiku-5-5 三个候选的超时预算合计 260 秒、deepseek-v4.1-flash 七个合计 405 秒，
+  //   而客户端自己的超时约 60–120 秒 —— 客户端先断开，后面试的都是白费。
+  const budgetMs = requestBudgetMs(cfg);
+  const deadline = reqStart + budgetMs;
+  let budgetExhausted = false;
+
   for (const p of tryOrder) {
+    if (Date.now() >= deadline) {
+      budgetExhausted = true;
+      log(`failover 总预算 ${Math.round(budgetMs / 1000)}s 已用尽（已试 ${tryOrder.indexOf(p)}/${tryOrder.length} 家）`
+        + `→ 不再开始新的候选，立刻收口（anthropic 路径）`);
+      break;
+    }
     // 模型映射：逻辑名 → 该供应商的上游真实 ID（Anthropic 路径同样处理）；
     // 带图片时优先选声明了 vision 的那条上游 ID（见 upstreamIdFor）
     const attemptBody = bodyForProvider(outBody, p, model, bodyHasImage(body));
@@ -10222,6 +10336,9 @@ async function handleMessages(cfg, req, res, body) {
     //（只在 forward() 里补会让声明了 openai-chat 的那批模型全部 400 MissingSessionID）。
     applyOpencodeLaneHeaders(baseHeaders, attemptBody, p.id);
     let out;
+    // 本轮预算剩余 —— 传给下游把**单次**上游等待也压进预算（见 effectiveTimeoutMs）。
+    // 三个分支全都要传，漏一个那条路径就仍然会等满该家 timeoutMs（amd 180s）。
+    const budgetOpts = { remainingBudgetMs: Math.max(0, deadline - Date.now()) };
     if (toResponses) {
       // 协议矩阵：Anthropic 客户端 ← Responses 上游。
       // 请求体 Anthropic→chat→Responses 在这里翻；响应由 forward 里的矩阵分支翻回 Anthropic
@@ -10230,17 +10347,20 @@ async function handleMessages(cfg, req, res, body) {
         baseHeaders,
         translateMatrixRequest(attemptBody, 'anthropic-messages', 'openai-responses', p),
         res,
-        { matrix: {
-          clientWire: 'anthropic-messages',
-          upstreamWire: 'openai-responses',
-          model,
-          inputTokens: estimateTokens(JSON.stringify(attemptBody.messages || '')),
-          clientStream: !!body.stream,
-        } });
+        {
+          ...budgetOpts,
+          matrix: {
+            clientWire: 'anthropic-messages',
+            upstreamWire: 'openai-responses',
+            model,
+            inputTokens: estimateTokens(JSON.stringify(attemptBody.messages || '')),
+            clientStream: !!body.stream,
+          },
+        });
     } else if (toOpenAI) {
-      out = await forwardAnthropicViaOpenAI(p, baseHeaders, attemptBody, res, undefined);
+      out = await forwardAnthropicViaOpenAI(p, baseHeaders, attemptBody, res, { ...budgetOpts });
     } else {
-      out = await forwardWithAccounts(p, '/messages', baseHeaders, attemptBody, res);
+      out = await forwardWithAccounts(p, '/messages', baseHeaders, attemptBody, res, { ...budgetOpts });
     }
     if (out === true) {
       log(`served ${model} via ${viaTag(p.id)} (anthropic)`);
@@ -10289,7 +10409,15 @@ async function handleMessages(cfg, req, res, body) {
     } });
   }
   logCall('all-providers', 'fail');
-  json(res, 503, { type: 'error', error: { type: 'api_error', message: `all providers for model "${model}" are unavailable` } });
+  // 预算用尽 ≠ 所有家都坏了。两者诊断方向完全不同，措辞必须分开（见 requestBudgetMs 注释）。
+  json(res, 503, { type: 'error', error: {
+    type: 'api_error',
+    message: budgetExhausted
+      ? `all providers for model "${model}" failed within the ${Math.round(budgetMs / 1000)}s request budget`
+        + ` —— the gateway stopped trying early instead of piling up per-provider timeouts`
+        + ` (raise requestBudgetMs in the gateway config, or lower the slow providers' timeoutMs)`
+      : `all providers for model "${model}" are unavailable`,
+  } });
 }
 
 async function handleModels(cfg, req, res) {

@@ -2011,6 +2011,49 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up); }
   });
 
+  t('网关（2026-10-17）：候选链必须有**整体预算** —— 不得让各家 timeoutMs 串行累加把客户端拖超时', async () => {
+    // 现场：Claude Code 报 `Gateway was unreachable: The operation was aborted due to timeout`
+    // （/v1/messages）。网关进程是健康的（/health 82ms），小请求 2–3 秒就回。
+    // 根因是候选链的 timeoutMs **串行累加**：
+    //   deepseek-v4.1-flash 7 家合计 405 秒、claude-haiku-5-5 3 家合计 260 秒，
+    //   而客户端自己的超时约 60–120 秒 → 客户端先断开，网关还在傻等没人再听的响应。
+    //   实测当天 46 次调用超过 60 秒（最长 293 秒）。
+    //
+    // 用两个**永不响应**的上游（各自 timeoutMs 给到 60 秒）验证三件事：
+    //   ① 总耗时被压到 requestBudgetMs 量级，而不是等满第一家的 60 秒；
+    //   ② 预算在**启动下一个候选之前**生效 → 第二家一次都不该被调用；
+    //   ③ 日志要写明是"预算收口"，否则用户会去查供应商（诊断方向错）。
+    const httpMod = require('node:http');
+    const mkHang = () => new Promise((resolve) => {
+      const st = { calls: 0 };
+      const srv = httpMod.createServer((req) => { st.calls++; req.resume(); /* 永不回响应 */ });
+      srv.listen(0, '127.0.0.1', () => resolve({ srv, st, port: srv.address().port }));
+    });
+    const h1 = await mkHang();
+    const h2 = await mkHang();
+    const gw = await startGatewayWith([
+      providerOf('hang1', h1, { priority: 1, timeoutMs: 60000 }),
+      providerOf('hang2', h2, { priority: 2, timeoutMs: 60000 }),
+    ], 'budget', {}, { requestBudgetMs: 1200 });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const started = Date.now();
+      const r = await call({ port: gw.port });
+      const dur = Date.now() - started;
+      assert.strictEqual(r.status, 503, '预算用尽应回 503，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.ok(dur < 6000,
+        '总耗时必须被预算压住（否则会等满第一家的 60000ms），实际 ' + dur + 'ms');
+      assert.strictEqual(h2.st.calls, 0,
+        '预算用尽后不得再启动新的候选，实际 hang2 被调用 ' + h2.st.calls + ' 次');
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/总预算/.test(logText), '日志应写明是按总预算收口：' + logText.slice(-400));
+    } finally {
+      killGw(gw);
+      try { h1.srv.close(); } catch { /* 忽略 */ }
+      try { h2.srv.close(); } catch { /* 忽略 */ }
+    }
+  });
+
   t('网关：熔断期间不再打上游；冷却到点并发只放一个探测；上游恢复后能自愈（不永久卡死）', async () => {
     const up = await startFakeUpstream({ status: 401, modelsStatus: 401, delayMs: 400, errorBody: { error: { message: 'unauthorized' } } });
     const gw = await startGatewayWith([providerOf('bad', up, { priority: 1 })], 'breaker', {
