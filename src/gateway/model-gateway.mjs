@@ -145,19 +145,44 @@ function requestBudgetMs(cfg) {
 }
 
 /**
- * 本次候选实际可用的超时 = min(该家 timeoutMs, **本轮预算剩余**)。
+ * 本次候选实际可用的超时 = min(该家 timeoutMs, **本轮预算的合理份额**)。
  *
- * 为什么需要它（2026-10-17）：只在"开始下一个候选前"检查预算是不够的 ——
- * 它拦不住**已经在跑的单个慢候选**。实测今天最慢的一次是 `amd#key1 233 秒`，
- * 而 amd 的 timeoutMs 就是 180 秒：预算检查发生在它启动之前，一旦启动就要等满它自己的超时。
- * 于是"总预算"对单家慢的情况完全失效，Claude Code 照样超时。
- * 把剩余预算作为上限压进每次请求，才真正做到"到点就收口"。
+ * ## 为什么不能只压"剩余预算"（2026-10-19 实测事故）
+ *
+ * 只压剩余预算是**不够的**：它允许**第一个慢候选独占几乎全部预算**。
+ * 现场（用户贴回的 400）：
+ *
+ *   11:10:58 try amd for deepseek-v4.1-flash          ← amd.timeoutMs = 180s
+ *   11:12:05 upstream amd request error: 超时，阈值 66147ms，已等 66154ms   ← 一家吃掉 66 秒
+ *   11:12:05 failover 总预算 120s 已用尽（已试 3/5 家）→ 不再开始新的候选
+ *   11:12:05 failover exhausted：回最后一次确定性 4xx（via opencode HTTP 400）
+ *   → 单次请求 120917ms，**另外 2 家候选一次都没试**（其中 commandcode 本可成功）
+ *
+ * 而紧接着的下一次请求（11:12:57）就成功了：opencode 400 → commandcode 200。
+ * 也就是说：**不是没有可用候选，是慢候选把预算吃光、让可用候选没机会上场。**
+ *
+ * ## 份额怎么给
+ *
+ * `剩余预算 ÷ 剩余候选数`（下限 {@link MIN_CANDIDATE_TIMEOUT_MS}，避免预算很小时
+ * 把每家都压到几百毫秒、反而全部误判超时）。这样一家慢不会饿死后面所有家：
+ * 上例中 amd 只能用到约 24 秒，剩下的时间足够 commandcode 上场并成功。
+ *
+ * ⚠ 代价要说清楚：这会让"确实很慢但能成功"的家被提前掐断。可调的两个旋钮是
+ *   网关配置的 `requestBudgetMs`（整体放宽）与该家的 `timeoutMs`（无意义，因为份额才是上界）。
+ *   若某家确实需要更长时间，应当**提高整体预算**，而不是指望它独占。
  */
+const MIN_CANDIDATE_TIMEOUT_MS = 5_000;
+
 function effectiveTimeoutMs(provider, model, opts) {
   const base = providerTimeoutMs(provider, model);
   const remain = Number(opts && opts.remainingBudgetMs);
   if (!Number.isFinite(remain) || remain <= 0) return base;
-  return Math.max(1, Math.min(base, remain));
+  const left = Number(opts && opts.remainingCandidates);
+  // 剩余候选数未知（老调用方）→ 退化为"不超剩余预算"，保持向后兼容
+  const share = (Number.isFinite(left) && left > 1)
+    ? Math.max(MIN_CANDIDATE_TIMEOUT_MS, Math.floor(remain / left))
+    : remain;
+  return Math.max(1, Math.min(base, share, remain));
 }
 
 function providerTimeoutMs(provider, model) {
@@ -5690,13 +5715,42 @@ function withThinkingPlaceholders(body) {
  * 确定性 4xx 的客户端文案：**不回显上游错误体原文**（防泄露上游信息/供应商指纹），
  * 只说明"请求本身有问题 + 已停止 failover（重发给别家不会有帮助）"。
  */
-function stopFailoverMessage(providerId, model, upstreamStatus) {
+/**
+ * "全部候选都失败"时回给客户端的文案。
+ *
+ * ⚠ 2026-10-19：旧文案**恒说** `failover stopped on purpose (re-sending the same request to
+ * other providers would not help)` —— 这句话在两种情形下都是**错的**，而且会把用户引向
+ * 错误方向（以为是请求本身的问题，实际是**预算被慢候选吃光、后面几家没机会上场**）：
+ *
+ *   用户现场贴回的报错：
+ *     `upstream provider "opencode" rejected model "deepseek-v4.1-flash" with HTTP 400 —
+ *      the request itself is invalid …; failover stopped on purpose`
+ *   而日志显示的真实经过是：
+ *     opencode 400（8.5s）→ amd 超时（66s）→ **总预算 120s 用尽，另 2 家一次都没试**
+ *     → 回最后一次确定性 4xx（就是 opencode 那个）。
+ *   紧接着的下一次请求就成功了（commandcode 200）—— 说明"再发给别家没用"完全不成立。
+ *
+ * 现在按实际原因分两路措辞，并把"试了几家/共几家"讲出来，让用户知道该调什么。
+ *
+ * @param {object} [info] {budgetExhausted, tried, total, budgetMs}
+ */
+function stopFailoverMessage(providerId, model, upstreamStatus, info) {
   const hint = upstreamStatus === 404
     ? 'the provider does not offer this model'
-    : 'the request itself is invalid (parameters / size / unprocessable)';
-  return `upstream provider "${providerId}" rejected model "${model}" with HTTP ${upstreamStatus} — ${hint}; `
-    + 'failover stopped on purpose (re-sending the same request to other providers would not help). '
-    + 'See the gateway log for the upstream detail.';
+    : 'the request itself may be invalid (parameters / size / context length) — check the gateway log for the upstream detail';
+  const bits = [`upstream provider "${providerId}" rejected model "${model}" with HTTP ${upstreamStatus}`, hint];
+  if (info && info.budgetExhausted) {
+    const secs = Math.round(Number(info.budgetMs || 0) / 1000);
+    const tried = Number(info.tried || 0);
+    const total = Number(info.total || 0);
+    bits.push(`⚠ this request was cut short by the ${secs}s total budget after trying ${tried} of ${total} providers`
+      + ' — the remaining providers were never attempted, so a retry may well succeed'
+      + ' (raise requestBudgetMs in the gateway config, or lower the slow providers\' timeoutMs)');
+  } else {
+    bits.push('every configured provider was attempted and failed');
+  }
+  bits.push('See the gateway log for details.');
+  return bits.join(' — ');
 }
 
 /* ---------------- 内容拦截诊断 dump（审计修复 P3，本次） ----------------
@@ -10159,16 +10213,20 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
   const budgetMs = requestBudgetMs(cfg);
   const deadline = reqStart + budgetMs;
   let budgetExhausted = false;
+  // 实际**开始过**的候选数（不是"轮到第几个"）：有候选会被 skip（熔断/体积超限），
+  // 两者不同。报错文案里说"试了 N 家"必须用这个真值，否则会误导用户。
+  let triedCount = 0;
 
   for (const p of tryOrder) {
     // 进每个候选**之前**检查总预算。用 >= 而不是 >：刚好用满也不再开新的一家 ——
     // 新开一家最坏还要等它自己的 timeoutMs，那必然超出客户端耐心。
     if (Date.now() >= deadline) {
       budgetExhausted = true;
-      log(`failover 总预算 ${Math.round(budgetMs / 1000)}s 已用尽（已试 ${tryOrder.indexOf(p)}/${tryOrder.length} 家）`
+      log(`failover 总预算 ${Math.round(budgetMs / 1000)}s 已用尽（已试 ${triedCount}/${tryOrder.length} 家）`
         + `→ 不再开始新的候选，立刻收口（客户端早已超时的话，继续试是没人听的）`);
       break;
     }
+    triedCount++;
     // 模型映射：把逻辑名换成该供应商的上游真实 ID（未声明映射 → 原样透传）；
     // 带图片时优先选声明了 vision 的那条上游 ID（见 upstreamIdFor）
     const attemptBody = bodyForProvider(body, p, model, bodyHasImage(body));
@@ -10214,9 +10272,13 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
           return true;
         },
       } : {}),
-      // 把"本轮预算剩余"传给 forward：它用于把**单次**上游等待也压进预算（见 effectiveTimeoutMs）。
-      // 只靠"开始下一个候选前检查"拦不住已经在跑的慢候选（实测 amd 单次 233 秒）。
-      { remainingBudgetMs: Math.max(0, deadline - Date.now()) },
+      // 把"预算剩余 ÷ 剩余候选数"传给 forward：见 effectiveTimeoutMs 的事故说明。
+      // 只压"剩余预算"会让第一个慢候选独占几乎全部预算（实测 amd 一家吃掉 66 秒，
+      // 导致后面本可成功的 commandcode 没机会上场）。
+      {
+        remainingBudgetMs: Math.max(0, deadline - Date.now()),
+        remainingCandidates: tryOrder.length - tryOrder.indexOf(p),
+      },
     );
     const out = await forwardWithAccounts(p, sendPath + search, passthroughHeaders(req.headers, p.apiKey, cfg.clientUA, effectiveClientProfile(cfg, p), cfg), sendBody, res, fwdOpts);
     if (out === true) {
@@ -10267,7 +10329,11 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
       + ` → ${lastDeterministic4xx.status}）`);
     logCall(`via=${lastDeterministic4xx.providerId}`, 'fail:' + lastDeterministic4xx.status);
     return json(res, lastDeterministic4xx.status, {
-      error: { message: stopFailoverMessage(lastDeterministic4xx.providerId, model, lastDeterministic4xx.upstreamStatus) },
+      error: {
+        message: stopFailoverMessage(lastDeterministic4xx.providerId, model, lastDeterministic4xx.upstreamStatus, {
+          budgetExhausted, tried: triedCount, total: tryOrder.length, budgetMs,
+        }),
+      },
     });
   }
   logCall('all-providers', 'fail');
@@ -10539,14 +10605,17 @@ async function handleMessages(cfg, req, res, body) {
   const budgetMs = requestBudgetMs(cfg);
   const deadline = reqStart + budgetMs;
   let budgetExhausted = false;
+  // 实际**开始过**的候选数（不是"轮到第几个"）—— 见 handleCompletion 里同名变量说明。
+  let triedCount = 0;
 
   for (const p of tryOrder) {
     if (Date.now() >= deadline) {
       budgetExhausted = true;
-      log(`failover 总预算 ${Math.round(budgetMs / 1000)}s 已用尽（已试 ${tryOrder.indexOf(p)}/${tryOrder.length} 家）`
+      log(`failover 总预算 ${Math.round(budgetMs / 1000)}s 已用尽（已试 ${triedCount}/${tryOrder.length} 家）`
         + `→ 不再开始新的候选，立刻收口（anthropic 路径）`);
       break;
     }
+    triedCount++;
     // 模型映射：逻辑名 → 该供应商的上游真实 ID（Anthropic 路径同样处理）；
     // 带图片时优先选声明了 vision 的那条上游 ID（见 upstreamIdFor）
     const attemptBody = bodyForProvider(outBody, p, model, bodyHasImage(body));
@@ -10567,9 +10636,13 @@ async function handleMessages(cfg, req, res, body) {
     //（只在 forward() 里补会让声明了 openai-chat 的那批模型全部 400 MissingSessionID）。
     applyOpencodeLaneHeaders(baseHeaders, attemptBody, p.id);
     let out;
-    // 本轮预算剩余 —— 传给下游把**单次**上游等待也压进预算（见 effectiveTimeoutMs）。
-    // 三个分支全都要传，漏一个那条路径就仍然会等满该家 timeoutMs（amd 180s）。
-    const budgetOpts = { remainingBudgetMs: Math.max(0, deadline - Date.now()) };
+    // 预算剩余 **÷ 剩余候选数** —— 见 effectiveTimeoutMs 的事故说明：只压剩余预算会让
+    // 第一个慢候选独占几乎全部预算（实测 amd 一家吃 66 秒 → 后面本可成功的家没机会上场）。
+    // 三个分支全都要传，漏一个那条路径就仍然会等满该家 timeoutMs。
+    const budgetOpts = {
+      remainingBudgetMs: Math.max(0, deadline - Date.now()),
+      remainingCandidates: tryOrder.length - tryOrder.indexOf(p),
+    };
     if (toResponses) {
       // 协议矩阵：Anthropic 客户端 ← Responses 上游。
       // 请求体 Anthropic→chat→Responses 在这里翻；响应由 forward 里的矩阵分支翻回 Anthropic
@@ -10636,7 +10709,9 @@ async function handleMessages(cfg, req, res, body) {
     logCall(`via=${lastDeterministic4xx.providerId}`, 'fail:' + lastDeterministic4xx.status);
     return json(res, lastDeterministic4xx.status, { type: 'error', error: {
       type: lastDeterministic4xx.status >= 500 ? 'api_error' : 'invalid_request_error',
-      message: stopFailoverMessage(lastDeterministic4xx.providerId, model, lastDeterministic4xx.upstreamStatus),
+      message: stopFailoverMessage(lastDeterministic4xx.providerId, model, lastDeterministic4xx.upstreamStatus, {
+        budgetExhausted, tried: triedCount, total: tryOrder.length, budgetMs,
+      }),
     } });
   }
   logCall('all-providers', 'fail');

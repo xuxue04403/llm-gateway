@@ -2054,6 +2054,72 @@ let upstreamPort = 0;
     }
   });
 
+  t('网关（2026-10-19）：预算要**按剩余候选分摊** —— 一个慢家不得吃光，后面本可成功的家必须有机会', async () => {
+    // 用户现场：opencode 400（8.5s）→ amd 超时（66s）→ **总预算 120s 用尽，另 2 家一次都没试**
+    // → 回最后一次 4xx，报告里写"failover stopped on purpose"。而紧接着的下一次请求就成功了。
+    // 也就是说：不是没有可用候选，是慢候选把预算吃光、让可用候选没机会上场。
+    //
+    // 修法：单候选超时 = min(该家 timeoutMs, 剩余预算 ÷ 剩余候选数)。
+    // 这里用「第一家挂起 60s + 第二家立刻 200」验证：第一家只能用到约一半预算，
+    // 第二家必须被真正尝试并成功。
+    const httpMod = require('node:http');
+    const mkHang = () => new Promise((resolve) => {
+      const st = { calls: 0 };
+      const srv = httpMod.createServer((req) => { st.calls++; req.resume(); /* 永不回响应 */ });
+      srv.listen(0, '127.0.0.1', () => resolve({ srv, st, port: srv.address().port }));
+    });
+    const hang = await mkHang();
+    const ok = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      providerOf('slowFirst', hang, { priority: 1, timeoutMs: 60000 }),
+      providerOf('goodSecond', ok, { priority: 2 }),
+    ], 'budget-share', {}, { requestBudgetMs: 6000 });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const started = Date.now();
+      const r = await call({ port: gw.port });
+      const dur = Date.now() - started;
+      assert.strictEqual(r.status, 200,
+        '第二家本可成功，必须真的被尝试（旧实现会让慢家吃光预算 → 503），实际 ' + r.status
+        + ' ' + String(r.text || '').slice(0, 200));
+      assert.strictEqual(ok.st.calls, 1, '第二家应收到 1 次转发，实际 ' + ok.st.calls);
+      assert.ok(dur < 5500,
+        '慢家只应占约一半预算（3s），总耗时应明显小于 6s 预算，实际 ' + dur + 'ms');
+      assert.ok(hang.st.calls === 1, '慢家应只被尝试 1 次，实际 ' + hang.st.calls);
+    } finally {
+      killGw(gw);
+      try { hang.srv.close(); } catch { /* 忽略 */ }
+      closeUp(ok);
+    }
+  });
+
+  t('网关（2026-10-19）：预算耗尽时回给客户端的文案**不得**说"failover stopped on purpose"', async () => {
+    // 旧文案恒说 "failover stopped on purpose (re-sending the same request to other providers
+    // would not help)"，而真实情况是"预算被慢家吃光、剩下几家没试过" —— 重发很可能成功。
+    // 这句话会把用户引向"我的请求有问题"的错误方向，必须按实际原因分路。
+    const httpMod = require('node:http');
+    const st = { calls: 0 };
+    const srv = httpMod.createServer((req) => { st.calls++; req.resume(); /* 挂起 */ });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const up = { srv, st, port: srv.address().port };
+    const gw = await startGatewayWith([
+      providerOf('h1', up, { priority: 1, timeoutMs: 60000 }),
+      providerOf('h2', up, { priority: 2, timeoutMs: 60000 }),
+    ], 'budget-msg', {}, { requestBudgetMs: 2500 });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 503, '全部挂起应回 503，实际 ' + r.status);
+      assert.ok(!/stopped on purpose/i.test(r.text || ''),
+        '预算耗尽时不得说"故意停止"（那会让用户以为请求本身有问题）：' + String(r.text).slice(0, 240));
+      assert.ok(/budget/i.test(r.text || '') && /requestBudgetMs/.test(r.text || ''),
+        '文案应说明是预算收口，并指出可调 requestBudgetMs：' + String(r.text).slice(0, 240));
+    } finally {
+      killGw(gw);
+      try { srv.close(); } catch { /* 忽略 */ }
+    }
+  });
+
   t('网关：熔断期间不再打上游；冷却到点并发只放一个探测；上游恢复后能自愈（不永久卡死）', async () => {
     const up = await startFakeUpstream({ status: 401, modelsStatus: 401, delayMs: 400, errorBody: { error: { message: 'unauthorized' } } });
     const gw = await startGatewayWith([providerOf('bad', up, { priority: 1 })], 'breaker', {
