@@ -11,19 +11,36 @@
 'use strict';
 
 /** 单个供应商声明的模型条目 → [{ up, as, vision?, contextWindow?, maxTokens? }] */
+/**
+ * 免费档的**后缀自动归一**（2026-10-19）：与引擎 modelEntries 逐字一致。
+ * 上游 ID 结尾的 `-free` 在未显式声明 `as` 时自动去掉，于是
+ * `deepseek-v4.1-flash-free` 天然归入 `deepseek-v4.1-flash` 这个逻辑模型。
+ * ⚠ 这个文件是引擎规则的镜像，被 tests/writers.test.js 锁死必须与 --write-dsh 的输出一致；
+ *   改引擎那侧就必须同步这里（漏改会让"写进客户端的模型列表"与"网关实际路由"分叉）。
+ */
+const FREE_SUFFIX_RE = /^(.+?)-free$/i;
+
+function stripFreeSuffix(upstreamId) {
+  const s = String(upstreamId || '').trim();
+  const m = FREE_SUFFIX_RE.exec(s);
+  return m ? m[1] : s;
+}
+
 function modelEntries(provider) {
   const out = [];
   const list = provider && Array.isArray(provider.models) ? provider.models : [];
   for (const m of list) {
     if (typeof m === 'string') {
       const s = m.trim();
-      if (s) out.push({ up: s, as: s });
+      if (s) out.push({ up: s, as: stripFreeSuffix(s) });
       continue;
     }
     if (m && typeof m === 'object' && !Array.isArray(m)) {
       const up = String(m.id ?? m.up ?? m.upstream ?? m.model ?? '').trim();
       if (!up) continue;
-      const as = String(m.as ?? m.alias ?? m.model ?? m.name ?? up).trim();
+      // 显式 as / alias / model / name 优先；都没有时才用去 -free 的形态。
+      const declared = String(m.as ?? m.alias ?? m.model ?? m.name ?? '').trim();
+      const as = declared || stripFreeSuffix(up);
       const vision = m.vision === true
         || (Array.isArray(m.input) && m.input.map((x) => String(x).toLowerCase()).includes('image'));
       const entry = { up, as: as || up };

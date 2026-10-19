@@ -5034,6 +5034,90 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up); }
   });
 
+  t('⑥ OpenCode 车道：会话 id 的 12 位 hex **低 12 位必须是合规计数器**（否则上游恒 403）', async () => {
+    // 现场（2026-10-19）：旧实现 `'ses_' + sha16(...).slice(0,12) + hex` 形状对，
+    // 既有用例也只断言 /^ses_/ —— 于是它**骗过了测试**，却在真实上游恒
+    // `403 FreeTierError`，表现为"配置了这条车道却永远不通"，日志里只有一句 403，极难定位。
+    //
+    // 逐位受控实测确定了真实判据（其余照配方，只改这 12 位）：
+    //     counter=1 → 200 ✓   counter=63 → 200 ✓（窗内上沿）
+    //     counter=64 → 403 ✗  counter=2000 → 403 ✗（越窗）
+    //     时钟位全 0 + counter=1 → 200 ✓  ← **时钟位完全不校验**
+    //     纯摘要派生的 12 位 → 403 ✗（低 12 位是随机值，落窗概率约 1.5%）
+    //
+    // ⚠ 所以断言只能是"低 12 位 ∈ [0,63]"，**不能**写"解回的时钟要接近当前时间" ——
+    //   后者数学上就不成立（now(ms)*4096 超过 48 位，高位必然被截断，实测解回的是 1970 年附近的数）。
+    //   我第一版就写错了这条，实测解出 -1786706395131ms 才发现。
+    const up = await startFakeUpstream({ status: 200 });
+    const p = providerOf('oc-clock', up, { priority: 1 });
+    p.clientProfile = 'opencode';
+    const gw = await startGatewayWith([p], 'oc-clock');
+    try {
+      const r = await call({
+        port: gw.port,
+        body: { model: 'test-model', messages: [{ role: 'user', content: LONG_PREFIX }] },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      const sid = up.st.headers[up.st.headers.length - 1]['x-opencode-session'];
+      assert.ok(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(sid),
+        '会话 id 必须是上游规范形状 ses_+12位小写hex+14位Base62：' + sid);
+
+      const hex = sid.slice(4, 16);
+      const inverted = BigInt('0x' + hex);
+      // 还原被取反的时间段：取反回来 → 低 12 位就是计数器
+      const restored = ~inverted & 0xffffffffffffn;
+      const counter = Number(restored & 0xfffn);
+      assert.ok(counter >= 0 && counter <= 63,
+        '★ 低 12 位（每毫秒计数器）必须落在上游接受的 [0,63]，实际 ' + counter
+        + '（hex=' + hex + '）—— 这一条就是"摘要派生"与"真实时钟算法"的分水岭');
+
+      // 反证：同一个 hex，把低 12 位改成 64（越窗）就必须被上游拒。
+      // 这里不联网，只验证我们的构造确实把语义放在了低 12 位上。
+      const overWindow = (inverted & ~0xfffn) | BigInt((~64) & 0xfff);
+      const overCounter = Number(~overWindow & 0xfffn);
+      assert.strictEqual(overCounter, 64,
+        '构造出的越窗样例其计数器应为 64（用于说明为何不能随机凑这 12 位）');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('⑥ OpenCode 车道：免费档只接受流式 → 客户端要非流式时由网关强制并聚合', async () => {
+    // 受控实测：同一份头与工具，只把 stream 改成 false → 403 FreeTierError。
+    // 所以网关必须替客户端改成流式，并在客户端本来要非流式时自己聚合回单条 JSON
+    //（否则会把裸 SSE 吐给一个期待 JSON 的客户端）。
+    // ⚠ 上游必须回一句**语义完整**的 SSE（带 finish_reason）——否则聚合器会（正确地）
+    //   判成"上游被腰斩"并回 502，那是另一条既有契约，会把本用例的意图掩盖掉。
+    const sseBody = 'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n'
+      + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+      + 'data: [DONE]\n\n';
+    const up = await startFakeUpstream({ status: 200, sseBody });
+    const p = providerOf('oc-stream', up, { priority: 1 });
+    p.clientProfile = 'opencode';
+    const gw = await startGatewayWith([p], 'oc-stream');
+    try {
+      // ① 客户端显式要非流式 → 上游仍必须是 stream:true，且客户端拿到的是单条 JSON
+      const r = await call({
+        port: gw.port,
+        body: { model: 'test-model', stream: false, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      const sent = up.st.bodies[up.st.bodies.length - 1];
+      assert.strictEqual(sent.stream, true,
+        '免费档车道必须把上游请求改成 stream:true（false 会 403）：' + JSON.stringify(sent.stream));
+      assert.ok(r.status === 200, '客户端应拿到 200，实际 ' + r.status);
+      assert.ok(!/^data: /m.test(r.text || ''),
+        '客户端要的是非流式，不得把裸 SSE 交给它：' + String(r.text || '').slice(0, 160));
+      const log = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/只接受流式/.test(log), '日志应说明为车道改了流式：' + log.slice(-300));
+
+      // ② 客户端本来就要流式 → 原样透传，不必聚合
+      const r2 = await call({
+        port: gw.port,
+        body: { model: 'test-model', stream: true, messages: [{ role: 'user', content: 'hi2' }] },
+      });
+      assert.strictEqual(r2.status, 200, '流式请求实际 ' + r2.status);
+      assert.strictEqual(up.st.bodies[up.st.bodies.length - 1].stream, true, '流式请求上游也应 stream:true');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
   t('⑥ OpenCode 车道：补齐免费档要求的工具四元组（缺了上游 403 FreeTierError）', async () => {
     const up = await startFakeUpstream({ status: 200 });
     const p = providerOf('oc3', up, { priority: 1 });

@@ -178,6 +178,43 @@ t('models.modelEntries：别名 id/up/upstream/model 与 input:["text","image"] 
   assert.ok(e[2].vision, 'input 含 image 应判定为 vision');
 });
 
+t('models.modelEntries：上游 ID 结尾的 -free 自动归一（免写 as）', () => {
+  // 用户要求（2026-10-19）：`deepseek-v4.1-flash-free` 应自动映射为 `deepseek-v4.1-flash`，
+  // 不必在配置里逐条手写 `as`。漏写会让同一个模型在 /v1/models 与用量统计里出现两个名字。
+  const e = models.modelEntries({
+    models: [
+      'deepseek-v4.1-flash-free',                                        // 字符串简写也要归一
+      { id: 'glm-5.3-flash-free' },                                      // 对象形态、无 as
+      { id: 'mimo-v2.6-flash-free', as: 'claude-haiku-5-5' },            // ★ 显式 as 必须优先
+      { id: 'space-bunny' },                                             // 无后缀 → 原样
+      { id: 'free-tier-model' },                                         // 中间出现 free → 不动
+      { id: 'notfree' },                                                 // 不以 -free 结尾 → 不动
+    ],
+  });
+  assert.deepStrictEqual(e.map((x) => x.up), [
+    'deepseek-v4.1-flash-free', 'glm-5.3-flash-free', 'mimo-v2.6-flash-free',
+    'space-bunny', 'free-tier-model', 'notfree',
+  ], '上游 ID 必须原样保留（它才是发给上游的那个名字）');
+  assert.deepStrictEqual(e.map((x) => x.as), [
+    'deepseek-v4.1-flash',      // ← 自动去后缀
+    'glm-5.3-flash',            // ← 自动去后缀
+    'claude-haiku-5-5',         // ← 显式 as 优先，不被后缀规则覆盖
+    'space-bunny',
+    'free-tier-model',          // 中间出现 free 不受影响
+    'notfree',                  // 不带 `-free` 后缀（连字符是判据的一部分）
+  ]);
+});
+
+t('models.modelEntries：-free 归一后同族模型归入同一逻辑名（避免模型列表出现两个名字）', () => {
+  const e = models.modelEntries({
+    models: [{ id: 'deepseek-v4.1-flash' }, { id: 'deepseek-v4.1-flash-free' }],
+  });
+  assert.deepStrictEqual(e.map((x) => x.up), ['deepseek-v4.1-flash', 'deepseek-v4.1-flash-free'],
+    '两条上游 ID 不同');
+  assert.deepStrictEqual(e.map((x) => x.as), ['deepseek-v4.1-flash', 'deepseek-v4.1-flash'],
+    '但归一到同一个逻辑名 —— 这样 /v1/models 只出现一个 deepseek-v4.1-flash');
+});
+
 /* ==================== datadir：占位配置判定 ==================== */
 
 const EXAMPLE_PATH = path.join(__dirname, '..', 'src', 'gateway', 'gateway.config.example.json');

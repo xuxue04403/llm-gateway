@@ -898,21 +898,94 @@ function sessionKeyOf(body, req) {
 }
 
 /**
+ * OpenCode 免费档的**规范会话 id 形状**：`ses_` + 12 位小写 hex + 14 位 Base62。
+ *
+ * ## 那 12 位 hex 的真实判据（2026-10-19 逐位受控实测）
+ *
+ * 旧实现是 `'ses_' + sha16(...).slice(0,12) + hex` —— 形状对、正则能过，
+ * 却恒被上游 403 `FreeTierError`，表现为"配了这条车道却永远不通"，
+ * 日志里只有一句 403，极难定位。
+ *
+ * 上游把这 12 位当 `时钟 << 12 | 每毫秒计数器` 读，**但只校验低 12 位**：
+ *
+ *     counter=1              → 200 ✓      counter=63   → 200 ✓  （窗内上沿）
+ *     counter=64             → 403 ✗      counter=2000 → 403 ✗  （越窗）
+ *     时钟位全 0 + counter=1 → 200 ✓   ← **时钟位完全不校验**
+ *     纯摘要派生的 12 位     → 403 ✗   （低 12 位是随机值，落窗概率约 1.5%）
+ *
+ * 所以真正要满足的只有一条：**低 12 位 ∈ [0, 63]**。
+ * 真实时钟算法天然满足（计数器恒为 1），但"解回时钟要等于当前时间"并不成立 ——
+ * `now(ms) * 4096` 早已超过 48 位，高位必然被截断（实测解回值是 1970 年附近的数）。
+ * 插件 opencode2dsh 的注释在这一点上自相矛盾（一处说校验时钟，issue #62 说高 36 位不检查），
+ * 实测支持后者。这里仍按上游生成器原样保留时钟位 —— "像真实客户端"比"刚好过闸"更稳。
+ *
+ * 计数器恒取 1 是刻意的：本网关是它自己会话的唯一写入方，
+ * 维护"每毫秒计数器"只会白白增加状态。
+ *
+ * ⚠ 时钟部分**每个会话只能铸一次**（见下方 sessionMemo）：上游按会话聚合免费额度与
+ * prompt cache，每次请求换一个 `ses_` 会把额度打光并 429，也会让缓存永远命中不了。
+ */
+const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
+const OPENCODE_BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+/** 会话 id 记忆表上限（key = 对话信号）。有界，避免长跑进程无界增长。 */
+const OPENCODE_SESSION_MEMO_LIMIT = 1024;
+/** 对话信号 → 已铸的规范会话 id。见 opencodeCanonicalSessionId 的"时钟只铸一次"。 */
+const opencodeSessionMemo = new Map();
+
+/** 定宽 Base62（大端，左侧补零）。用于会话 id 的 14 位随机段。 */
+function opencodeBase62Fixed(value, width) {
+  let n = BigInt(value);
+  const out = new Array(width);
+  for (let i = width - 1; i >= 0; i--) {
+    out[i] = OPENCODE_BASE62.charAt(Number(n % 62n));
+    n /= 62n;
+  }
+  return out.join('');
+}
+
+/** 上游生成器的 12 位 hex：毫秒时钟 <<12 | 计数器，再按位取反，截 48 位。 */
+function opencodeTimestampHex(now) {
+  const current = BigInt(Math.trunc(Number(now) || Date.now())) * 0x1000n + 1n;
+  return ((~current) & 0xffffffffffffn).toString(16).padStart(12, '0');
+}
+
+/**
+ * 按会话信号铸一个规范会话 id（带记忆，见下方说明）。
+ * 信号本身已经是规范形状时**原样放行** —— 保留上游的 prompt cache 亲和。
+ */
+function opencodeCanonicalSessionId(signal) {
+  const sig = String(signal || '');
+  if (OPENCODE_SESSION_RE.test(sig)) return sig;
+  const hit = opencodeSessionMemo.get(sig);
+  if (hit !== undefined) return hit;
+  const sum = crypto.createHash('sha256').update('ses\u0000' + sig).digest();
+  const session = 'ses_' + opencodeTimestampHex(Date.now())
+    + opencodeBase62Fixed(BigInt('0x' + sum.subarray(6, 16).toString('hex')), 14);
+  // 有界（FIFO 淘汰，非 LRU）：key 源自对话内容，长跑进程不能无界增长。
+  // 淘汰的代价只是重铸一个 id → 损失一点缓存亲和，不影响正确性。
+  if (opencodeSessionMemo.size >= OPENCODE_SESSION_MEMO_LIMIT) {
+    const oldest = opencodeSessionMemo.keys().next();
+    if (!oldest.done) opencodeSessionMemo.delete(oldest.value);
+  }
+  opencodeSessionMemo.set(sig, session);
+  return session;
+}
+
+/**
  * OpenCode 车道的 `x-opencode-session`。
  *
- * ⚠ 与 sessionKeyOf **必须分开**：上游对这条头是**无条件**要求的，少了直接
- * `400 MissingSessionID`。而 sessionKeyOf 带 512 token 门槛（那是"值不值得钉缓存"的启发式），
- * 短对话（"你好"这种最常见的）会被它判成 null ——
+ * ⚠ 与 sessionKeyOf **必须分开**：上游对这条头是**无条件**要求的，少了直接 403
+ * FreeTierError（更早的版本是 400 MissingSessionID）。而 sessionKeyOf 带 512 token 门槛
+ *（那是"值不值得钉缓存"的启发式），短对话（"你好"这种最常见的）会被它判成 null ——
  * 实测踩到：**四种短对话全部拿不到会话头**，等于把这条车道在真实用法上全废掉。
  *
- * 所以这里**永远返回一个 id**：优先按对话内容派生（同一对话跨轮稳定，上游才好做路由）；
+ * 所以这里**永远返回一个 id**：优先按对话内容派生（同一对话跨轮稳定，上游才好做路由与缓存）；
  * 实在没有任何可用前缀时退化成**进程级常量**（所有会话共用一个 id —— 仍然满足上游，
- * 只是它的路由聚合度低一些，不会 400）。
+ * 只是它的路由聚合度低一些，不会 403）。
  */
 function opencodeSessionId(body, providerId) {
   const d = deriveSessionKey(body, null);
-  const hex = sha16(d ? d.key : `opencode-fallback\u0000${providerId || ''}`);
-  return 'ses_' + hex.slice(0, 12) + hex;   // ses_ + 28 位，形态与上游一致
+  return opencodeCanonicalSessionId(d ? d.key : `opencode-fallback\u0000${providerId || ''}`);
 }
 
 /**
@@ -1982,13 +2055,49 @@ function providerPriority(provider) {
  * 同义字段：as / alias / model / name 任一都当逻辑名（手写配置容错）；as 缺省 = id。
  * 同一 provider 允许多条 as 相同的映射（该逻辑模型在该家有多个上游 ID 变体，取第一条命中）。
  */
+/**
+ * 免费档的**后缀自动归一**（2026-10-19，用户要求）。
+ *
+ * 背景：同一条上游车道对"免费额度"与"付费"用的是**同族模型名**，只差一个 `-free` 后缀：
+ *
+ *     deepseek-v4.1-flash-free   ← 免费档（匿名 lane）
+ *     deepseek-v4.1-flash        ← 付费 / Go 订阅
+ *     glm-5.3-flash-free  /  glm-5.3-flash
+ *     mimo-v2.6-flash-free / mimo-v2.6-flash
+ *
+ * 过去要接免费档，用户必须在配置里**逐条手写** `as`：
+ *
+ *     { "id": "deepseek-v4.1-flash-free", "as": "deepseek-v4.1-flash" }
+ *
+ * 漏写一条，那条模型就会以 `deepseek-v4.1-flash-free` 这个"新逻辑名"出现在
+ * `/v1/models` 与客户端模型选择器里 —— 同一个模型出现两个名字，用量统计也被拆成两行。
+ *
+ * 现在把它变成**默认行为**：未显式声明 `as` 时，上游 ID 的 `-free` 后缀自动去掉，
+ * 于是"免费档"天然归入同名逻辑模型，并作为该模型的**兜底候选**参与 failover。
+ *
+ * ⚠ 只在**没有显式 `as`** 时生效：显式声明永远优先（用户可能故意把免费档映射到
+ *   另一个逻辑名，例如让 `deepseek-v4.1-flash-free` 充当 `claude-haiku-5-5`）。
+ * ⚠ 只认**结尾**的 `-free`（且前面还有内容）：`free-tier-model` 这类中间出现的
+ *   不受影响 —— 后缀才是这条上游的命名约定。
+ */
+const FREE_SUFFIX_RE = /^(.+?)-free$/i;
+
+/** 去掉上游 ID 结尾的 `-free`（没有则原样返回）。 */
+function stripFreeSuffix(upstreamId) {
+  const s = String(upstreamId || '').trim();
+  const m = FREE_SUFFIX_RE.exec(s);
+  return m ? m[1] : s;
+}
+
 function modelEntries(provider) {
   const out = [];
   const list = provider && Array.isArray(provider.models) ? provider.models : [];
   for (const m of list) {
     if (typeof m === 'string') {
       const s = m.trim();
-      if (s) out.push({ up: s, as: s });
+      // 字符串简写形态同样享受后缀归一：`["deepseek-v4.1-flash-free"]` 直接等价于
+      // `[{id:"deepseek-v4.1-flash-free", as:"deepseek-v4.1-flash"}]`。
+      if (s) out.push({ up: s, as: stripFreeSuffix(s) });
       continue;
     }
     if (m && typeof m === 'object' && !Array.isArray(m)) {
@@ -1996,7 +2105,11 @@ function modelEntries(provider) {
       //（配置页对 `{model,as}` 这种手写形态也这么读，两侧语义必须一致）
       const up = String(m.id ?? m.up ?? m.upstream ?? m.model ?? '').trim();
       if (!up) continue;
-      const as = String(m.as ?? m.alias ?? m.model ?? m.name ?? up).trim();
+      // 显式 `as` 优先（同义键 alias/model/name）；未声明时用去 `-free` 的形态
+      //（见上方 FREE_SUFFIX_RE 说明）。回退链必须与 writers/models.js 逐字一致 ——
+      // 那个文件是本函数的镜像，被测试锁死。
+      const declared = String(m.as ?? m.alias ?? m.model ?? m.name ?? '').trim();
+      const as = declared || stripFreeSuffix(up);
       // 多模态声明（2026-09-16）：vision: true 或 input: ['text','image'] 都表示该条支持图片输入。
       // 只会影响两件事：① 写进 dsh settings.yaml 的 input 字段（否则 harness 直接拦下图片：
       // "当前模型不支持图片"）；② 带图片的请求只发给声明了图片的家。
@@ -3729,6 +3842,10 @@ async function aggregateOpenAIStream(upstream, headBytes) {
   let reasoning = '';
   let finish = null;
   let usage = null;
+  // ⚠ 必须声明在 `feed` **之前**：feed() 里要记 `[DONE]`（见其注释），
+  //   而 feed 会被"首事件偷看"喂进来的 headBytes 调用 —— 那次调用发生在读取循环之前。
+  //   声明在下游靠 TDZ 之外的提升侥幸能跑，但语义脆弱，不该依赖。
+  let sawDone = false;
   const toolCalls = new Map();
   const toolCallState = { last: 0 };   // 第二轮审计修复：缺 index 的分片按"新调用/续片"分流，不再一律落 0
   const feed = (text) => {
@@ -3740,7 +3857,19 @@ async function aggregateOpenAIStream(upstream, headBytes) {
       const m = /^data:\s*(.*)$/.exec(line);
       if (!m) continue;
       const payload = m[1].trim();
-      if (payload === '[DONE]') continue;
+      // ⚠ `[DONE]` 必须在这里就记下"上游说完了"（2026-10-19 修复）。
+      //
+      // 旧实现在这里只 `continue`，`sawDone` 却是在**读取循环**里按 chunk 原文设的
+      //（`if (text.includes('[DONE]')) sawDone = true`）。可首事件偷看（forward 为识别
+      // "首事件即错误"）会把**开头那段字节**先喂给 feed()，于是当上游整条流很短
+      //（只有一帧内容 + `[DONE]`，这是**中转最常见的形态**）时，`[DONE]` 落在 headBytes 里，
+      // 只经过 feed() → sawDone 永远是 false → 聚合路径把它判成"上游被腰斩" → **502**。
+      //
+      // 实测对照（最小复现，上游只发 `[DONE]` 不发 finish_reason）：
+      //   stream=false → 502 upstream_truncated ❌ ｜ stream=true → 200 ✓
+      //   同一份流，只有"是否经过聚合"不同 —— 说明是聚合侧的判据有缺口，不是上游的问题。
+      // 带 finish_reason 的流两边都 200，所以这个缺口平时被掩盖着，只在"短流 + 非流式"时暴露。
+      if (payload === '[DONE]') { sawDone = true; continue; }
       let json = null;
       try { json = JSON.parse(payload); } catch { continue; }
       if (json.id) id = json.id;
@@ -3767,7 +3896,6 @@ async function aggregateOpenAIStream(upstream, headBytes) {
   // 且**不抛异常**，所以 catch 抓不到）时，客户端拿到的是
   // `200 + 半截内容 + finish_reason:"stop"`，**看起来完全正常**。
   // 这是"任务静默终止"在本路径（上游强制流式 + 客户端要非流式）上的形态。
-  let sawDone = false;
   try {
     // 注意：forward() 为识别"首事件即错误"已偷看过首个事件，那些字节必须原样喂回来，否则丢内容
     if (headBytes && headBytes.length) feed(Buffer.from(headBytes).toString('utf8'));
@@ -4277,7 +4405,15 @@ function upstreamRequestHeaders(reqHeaders, apiKey, clientUA, anthropic, clientP
     // OpenCode 免费车道：完全仿真官方桌面客户端。
     // 动态的 session/request id 不在这里给（这里拿不到 body）—— 由 forward 按对话内容补。
     Object.assign(out, opencodeClientHeaders(cfg));
-    if (clientUA) out['user-agent'] = clientUA;
+    // ⚠ User-Agent **不能被全局 clientUA 覆盖**（2026-10-19 抓包实测）。
+    //
+    // 现场：配置里全局 clientUA = `claude-cli/2.0.0`，于是这条车道的 UA 被覆盖成
+    // claude-cli，上游直接 403 FreeTierError —— 而同一个请求只要把 UA 换回
+    // `opencode/1.18.31` 就 200（受控重放 5/5 通过）。UA 是这条车道身份契约的一部分：
+    // 上游还会校验版本（`opencode/0.0.1` → 426 "1.18.0 or newer is required"）。
+    // 所以只在 UA **本身就是 opencode** 时才允许覆盖（例如用户想指定具体版本号），
+    // 其余情况一律保留车道自己的 opcode UA。
+    if (clientUA && /^opencode\//i.test(String(clientUA).trim())) out['user-agent'] = clientUA;
   } else if (clientProfile === 'claude' || (!clientProfile && clientUA)) {
     // Claude Code 完全仿真（兼容旧配置：仅 clientUA 时按 Claude 仿真）
     Object.assign(out, claudeClientHeaders(cfg));
@@ -5941,13 +6077,27 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
           outBody = { ...outBody, stream: true };
         }
       }
-      // ③ OpenCode 免费车道：两件只有网关才知道怎么做的事。
+      // ③ OpenCode 免费车道：三件只有网关才知道怎么做的事。
       // 用**标记头**判断车道，而不是再穿一个 cfg 进来（上游请求头里已经有 x-opencode-client）。
       if (upstreamHeaders && upstreamHeaders['x-opencode-client']) {
         // ① 会话/请求 id 必须由**对话内容**派生（静态头做不到），且同一对话跨轮稳定 ——
         //    上游按会话计费，每请求新铸一个会直接把额度打光并 429。
         //    ⚠ 抽成辅助函数：翻译路径（forwardAnthropicViaOpenAI）也必须调 —— 见该函数的注释。
         applyOpencodeLaneHeaders(upstreamHeaders, outBody, provider.id);
+        // ①b 免费档**只接受流式**：`stream:false` 恒 403 FreeTierError（2026-10-19 受控实测：
+        //     同一份头与工具，只把 stream 改成 false → 403；改回 true → 200）。
+        //     客户端要非流式时由引擎自己把上游 SSE 收完再回一条完整 JSON ——
+        //     直通路径的聚合开关就是下方 init 之后的 needAggregate（applyOpenAIQuirks 的
+        //     `force-stream` 走的是同一条路），所以这里只需把 body 改对流式并置开关。
+        //     ⚠ Responses 模式不在此列：它的流式聚合会产出 chat.completion 形状（错），
+        //       沿用 applyOpenAIQuirks 里那条既有护栏（D7），不在这条路径强制。
+        if (!responsesMode && outBody && typeof outBody === 'object' && outBody.stream !== true) {
+          const wasStream = outBody.stream === true;
+          outBody = { ...outBody, stream: true };
+          if (!wasStream) needAggregate = true;
+          log('OpenCode 免费档：该车道只接受流式 → 已把请求改为 stream:true'
+            + (wasStream ? '' : '（客户端要的是非流式，网关收完 SSE 后聚合回单条 JSON 交付）'));
+        }
         // ② 免费档的工具指纹门：缺 bash/glob/grep/read 直接 403 FreeTierError。
         //    ⚠ 形状必须按**上游实际收到的协议**给，而不是按客户端路径 ——
         //    矩阵翻译之后 body 已经是上游的形状了（实测踩到：Anthropic 客户端 → Responses 上游时
@@ -6262,6 +6412,49 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       // 2026-10-14 新增（commandcode 实测）：「**这家有这模型，但不在这个端点上**」要**单独**成支，
       // 因为它的处置与"不提供该模型"虽然相同（继续 failover、不熔断、不冷却账户），
       // 但**给用户的提示完全不同** —— 用户需要知道该改 baseURL 路径，而不是删掉模型映射。
+      // 「该模型不支持这个**线协议**」（2026-10-19，OpenCode 免费档实测）
+      //
+      // 现场：opencode 家没声明 protocol，Anthropic 客户端（DSH / Claude Code）的请求被
+      // 原样透传到 `/zen/v1/messages`，上游回
+      //   `400 {"type":"error","error":{"type":"ModelProtocolUnsupported","message":"Model does not support this protocol"}}`
+      // 免费档模型**只支持 /chat/completions**（同一模型同一份头，chat 面 200、messages 面 400）。
+      //
+      // 处置与"模型不在这个端点上"相同（继续 failover、不熔断、不冷却账户），
+      // 但**提示完全不同**：用户该做的是给这家声明线协议，而不是删模型映射或改 baseURL。
+      // 不给提示的话，现场日志只有一句 400，排查方向完全是错的。
+      // 「免费档的车道条件没满足」（2026-10-19，OpenCode 免费档实测）
+      //
+      // `403 FreeTierError: OpenCode's free tier can only be used from within OpenCode`
+      // 是这条车道**最常见也最误导人**的失败：日志只有一句 403，看起来像"被风控封了"，
+      // 而实测它完全由**四个可满足的条件**决定（受控对照逐项验证过）：
+      //   ① 端点必须是 /zen/v1/chat/completions（Anthropic 的 /messages 面不支持免费档）
+      //   ② 凭据必须是字面量 `Bearer public`（用真 key → 401/403）
+      //   ③ User-Agent 必须是 `opencode/<≥1.18.0>`（太旧 → 426）
+      //   ④ body 必须 stream:true，且 tools 里同时有 bash 与 read
+      // 所以这里给出**可执行的修复方向**，而不是让用户去猜是不是被封了。
+      if (/FreeTierError/i.test(String(detail || ''))) {
+        log(`upstream ${provider.id} HTTP ${upstream.status} FreeTierError —— 这条免费车道的四个条件需全部满足：`
+          + `① 端点用 /zen/v1/chat/completions（不要 /messages）；`
+          + `② 该家 apiKey 必须是字面量 "public"；`
+          + `③ User-Agent 必须是 opencode/1.18.0 以上；`
+          + `④ stream:true 且 tools 含 bash+read（③④ 网关会自动补）。`
+          + `→ 请先检查 ①②，其余交给网关`);
+        if (opts.failureSink) opts.failureSink.modelScopeOnly = true;
+        breakerReleaseSlot(provider.id, bModel);
+        breakerRecordFail(provider.id, upstream.status, 0, false, bModel);
+        return rawMode ? { retryable: upstream.status } : false;
+      }
+      if (/ModelProtocolUnsupported/i.test(String(detail || ''))) {
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"该模型不支持这个线协议"`
+          + `（请求本身没问题，是这条车道只接受另一种协议）→ 继续 failover（不熔断该家、不冷却账户）；`
+          + `**请在供应商设置里为该家声明 protocol**（例如 OpenCode 免费档用 "openai-chat"），`
+          + `网关会把其它协议的客户端请求自动翻译过去`);
+        if (opts.failureSink) opts.failureSink.modelScopeOnly = true;
+        breakerReleaseSlot(provider.id, bModel);
+        // 记一次模型级失败：协议声明错是**持续**状态，不是抖动；不记的话每条请求都会先白打一发。
+        breakerRecordFail(provider.id, upstream.status, 0, false, bModel);
+        return rawMode ? { retryable: upstream.status } : false;
+      }
       if (isEndpointMismatchByProvider(upstream.status, detail)) {
         const hint = suggestedEndpointHint(detail);
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"模型不在这个端点上"（请求本身没问题，`
@@ -9254,6 +9447,15 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
     const openaiBody = anthropicToOpenAIRequest(body, provider);
     if (quirks.has('force-stream')) openaiBody.stream = true;
     else openaiBody.stream = wantsStream;
+    // OpenCode 免费档**只接受流式**：`stream:false` 恒 403 FreeTierError（2026-10-19 实测对照）。
+    // 这条路径的非流式交付已经具备 —— 响应侧按 `wantsStream` 分流，走的是"收完 SSE 再聚合回
+    // 一条完整 Anthropic message"那条分支（见本函数下方 `wantsStream && !aggregateOnly` 的 else）。
+    // 所以只要把上游请求改对流式即可，**不需要**额外的聚合开关。
+    if (headers && headers['x-opencode-client'] && openaiBody.stream !== true) {
+      openaiBody.stream = true;
+      log('OpenCode 免费档：该车道只接受流式 → 已把请求改为 stream:true'
+        + (wantsStream ? '' : '（客户端要的是非流式，网关收完 SSE 后聚合回单条 message 交付）'));
+    }
     if (quirks.has('stringify-tool-choice') && openaiBody.tool_choice && typeof openaiBody.tool_choice === 'object') {
       openaiBody.tool_choice = (openaiBody.tool_choice.function && openaiBody.tool_choice.function.name) || 'auto';
     }
