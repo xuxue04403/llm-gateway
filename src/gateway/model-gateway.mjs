@@ -145,7 +145,7 @@ function requestBudgetMs(cfg) {
 }
 
 /**
- * 本次候选实际可用的超时 = min(该家 timeoutMs, **本轮预算的合理份额**)。
+ * 本次候选实际可用的超时 = min(该家 timeoutMs, **本轮预算能分给它的额度**)。
  *
  * ## 为什么不能只压"剩余预算"（2026-10-19 实测事故）
  *
@@ -155,22 +155,39 @@ function requestBudgetMs(cfg) {
  *   11:10:58 try amd for deepseek-v4.1-flash          ← amd.timeoutMs = 180s
  *   11:12:05 upstream amd request error: 超时，阈值 66147ms，已等 66154ms   ← 一家吃掉 66 秒
  *   11:12:05 failover 总预算 120s 已用尽（已试 3/5 家）→ 不再开始新的候选
- *   11:12:05 failover exhausted：回最后一次确定性 4xx（via opencode HTTP 400）
  *   → 单次请求 120917ms，**另外 2 家候选一次都没试**（其中 commandcode 本可成功）
  *
- * 而紧接着的下一次请求（11:12:57）就成功了：opencode 400 → commandcode 200。
+ * 而紧接着的下一次请求（11:12:57）就成功了：commandcode 200（31 秒）。
  * 也就是说：**不是没有可用候选，是慢候选把预算吃光、让可用候选没机会上场。**
  *
- * ## 份额怎么给
+ * ## 分配方式：**预留**，不是等分
  *
- * `剩余预算 ÷ 剩余候选数`（下限 {@link MIN_CANDIDATE_TIMEOUT_MS}，避免预算很小时
- * 把每家都压到几百毫秒、反而全部误判超时）。这样一家慢不会饿死后面所有家：
- * 上例中 amd 只能用到约 24 秒，剩下的时间足够 commandcode 上场并成功。
+ * 第一版写成"剩余预算 ÷ 剩余候选数"（等分），复核时发现它**会误杀快家**：
+ * 5 个候选、预算 120s 时第一家只拿到 24s，而日志里 commandcode 实测有过
+ * `served … via commandcode dur=31456ms` —— 一个**本来会成功**的请求会被硬砍在 24s。
+ * 等分对"排在最前的那家通常正是最好的一家"这个事实视而不见。
  *
- * ⚠ 代价要说清楚：这会让"确实很慢但能成功"的家被提前掐断。可调的两个旋钮是
- *   网关配置的 `requestBudgetMs`（整体放宽）与该家的 `timeoutMs`（无意义，因为份额才是上界）。
- *   若某家确实需要更长时间，应当**提高整体预算**，而不是指望它独占。
+ * 现在改成**给每个后续候选预留下限**，第一家可以用掉其余全部：
+ *
+ *   可用 = 剩余预算 − 预留 × (剩余候选数 − 1)
+ *
+ * 上例（预算 120s、5 家、每家预留 15s）：
+ *   commandcode → 120 − 15×4 = **60s**（能用满它自己的 timeout，不再被误杀）
+ *   amd         → 剩 119s 时 = 119 − 15×3 = 74s
+ *   x666        → 剩 45s 时 = 45 − 15×2 = 15s
+ *   nvidia      → 剩 30s 时 = 15s
+ *   opencode    → 剩 15s 时 = 15s
+ * 关键性质：**每个候选都保证有 ≥ 预留 的机会**，同时快家不被掐。
+ *
+ * ⚠ 两个旋钮：网关配置的 `requestBudgetMs`（整体放宽）与
+ *   `DSH_GATEWAY_CANDIDATE_RESERVE_MS`（单家预留，缺省 15s）。
+ *   若某家确实需要更久，应当**提高整体预算**，而不是指望它独占。
  */
+const CANDIDATE_RESERVE_MS = (() => {
+  const n = Number(process.env.DSH_GATEWAY_CANDIDATE_RESERVE_MS);
+  return Number.isFinite(n) && n > 0 ? n : 15_000;
+})();
+/** 兜底下限：预算极小时也不要把单家压到几百毫秒（那会让每家都误判超时）。 */
 const MIN_CANDIDATE_TIMEOUT_MS = 5_000;
 
 function effectiveTimeoutMs(provider, model, opts) {
@@ -180,7 +197,7 @@ function effectiveTimeoutMs(provider, model, opts) {
   const left = Number(opts && opts.remainingCandidates);
   // 剩余候选数未知（老调用方）→ 退化为"不超剩余预算"，保持向后兼容
   const share = (Number.isFinite(left) && left > 1)
-    ? Math.max(MIN_CANDIDATE_TIMEOUT_MS, Math.floor(remain / left))
+    ? Math.max(MIN_CANDIDATE_TIMEOUT_MS, remain - CANDIDATE_RESERVE_MS * (left - 1))
     : remain;
   return Math.max(1, Math.min(base, share, remain));
 }

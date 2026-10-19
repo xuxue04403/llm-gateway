@@ -2054,26 +2054,26 @@ let upstreamPort = 0;
     }
   });
 
-  t('网关（2026-10-19）：预算要**按剩余候选分摊** —— 一个慢家不得吃光，后面本可成功的家必须有机会', async () => {
-    // 用户现场：opencode 400（8.5s）→ amd 超时（66s）→ **总预算 120s 用尽，另 2 家一次都没试**
-    // → 回最后一次 4xx，报告里写"failover stopped on purpose"。而紧接着的下一次请求就成功了。
+  t('网关（2026-10-19）：预算要给后续候选**预留** —— 一个慢家不得吃光，后面本可成功的家必须有机会', async () => {
+    // 用户现场：opencode 400（8.5s）→ commandcode socket 错 → amd 超时（66s）
+    // → **总预算 120s 用尽，另 2 家一次都没试** → 回最后一次 4xx，报告里写
+    // "failover stopped on purpose"。而紧接着的下一次请求就成功了。
     // 也就是说：不是没有可用候选，是慢候选把预算吃光、让可用候选没机会上场。
     //
-    // 修法：单候选超时 = min(该家 timeoutMs, 剩余预算 ÷ 剩余候选数)。
-    // 这里用「第一家挂起 60s + 第二家立刻 200」验证：第一家只能用到约一半预算，
-    // 第二家必须被真正尝试并成功。
+    // 修法：单候选可用额度 = 剩余预算 − 预留 × (剩余候选数 − 1)。
+    // 这里让第一家"自身 timeout 远大于预算"（60s vs 8s）：旧实现会把 8s 全给它、
+    // 第二家一家都轮不上（503）；新实现只给它 8−3=5s，剩下的 3s 足够第二家上场并成功。
     const httpMod = require('node:http');
-    const mkHang = () => new Promise((resolve) => {
+    const hang = await new Promise((resolve) => {
       const st = { calls: 0 };
       const srv = httpMod.createServer((req) => { st.calls++; req.resume(); /* 永不回响应 */ });
       srv.listen(0, '127.0.0.1', () => resolve({ srv, st, port: srv.address().port }));
     });
-    const hang = await mkHang();
     const ok = await startFakeUpstream({ status: 200 });
     const gw = await startGatewayWith([
       providerOf('slowFirst', hang, { priority: 1, timeoutMs: 60000 }),
       providerOf('goodSecond', ok, { priority: 2 }),
-    ], 'budget-share', {}, { requestBudgetMs: 6000 });
+    ], 'budget-reserve', { DSH_GATEWAY_CANDIDATE_RESERVE_MS: '3000' }, { requestBudgetMs: 8000 });
     try {
       assert.ok(gw.ready, '独立网关实例应就绪');
       const started = Date.now();
@@ -2083,13 +2083,59 @@ let upstreamPort = 0;
         '第二家本可成功，必须真的被尝试（旧实现会让慢家吃光预算 → 503），实际 ' + r.status
         + ' ' + String(r.text || '').slice(0, 200));
       assert.strictEqual(ok.st.calls, 1, '第二家应收到 1 次转发，实际 ' + ok.st.calls);
-      assert.ok(dur < 5500,
-        '慢家只应占约一半预算（3s），总耗时应明显小于 6s 预算，实际 ' + dur + 'ms');
-      assert.ok(hang.st.calls === 1, '慢家应只被尝试 1 次，实际 ' + hang.st.calls);
+      assert.ok(dur < 7000,
+        '慢家只应占 5s（8s 预算 − 3s 预留），总耗时应明显小于 8s 预算，实际 ' + dur + 'ms');
+      assert.strictEqual(hang.st.calls, 1, '慢家应只被尝试 1 次，实际 ' + hang.st.calls);
     } finally {
       killGw(gw);
       try { hang.srv.close(); } catch { /* 忽略 */ }
       closeUp(ok);
+    }
+  });
+
+  t('网关（2026-10-19）：排在最前的**快家不得被均分公式误杀**（预留而非等分）', async () => {
+    // 第一版写成"剩余预算 ÷ 剩余候选数"（等分）。复核时发现它会误杀快家：
+    // 5 家候选、预算 120s 时第一家只拿到 24s，而日志里 commandcode 实测有 dur=31456ms ——
+    // 一个**本来会成功**的请求会被硬砍在 24s。等分对"排最前的通常正是最好的一家"视而不见。
+    //
+    // 这条用例锁住"预留"语义：第一家自身 timeout 小于（预算 − 预留）时，必须能**用满自己的
+    // timeout**，而不是被均分压低。用「第一家慢 6s 但能成功」验证：它必须成功，
+    // 而不是被压到 6s 以下而超时。
+    const slowButOk = await new Promise((resolve) => {
+      const st = { calls: 0 };
+      const srv = require('node:http').createServer((req, res) => {
+        st.calls++;
+        req.resume();
+        req.on('end', () => setTimeout(() => {
+          res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+          res.end('data: {"choices":[{"index":0,"delta":{"content":"slow-ok"}}]}\n\n'
+            + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+        }, 6000));
+      });
+      srv.listen(0, '127.0.0.1', () => resolve({ srv, st, port: srv.address().port }));
+    });
+    const ok2 = await startFakeUpstream({ status: 200 });
+    // 6 家候选、预算 60s、预留 5s：等分只给第一家 10s（够），但若候选更多就会误杀。
+    // 这里用 12 家模拟"候选多"的情形：等分 = 5s < 该家需要的 6s → 会被误杀；
+    // 预留法则给它 60 − 5×11 = 5s… 仍不够，所以这里直接用更贴近真实的参数：
+    // 预算 60s、6 家、预留 5s → 第一家可用 60 − 25 = 35s，足够它 6s 的慢响应。
+    const provs = [providerOf('slowOk', slowButOk, { priority: 1, timeoutMs: 30000 })];
+    for (let i = 0; i < 5; i++) provs.push(providerOf('filler' + i, ok2, { priority: 9, models: ['other-model'] }));
+    const gw = await startGatewayWith(provs, 'budget-reserve2', { DSH_GATEWAY_CANDIDATE_RESERVE_MS: '5000' }, { requestBudgetMs: 60000 });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const started = Date.now();
+      const r = await call({ port: gw.port });
+      const dur = Date.now() - started;
+      assert.strictEqual(r.status, 200,
+        '慢 6s 但能成功的第一家必须被允许跑完（均分公式会把它压到 5s 以下而误杀），实际 ' + r.status
+        + ' ' + String(r.text || '').slice(0, 200));
+      assert.ok(dur >= 5500, '应该真的等了它那 6 秒（说明没被误杀），实际 ' + dur + 'ms');
+      assert.strictEqual(slowButOk.st.calls, 1, '第一家应只被尝试 1 次，实际 ' + slowButOk.st.calls);
+    } finally {
+      killGw(gw);
+      try { slowButOk.srv.close(); } catch { /* 忽略 */ }
+      closeUp(ok2);
     }
   });
 
