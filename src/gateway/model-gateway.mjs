@@ -3185,6 +3185,23 @@ const workbuddyInflight = new Map();       // key → Promise（单飞：并发�
  * 旧实现对 11128 的处置是"≈2% 随机风控，换下一发就行"，于是**永远在重发同一份旧 token**。
  * 现在改为：收到 11128 就作废缓存，让下一次尝试重新解析凭据 —— 这才是"重启就好了"
  * 那个现象的正确自动化。
+ *
+ * ## 为什么**只清内存缓存不够**（2026-10-20 下午复测发现）
+ *
+ * 凭据取舍是两段式（见 resolveWorkBuddyCredential）：身份相同时**谁过期更晚用谁**，
+ * 而"过期更晚"的那份常常是**网关自己刷新后写下的 `own` 副本**。
+ * 问题在于：**"过期更晚"不等于"仍然有效"** —— 桌面 App 轮换凭据后，
+ * 旧的 `own` 副本可能过期时间更晚却**已被上游吊销**。
+ *
+ * 实测证据（用户 14:02 的日志）：
+ *   14:02:50  366 工具 → 11128 → 作废缓存
+ *   14:03:27  366 工具 → 11128 → 再作废     ← 清缓存后又选回那份 own
+ *   14:05:56  → 200（恢复）
+ *   14:20:31  366 工具 → 200（dur=17s）
+ * 也就是说修复生效了，但**要撞两次**才恢复。因为第一次重新解析时 `own` 仍然赢。
+ *
+ * 所以这里额外把该家登记进 {@link workbuddyForceDesktop}：下一次解析**忽略 `own`**，
+ * 强制以桌面 auth 文件为权威（它才是"现在登录的是谁、当前 token 是什么"的权威）。
  */
 function invalidateWorkBuddyCredential(providerId) {
   const prefix = String(providerId) + '#';
@@ -3195,8 +3212,16 @@ function invalidateWorkBuddyCredential(providerId) {
   for (const k of [...workbuddyInflight.keys()]) {
     if (String(k).startsWith(prefix)) workbuddyInflight.delete(k);
   }
+  // 下次解析强制走桌面 auth 文件（忽略自己那份可能已被吊销的刷新副本）
+  if (providerId) workbuddyForceDesktop.add(String(providerId));
   return dropped;
 }
+
+/**
+ * 需要"下一次解析忽略自己那份 own 副本"的家（由 {@link invalidateWorkBuddyCredential} 登记）。
+ * 一次性：解析成功即移除，不长期改变取舍规则。
+ */
+const workbuddyForceDesktop = new Set();
 
 /**
  * WorkBuddy 会话渠道三头（照抄参照实现 corrinehu/dsh-workbuddy-connect 的
@@ -3242,7 +3267,10 @@ async function resolveWorkBuddyCredential(provider, acct) {
   if (cached && !workbuddyNeedsRefresh(cached.cred)) return cached.cred;
   if (workbuddyInflight.has(key)) return workbuddyInflight.get(key);
   const task = (async () => {
-    const ownRaw = readJsonSafe(workbuddyOwnPath(provider, acct));
+    // 收到过 11128 → 这一次**忽略自己那份 own 副本**，强制以桌面 auth 文件为准。
+    // 理由见 invalidateWorkBuddyCredential 的注释：own 可能"过期更晚但已被吊销"。
+    const forceDesktop = workbuddyForceDesktop.has(String(provider.id));
+    const ownRaw = forceDesktop ? null : readJsonSafe(workbuddyOwnPath(provider, acct));
     const own = ownRaw && ownRaw.credential ? ownRaw.credential : null;
     let desktop = null;
     // authFile 留空 → 按平台默认位置自动发现（配置里不必写死机器相关路径）
@@ -3344,6 +3372,9 @@ async function resolveWorkBuddyCredential(provider, acct) {
       }
     }
     workbuddyCredCache.set(key, { cred, ts: Date.now() });
+    // 已按桌面 auth 文件重新取到凭据 → 撤掉"强制桌面"标记（一次性，不长期改变取舍规则）。
+    // 若这次仍失败，上游会再回 11128 → 再次登记，行为是自愈式的。
+    workbuddyForceDesktop.delete(String(provider.id));
     return cred;
   })().finally(() => workbuddyInflight.delete(key));
   workbuddyInflight.set(key, task);
