@@ -1,0 +1,2691 @@
+{
+  "_readme": "llm-gateway 供应商预设目录（供 scripts/presets.mjs 使用）。\n\n来源：mu-zi-lee/magpie-our-free-model（MIT）的 vendor/ofm/src/providers/registry.json，\n逐条归一化到本项目的 provider 形状。**不含任何密钥** —— 只记录 apiKeyEnv（变量名提示）。\n\n字段说明：\n  freeTier   —— 上游标注的免费档/免费额度（9router/FCC 的说法），仅供参考，不保证长期有效\n  manualOnly —— 无法用「baseURL + apiKey」表达（oauth / adc / 本地服务），需手工配置\n  apiKeyEnv  —— 建议的环境变量名，CLI 添加时会提示你填入对应 Key",
+  "generatedAt": "2026-10-20T10:29:07.685Z",
+  "count": 75,
+  "presets": [
+    {
+      "id": "agnes",
+      "name": "Agnes AI",
+      "baseURL": "https://apihub.agnes-ai.com/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "agnes-2.0-flash"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "AGNES_API_KEY",
+      "website": "https://agnes-ai.com/",
+      "signupUrl": "https://agnes-ai.com/",
+      "freeTier": false,
+      "notes": "Reasoning arrives as think tags on this route (FCC profile).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "alibaba_cloud",
+      "name": "Alibaba Cloud",
+      "baseURL": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "qwen3.5-plus"
+        },
+        {
+          "id": "kimi-k2.5"
+        },
+        {
+          "id": "glm-5"
+        },
+        {
+          "id": "MiniMax-M2.5"
+        },
+        {
+          "id": "qwen3-coder-next"
+        },
+        {
+          "id": "qwen3-coder-plus"
+        },
+        {
+          "id": "glm-4.7"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "ALIBABA_CLOUD_API_KEY",
+      "website": "https://www.alibabacloud.com/en/product/modelstudio",
+      "signupUrl": "https://www.alibabacloud.com/help/en/model-studio/get-api-key",
+      "freeTier": false,
+      "notes": "DashScope international compatible-mode endpoint (9router alims-intl, same base URL as FCC).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "anthropic",
+      "name": "Anthropic",
+      "baseURL": "https://api.anthropic.com/v1",
+      "protocol": "anthropic-messages",
+      "models": [
+        {
+          "id": "claude-sonnet-4-20250514"
+        },
+        {
+          "id": "claude-opus-4-20250514"
+        },
+        {
+          "id": "claude-3-5-sonnet-20241022"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "ANTHROPIC_API_KEY",
+      "website": "https://www.anthropic.com/",
+      "signupUrl": "https://platform.claude.com/settings/keys",
+      "freeTier": false,
+      "notes": "Native Anthropic Messages passthrough (FCC marks it native_messages_passthrough).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "baidu",
+      "name": "Baidu Qianfan",
+      "baseURL": "https://qianfan.baidubce.com/v2",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "deepseek-v4-pro",
+          "contextWindow": 1048576
+        },
+        {
+          "id": "deepseek-v4-flash",
+          "contextWindow": 1048576
+        },
+        {
+          "id": "glm-5.2",
+          "contextWindow": 512000
+        },
+        {
+          "id": "glm-5.1",
+          "contextWindow": 198000
+        },
+        {
+          "id": "kimi-k2.6",
+          "contextWindow": 262144
+        },
+        {
+          "id": "qwen3.5-397b-a17b",
+          "contextWindow": 262144
+        },
+        {
+          "id": "qwen3.5-27b",
+          "contextWindow": 262144
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "BAIDU_API_KEY",
+      "website": "https://qianfan.baidubce.com",
+      "signupUrl": "https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application",
+      "freeTier": false,
+      "notes": "Baidu Qianfan v2 OpenAI-compatible endpoint.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "bazaarlink",
+      "name": "BazaarLink",
+      "baseURL": "https://bazaarlink.ai/api/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "auto:free"
+        },
+        {
+          "id": "claude-opus-4.7",
+          "contextWindow": 1000000
+        },
+        {
+          "id": "claude-sonnet-4.6",
+          "contextWindow": 1000000
+        },
+        {
+          "id": "claude-haiku-4.5",
+          "contextWindow": 200000
+        },
+        {
+          "id": "gpt-5.5",
+          "contextWindow": 1050000
+        },
+        {
+          "id": "gpt-5.4",
+          "contextWindow": 1050000
+        },
+        {
+          "id": "gpt-5.4-mini",
+          "contextWindow": 400000
+        },
+        {
+          "id": "gpt-5.4-nano",
+          "contextWindow": 400000
+        },
+        {
+          "id": "grok-4.3",
+          "contextWindow": 1000000
+        },
+        {
+          "id": "grok-4.20",
+          "contextWindow": 2000000
+        },
+        {
+          "id": "gemini-3.1-pro-preview",
+          "contextWindow": 1048576
+        },
+        {
+          "id": "gemini-3-flash-preview",
+          "contextWindow": 1048576
+        },
+        {
+          "id": "gemini-3.1-flash-lite-preview",
+          "contextWindow": 1048576
+        },
+        {
+          "id": "kimi-k2.6",
+          "contextWindow": 262144
+        },
+        {
+          "id": "kimi-k2.5",
+          "contextWindow": 262144
+        },
+        {
+          "id": "glm-5.1",
+          "contextWindow": 204800
+        },
+        {
+          "id": "glm-5",
+          "contextWindow": 204800
+        },
+        {
+          "id": "mimo-v2.5-pro",
+          "contextWindow": 1050000
+        },
+        {
+          "id": "mimo-v2.5",
+          "contextWindow": 1050000
+        },
+        {
+          "id": "minimax-m3",
+          "contextWindow": 1048576
+        },
+        {
+          "id": "minimax-m2.7",
+          "contextWindow": 204800
+        },
+        {
+          "id": "minimax-m2.5",
+          "contextWindow": 204800
+        },
+        {
+          "id": "qwen3.6-plus",
+          "contextWindow": 1000000
+        },
+        {
+          "id": "nemotron-3-super-120b-a12b",
+          "contextWindow": 1000000
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "BAZAARLINK_API_KEY",
+      "website": "https://bazaarlink.ai",
+      "signupUrl": "https://bazaarlink.ai",
+      "freeTier": true,
+      "notes": "Multi-vendor gateway with an auto:free slug; 9router lists it as free-tier.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "bedrock",
+      "name": "Amazon Bedrock",
+      "baseURL": "https://bedrock-mantle.us-east-1.api.aws/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "openai.gpt-oss-120b"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "AWS_BEARER_TOKEN_BEDROCK",
+      "website": "https://aws.amazon.com/bedrock/",
+      "signupUrl": "https://console.aws.amazon.com/bedrock/",
+      "freeTier": false,
+      "manualOnly": true,
+      "notes": "Bedrock Mantle OpenAI-compatible endpoint; the base URL stays configurable because keys and model availability are region-scoped (FCC).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "byteplus",
+      "name": "BytePlus Ark",
+      "baseURL": "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "seed-2-0-pro-260328"
+        },
+        {
+          "id": "seed-2-0-code-preview-260328"
+        },
+        {
+          "id": "seed-2-0-mini-260215"
+        },
+        {
+          "id": "seed-2-0-lite-260228"
+        },
+        {
+          "id": "kimi-k2-thinking-251104"
+        },
+        {
+          "id": "glm-4-7-251222"
+        },
+        {
+          "id": "gpt-oss-120b-250805"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "BYTEPLUS_API_KEY",
+      "website": "https://console.byteplus.com/ark",
+      "signupUrl": "https://console.byteplus.com/ark/region:ark+ap-southeast-1/apiKey",
+      "freeTier": true,
+      "notes": "Free credits for new accounts (9router notice); Seed 2.0, Kimi K2 Thinking, GLM 4.7 and GPT-OSS-120B.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "cerebras",
+      "name": "Cerebras",
+      "baseURL": "https://api.cerebras.ai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "gpt-oss-120b"
+        },
+        {
+          "id": "zai-glm-4.7"
+        },
+        {
+          "id": "llama-3.3-70b"
+        },
+        {
+          "id": "llama-4-scout-17b-16e-instruct"
+        },
+        {
+          "id": "qwen-3-235b-a22b-instruct-2507"
+        },
+        {
+          "id": "qwen-3-32b"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "CEREBRAS_API_KEY",
+      "website": "https://www.cerebras.ai/",
+      "signupUrl": "https://cloud.cerebras.ai",
+      "freeTier": false,
+      "notes": "max_tokens is sent as max_completion_tokens (FCC profile).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "cheaperinference",
+      "name": "Cheaper Inference",
+      "baseURL": "https://api.cheaperinference.com/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "gpt-5.4-mini"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "CHEAPER_INFERENCE_API_KEY",
+      "website": "https://cheaperinference.com/",
+      "signupUrl": "https://cheaperinference.com/signup",
+      "freeTier": false,
+      "notes": "Listing is filtered to streaming text models (FCC profile).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "chutes",
+      "name": "Chutes",
+      "baseURL": "https://llm.chutes.ai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "Qwen/Qwen3-32B-TEE"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "CHUTES_API_KEY",
+      "website": "https://chutes.ai/",
+      "signupUrl": "https://chutes.ai/docs/getting-started/authentication",
+      "freeTier": false,
+      "notes": "FCC lists only text-in/text-out models that advertise tool support.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "cline_pass",
+      "name": "ClinePass",
+      "baseURL": "https://api.cline.bot/api/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "cline-pass/glm-5.2"
+        },
+        {
+          "id": "cline-pass/kimi-k2.7-code"
+        },
+        {
+          "id": "cline-pass/kimi-k2.6"
+        },
+        {
+          "id": "cline-pass/deepseek-v4-pro"
+        },
+        {
+          "id": "cline-pass/deepseek-v4-flash"
+        },
+        {
+          "id": "cline-pass/mimo-v2.5"
+        },
+        {
+          "id": "cline-pass/mimo-v2.5-pro"
+        },
+        {
+          "id": "cline-pass/minimax-m3"
+        },
+        {
+          "id": "cline-pass/qwen3.7-max"
+        },
+        {
+          "id": "cline-pass/qwen3.7-plus"
+        },
+        {
+          "id": "cline-pass/kimi-k3"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "CLINE_API_KEY",
+      "website": "https://cline.bot/",
+      "signupUrl": "https://app.cline.bot",
+      "freeTier": false,
+      "notes": "ClinePass subscription key; FCC lists it from /ai/cline/recommended-models.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "cloudflare",
+      "name": "Cloudflare",
+      "baseURL": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "@cf/meta/llama-3.2-1b-instruct"
+        },
+        {
+          "id": "@cf/meta/llama-3.2-3b-instruct"
+        },
+        {
+          "id": "@cf/meta/llama-3.1-8b-instruct-fp8-fast"
+        },
+        {
+          "id": "@cf/meta/llama-3.1-8b-instruct-awq"
+        },
+        {
+          "id": "@cf/mistralai/mistral-small-3.1-24b-instruct"
+        },
+        {
+          "id": "@cf/meta/llama-3.1-70b-instruct-fp8-fast"
+        },
+        {
+          "id": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+        },
+        {
+          "id": "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b"
+        },
+        {
+          "id": "@cf/moonshotai/kimi-k2.5"
+        },
+        {
+          "id": "@cf/moonshotai/kimi-k2.6"
+        },
+        {
+          "id": "@cf/zai-org/glm-4.7-flash"
+        },
+        {
+          "id": "@cf/qwen/qwq-32b"
+        },
+        {
+          "id": "@cf/qwen/qwen2.5-coder-32b-instruct"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "CLOUDFLARE_API_TOKEN",
+      "website": "https://www.cloudflare.com/developer-platform/products/workers-ai/",
+      "signupUrl": "https://dash.cloudflare.com/profile/api-tokens",
+      "freeTier": true,
+      "notes": "Account-scoped URL — replace {account_id}; Workers AI has a free allocation and 9router lists it as free-tier. Image ids omitted.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "cohere",
+      "name": "Cohere",
+      "baseURL": "https://api.cohere.ai/compatibility/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "command-r-plus-08-2024"
+        },
+        {
+          "id": "command-r-08-2024"
+        },
+        {
+          "id": "command-a-03-2025"
+        },
+        {
+          "id": "command-a-plus-05-2026"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "COHERE_API_KEY",
+      "website": "https://cohere.com/",
+      "signupUrl": "https://dashboard.cohere.com/api-keys",
+      "freeTier": false,
+      "notes": "Compatibility layer at /compatibility/v1; several body keys are stripped (FCC profile).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "deepinfra",
+      "name": "DeepInfra",
+      "baseURL": "https://api.deepinfra.com/v1/openai",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "deepseek-ai/DeepSeek-V4-Flash"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "DEEPINFRA_API_KEY",
+      "website": "https://deepinfra.com/",
+      "signupUrl": "https://deepinfra.com/dash/api_keys",
+      "freeTier": false,
+      "notes": "FCC reads DeepInfra’s own /models/list shape (model_name / reported_type).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "baseURL": "https://api.deepseek.com",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "deepseek-v4-pro"
+        },
+        {
+          "id": "deepseek-v4-pro-max"
+        },
+        {
+          "id": "deepseek-v4-pro-none"
+        },
+        {
+          "id": "deepseek-v4.1-flash"
+        },
+        {
+          "id": "deepseek-v4-flash"
+        },
+        {
+          "id": "deepseek-v4-flash-vision-exp"
+        },
+        {
+          "id": "deepseek-chat"
+        },
+        {
+          "id": "deepseek-reasoner"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "DEEPSEEK_API_KEY",
+      "website": "https://www.deepseek.com/",
+      "signupUrl": "https://platform.deepseek.com/api_keys",
+      "freeTier": false,
+      "notes": "Cache usage is reported on this endpoint (FCC).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "experiential",
+      "name": "Experiential Labs",
+      "baseURL": "https://api.experientiallabs.ai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "union-alpha"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "EXPLABS_API_KEY",
+      "website": "https://www.experientiallabs.ai/",
+      "signupUrl": "https://platform.experientiallabs.ai/settings/api-keys",
+      "freeTier": false,
+      "notes": "Experiential Labs gateway.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "featherless",
+      "name": "Featherless AI",
+      "baseURL": "https://api.featherless.ai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "deepseek-ai/DeepSeek-V4-Pro"
+        },
+        {
+          "id": "deepseek-ai/DeepSeek-V4-Flash"
+        },
+        {
+          "id": "zai-org/GLM-5.2"
+        },
+        {
+          "id": "zai-org/GLM-5.1"
+        },
+        {
+          "id": "moonshotai/Kimi-K2.7-Code"
+        },
+        {
+          "id": "moonshotai/Kimi-K2.6"
+        },
+        {
+          "id": "moonshotai/Kimi-K2.5"
+        },
+        {
+          "id": "Qwen/Qwen3-32B"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "FEATHERLESS_API_KEY",
+      "website": "https://featherless.ai/",
+      "signupUrl": "https://featherless.ai/account/api-keys",
+      "freeTier": false,
+      "notes": "FCC asks for tool_use + available_on_current_plan rows; pagination is numbered.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "fireworks",
+      "name": "Fireworks",
+      "baseURL": "https://api.fireworks.ai/inference/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "accounts/fireworks/models/deepseek-v3p1"
+        },
+        {
+          "id": "accounts/fireworks/models/llama-v3p3-70b-instruct"
+        },
+        {
+          "id": "accounts/fireworks/models/qwen3-235b-a22b"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "FIREWORKS_API_KEY",
+      "website": "https://fireworks.ai/",
+      "signupUrl": "https://fireworks.ai/account/api-keys",
+      "freeTier": false,
+      "notes": "Embedding id omitted; model ids are account-scoped paths.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "gemini",
+      "name": "Gemini",
+      "baseURL": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "gemini-3.8-flash"
+        },
+        {
+          "id": "gemini-3.7-flash"
+        },
+        {
+          "id": "gemini-3.6-flash"
+        },
+        {
+          "id": "gemini-3.5-flash-lite"
+        },
+        {
+          "id": "gemini-3.1-pro-preview"
+        },
+        {
+          "id": "gemini-3.1-flash-lite-preview"
+        },
+        {
+          "id": "gemini-3-flash-preview"
+        },
+        {
+          "id": "gemini-2.5-pro"
+        },
+        {
+          "id": "gemini-2.5-flash"
+        },
+        {
+          "id": "gemini-2.5-flash-lite"
+        },
+        {
+          "id": "gemma-4-31b-it"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "GEMINI_API_KEY",
+      "website": "https://ai.google.dev/",
+      "signupUrl": "https://aistudio.google.com/apikey",
+      "freeTier": true,
+      "notes": "Google AI Studio key; 9router lists it as free-tier. FCC speaks the OpenAI-compatible layer at /v1beta/openai/.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "github_copilot",
+      "name": "GitHub Copilot",
+      "baseURL": "https://api.githubcopilot.com",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "gpt-5.2"
+        },
+        {
+          "id": "gpt-5.2-codex"
+        },
+        {
+          "id": "gpt-5.3-codex"
+        },
+        {
+          "id": "gpt-5.4"
+        },
+        {
+          "id": "gpt-5.4-mini"
+        },
+        {
+          "id": "claude-haiku-4.5"
+        },
+        {
+          "id": "claude-opus-4.5"
+        },
+        {
+          "id": "claude-sonnet-4.5"
+        },
+        {
+          "id": "claude-sonnet-4.6"
+        },
+        {
+          "id": "claude-opus-4.6"
+        },
+        {
+          "id": "claude-opus-4.7"
+        },
+        {
+          "id": "gemini-2.5-pro"
+        },
+        {
+          "id": "gemini-3-flash-preview"
+        },
+        {
+          "id": "gemini-3.1-pro-preview"
+        },
+        {
+          "id": "grok-code-fast-1"
+        },
+        {
+          "id": "oswe-vscode-prime"
+        },
+        {
+          "id": "goldeneye-free-auto"
+        }
+      ],
+      "authKind": "oauth",
+      "website": "https://github.com/features/copilot",
+      "signupUrl": "https://docs.github.com/en/copilot/how-tos/copilot-sdk/auth/authenticate",
+      "freeTier": false,
+      "manualOnly": true,
+      "notes": "GitHub account sign-in; the usable model set depends on the subscription (embedding ids omitted).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "glm",
+      "name": "Z.ai (Anthropic wire)",
+      "baseURL": "https://api.z.ai/api/anthropic/v1",
+      "protocol": "anthropic-messages",
+      "models": [
+        {
+          "id": "glm-5.3"
+        },
+        {
+          "id": "glm-5.3-flash"
+        },
+        {
+          "id": "glm-5.2"
+        },
+        {
+          "id": "glm-5.1"
+        },
+        {
+          "id": "glm-5-turbo"
+        },
+        {
+          "id": "glm-5"
+        },
+        {
+          "id": "glm-4.7"
+        },
+        {
+          "id": "glm-4.6v"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "ZAI_API_KEY",
+      "website": "https://z.ai",
+      "signupUrl": "https://open.bigmodel.cn/usercenter/apikeys",
+      "freeTier": false,
+      "notes": "Z.ai Anthropic-compatible route (Claude Code style); the same ZAI_API_KEY as the zai/zai_api records. Key URL as declared in the 9router glm registry.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "glm-cn",
+      "name": "Zhipu GLM (CN)",
+      "baseURL": "https://open.bigmodel.cn/api/coding/paas/v4",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "glm-5.3"
+        },
+        {
+          "id": "glm-5.3-flash"
+        },
+        {
+          "id": "glm-5.2"
+        },
+        {
+          "id": "glm-5.1"
+        },
+        {
+          "id": "glm-5-turbo"
+        },
+        {
+          "id": "glm-5"
+        },
+        {
+          "id": "glm-4.7"
+        },
+        {
+          "id": "glm-4.6v"
+        },
+        {
+          "id": "glm-4.6"
+        },
+        {
+          "id": "glm-4.5-air"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "ZHIPU_API_KEY",
+      "website": "https://open.bigmodel.cn",
+      "signupUrl": "https://open.bigmodel.cn/usercenter/apikeys",
+      "freeTier": false,
+      "notes": "Zhipu open-platform coding endpoint (mainland China), distinct from the z.ai international records.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "groq",
+      "name": "Groq",
+      "baseURL": "https://api.groq.com/openai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "llama-3.3-70b-versatile"
+        },
+        {
+          "id": "meta-llama/llama-4-maverick-17b-128e-instruct"
+        },
+        {
+          "id": "qwen/qwen3-32b"
+        },
+        {
+          "id": "openai/gpt-oss-120b"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "GROQ_API_KEY",
+      "website": "https://groq.com/",
+      "signupUrl": "https://console.groq.com/keys",
+      "freeTier": false,
+      "notes": "OpenAI-compatible endpoint; audio ids from the same registry listing are omitted (chat catalog).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "huggingface",
+      "name": "Hugging Face",
+      "baseURL": "https://router.huggingface.co/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "Qwen/Qwen3-Coder-480B-A35B-Instruct:fastest"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "HUGGINGFACE_API_KEY",
+      "website": "https://huggingface.co/",
+      "signupUrl": "https://huggingface.co/settings/tokens",
+      "freeTier": false,
+      "notes": "Inference Providers router; FCC resolves the context window from the live provider consensus.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "hyperbolic",
+      "name": "Hyperbolic AI",
+      "baseURL": "https://api.hyperbolic.xyz/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "Qwen/QwQ-32B"
+        },
+        {
+          "id": "deepseek-ai/DeepSeek-R1"
+        },
+        {
+          "id": "deepseek-ai/DeepSeek-V3"
+        },
+        {
+          "id": "meta-llama/Llama-3.3-70B-Instruct"
+        },
+        {
+          "id": "meta-llama/Llama-3.2-3B-Instruct"
+        },
+        {
+          "id": "Qwen/Qwen2.5-72B-Instruct"
+        },
+        {
+          "id": "Qwen/Qwen2.5-Coder-32B-Instruct"
+        },
+        {
+          "id": "NousResearch/Hermes-3-Llama-3.1-70B"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "HYPERBOLIC_API_KEY",
+      "website": "https://hyperbolic.xyz",
+      "signupUrl": "https://app.hyperbolic.xyz/settings",
+      "freeTier": false,
+      "notes": "OpenAI-compatible chat completions; 9router registry declares the key URL.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "kilo",
+      "name": "Kilo.ai",
+      "baseURL": "https://api.kilo.ai/api/gateway",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "kilo-auto/free",
+          "contextWindow": 256000
+        },
+        {
+          "id": "nvidia/nemotron-3-super-120b-a12b:free",
+          "contextWindow": 262144
+        },
+        {
+          "id": "nvidia/nemotron-3-ultra-550b-a55b:free",
+          "contextWindow": 1000000
+        },
+        {
+          "id": "kwaipilot/kat-coder-pro-v2.5:free",
+          "contextWindow": 256000
+        },
+        {
+          "id": "kilo-auto/frontier",
+          "contextWindow": 1000000
+        },
+        {
+          "id": "kilo-auto/balanced",
+          "contextWindow": 1000000
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "KILO_API_KEY",
+      "website": "https://kilo.ai/",
+      "signupUrl": "https://app.kilo.ai",
+      "freeTier": true,
+      "notes": "Kilo gateway free pool; the plugin’s own Kilo channel reads the same host.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "kimchi",
+      "name": "Kimchi",
+      "baseURL": "https://llm.kimchi.dev/openai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "minimax-m3"
+        },
+        {
+          "id": "kimi-k2.7"
+        },
+        {
+          "id": "kimi-k2.6"
+        },
+        {
+          "id": "kimi-k2.5"
+        },
+        {
+          "id": "nemotron-3-ultra-fp4"
+        },
+        {
+          "id": "minimax-m2.7"
+        },
+        {
+          "id": "claude-opus-4-6"
+        },
+        {
+          "id": "claude-sonnet-4-6"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "KIMCHI_API_KEY",
+      "website": "https://kimchi.dev",
+      "signupUrl": "https://app.kimchi.dev",
+      "freeTier": true,
+      "notes": "9router lists it as free-tier with oauth and apikey modes; the signup URL issues the credential. The user-agent is declared by the 9router registry.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "kimi",
+      "name": "Kimi",
+      "baseURL": "https://api.moonshot.ai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "kimi-k2.5"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "KIMI_API_KEY",
+      "website": "https://www.kimi.com/",
+      "signupUrl": "https://platform.moonshot.cn/console/api-keys",
+      "freeTier": false,
+      "notes": "Moonshot platform key; caller extra_body is rejected on this route (FCC profile).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "kimi_code",
+      "name": "Kimi Code",
+      "baseURL": "https://api.kimi.com/coding/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "kimi-k3"
+        },
+        {
+          "id": "k3"
+        },
+        {
+          "id": "kimi-for-coding"
+        },
+        {
+          "id": "kimi-for-coding-highspeed"
+        },
+        {
+          "id": "kimi-k2.7-code"
+        },
+        {
+          "id": "kimi-k2.7-code-highspeed"
+        },
+        {
+          "id": "kimi-k2.6"
+        },
+        {
+          "id": "kimi-k2.5"
+        },
+        {
+          "id": "kimi-k2.5-thinking"
+        },
+        {
+          "id": "kimi-latest"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "KIMI_CODE_API_KEY",
+      "website": "https://www.kimi.com/code",
+      "signupUrl": "https://www.kimi.com/code/console",
+      "freeTier": false,
+      "notes": "Kimi Code subscription; ids from the 9router kimi registry (same host, api.kimi.com/coding/v1).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "lightning",
+      "name": "Lightning AI",
+      "baseURL": "https://lightning.ai/api/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "lightning-ai/Qwen3.8-27B"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "LIGHTNING_API_KEY",
+      "website": "https://lightning.ai/",
+      "signupUrl": "https://lightning.ai/lightning-ai/model-apis/models",
+      "freeTier": false,
+      "notes": "Lightning AI Model APIs gateway.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "llamacpp",
+      "name": "LLaMA.cpp",
+      "baseURL": "http://localhost:8080/v1",
+      "protocol": "openai-chat",
+      "models": [],
+      "authKind": "none",
+      "website": "https://github.com/ggml-org/llama.cpp",
+      "freeTier": false,
+      "manualOnly": true,
+      "notes": "Local server; the model list is whatever the user has loaded, so the registry carries no ids.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "llm7",
+      "name": "LLM7.io",
+      "baseURL": "https://api.llm7.io/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "gpt-5.5",
+          "contextWindow": 1050000
+        },
+        {
+          "id": "claude-opus-5",
+          "contextWindow": 1000000
+        },
+        {
+          "id": "deepseek-v4-flash",
+          "contextWindow": 1000000
+        },
+        {
+          "id": "grok-4.5",
+          "contextWindow": 500000
+        },
+        {
+          "id": "kimi-k3",
+          "contextWindow": 1000000
+        },
+        {
+          "id": "default"
+        },
+        {
+          "id": "fast"
+        },
+        {
+          "id": "pro"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "LLM7_API_KEY",
+      "website": "https://llm7.io/",
+      "signupUrl": "https://dash.llm7.io/",
+      "freeTier": false,
+      "notes": "FCC also pins the default/fast/pro aliases; the listing is filtered to streaming tool models.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "lmstudio",
+      "name": "LM Studio",
+      "baseURL": "http://localhost:1234/v1",
+      "protocol": "openai-chat",
+      "models": [],
+      "authKind": "none",
+      "website": "https://lmstudio.ai/",
+      "freeTier": false,
+      "manualOnly": true,
+      "notes": "Local server; the model list is whatever the user has loaded, so the registry carries no ids.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "minimax",
+      "name": "MiniMax",
+      "baseURL": "https://api.minimax.io/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "MiniMax-M3"
+        },
+        {
+          "id": "MiniMax-M2.7"
+        },
+        {
+          "id": "MiniMax-M2.5"
+        },
+        {
+          "id": "MiniMax-M2.1"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "MINIMAX_API_KEY",
+      "website": "https://www.minimax.io/",
+      "signupUrl": "https://platform.minimax.io/user-center/basic-information/interface-key",
+      "freeTier": false,
+      "notes": "Reasoning is split out of the text stream (FCC profile); speech/image ids omitted.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "minimax-cn",
+      "name": "MiniMax (CN)",
+      "baseURL": "https://api.minimaxi.com/anthropic/v1",
+      "protocol": "anthropic-messages",
+      "models": [
+        {
+          "id": "MiniMax-M3"
+        },
+        {
+          "id": "MiniMax-M2.7"
+        },
+        {
+          "id": "MiniMax-M2.5"
+        },
+        {
+          "id": "MiniMax-M2.1"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "MINIMAX_CN_API_KEY",
+      "website": "https://www.minimaxi.com",
+      "signupUrl": "https://platform.minimaxi.com/user-center/basic-information/interface-key",
+      "freeTier": false,
+      "notes": "MiniMax mainland endpoint speaking the Anthropic Messages wire; speech ids omitted. The anthropic-beta header is declared by the 9router registry.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "mistral",
+      "name": "Mistral",
+      "baseURL": "https://api.mistral.ai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "mistral-large-latest"
+        },
+        {
+          "id": "codestral-latest"
+        },
+        {
+          "id": "mistral-medium-latest"
+        },
+        {
+          "id": "devstral-small-latest"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "MISTRAL_API_KEY",
+      "website": "https://mistral.ai/",
+      "signupUrl": "https://console.mistral.ai/",
+      "freeTier": false,
+      "notes": "La Plateforme keys; embedding id omitted.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "mistral_codestral",
+      "name": "Mistral Codestral",
+      "baseURL": "https://codestral.mistral.ai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "codestral-latest"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "CODESTRAL_API_KEY",
+      "website": "https://mistral.ai/",
+      "signupUrl": "https://console.mistral.ai/",
+      "freeTier": false,
+      "notes": "Codestral IDE endpoint, distinct from La Plateforme keys (FCC).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "morph",
+      "name": "Morph LLM",
+      "baseURL": "https://api.morphllm.com/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "morph-v3-large"
+        },
+        {
+          "id": "morph-v3-fast"
+        },
+        {
+          "id": "morph-qwen35-397b",
+          "contextWindow": 262144
+        },
+        {
+          "id": "morph-minimax27-230b",
+          "contextWindow": 200704
+        },
+        {
+          "id": "morph-qwen36-27b",
+          "contextWindow": 262144
+        },
+        {
+          "id": "morph-dsv4flash",
+          "contextWindow": 1048576
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "MORPH_API_KEY",
+      "website": "https://morphllm.com",
+      "signupUrl": "https://morphllm.com",
+      "freeTier": false,
+      "notes": "Fast apply/edit models for coding agents.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "nararoute",
+      "name": "NaraRoute",
+      "baseURL": "https://router.bynara.id/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "kimi-k3-free"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "NARAROUTE_API_KEY",
+      "website": "https://router.bynara.id/",
+      "signupUrl": "https://router.bynara.id/keys",
+      "freeTier": false,
+      "notes": "Multi-vendor gateway; reasoning is surfaced as a boolean in the listing (FCC profile).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "nebius",
+      "name": "Nebius Token Factory",
+      "baseURL": "https://api.tokenfactory.nebius.com/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "meta-llama/Llama-3.3-70B-Instruct"
+        },
+        {
+          "id": "Qwen/Qwen3-30B-A3B"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "NEBIUS_API_KEY",
+      "website": "https://tokenfactory.nebius.com/",
+      "signupUrl": "https://tokenfactory.nebius.com/project/api-keys",
+      "freeTier": false,
+      "notes": "Embedding id omitted; FCC requires architecture.modality=text->text in the listing.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "novita",
+      "name": "Novita AI",
+      "baseURL": "https://api.novita.ai/openai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "deepseek/deepseek-v4-flash-0731"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "NOVITA_API_KEY",
+      "website": "https://novita.ai/",
+      "signupUrl": "https://novita.ai/settings/key-management",
+      "freeTier": false,
+      "notes": "FCC README example id.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "nvidia_nim",
+      "name": "NVIDIA NIM",
+      "baseURL": "https://integrate.api.nvidia.com/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "minimaxai/minimax-m2.7"
+        },
+        {
+          "id": "minimaxai/minimax-m3"
+        },
+        {
+          "id": "z-ai/glm-5.2"
+        },
+        {
+          "id": "deepseek-ai/deepseek-v4-pro"
+        },
+        {
+          "id": "deepseek-ai/deepseek-v4-flash"
+        },
+        {
+          "id": "moonshotai/kimi-k2.6"
+        },
+        {
+          "id": "nvidia/nemotron-3-ultra-550b-a55b"
+        },
+        {
+          "id": "nvidia/nemotron-3-super-120b-a12b",
+          "contextWindow": 131072
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "NVIDIA_NIM_API_KEY",
+      "website": "https://build.nvidia.com/",
+      "signupUrl": "https://build.nvidia.com/settings/api-keys",
+      "freeTier": false,
+      "notes": "Free access for NVIDIA Developer Program members (prototyping and testing) per the 9router registry; FCC ships it as the default provider.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "ollama",
+      "name": "Ollama",
+      "baseURL": "http://localhost:11434/v1",
+      "protocol": "openai-chat",
+      "models": [],
+      "authKind": "none",
+      "website": "https://ollama.com/",
+      "freeTier": false,
+      "manualOnly": true,
+      "notes": "Local server; FCC normalizes the configured root to /v1, and the model list is whatever the user has pulled.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "ollama_cloud",
+      "name": "Ollama Cloud",
+      "baseURL": "https://ollama.com/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "gpt-oss:120b"
+        },
+        {
+          "id": "kimi-k2.5"
+        },
+        {
+          "id": "glm-5"
+        },
+        {
+          "id": "minimax-m2.5"
+        },
+        {
+          "id": "glm-4.7-flash"
+        },
+        {
+          "id": "qwen3.5"
+        },
+        {
+          "id": "minimax-m3"
+        },
+        {
+          "id": "deepseek-v4.1-flash:cloud"
+        },
+        {
+          "id": "qwen3-coder:480b"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "OLLAMA_API_KEY",
+      "website": "https://ollama.com/",
+      "signupUrl": "https://ollama.com/settings/keys",
+      "freeTier": false,
+      "notes": "Free tier: light usage, one cloud model at a time (9router notice). Tags are not OpenAI ids but Ollama model names.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "open_router",
+      "name": "OpenRouter",
+      "baseURL": "https://openrouter.ai/api/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "openrouter/free"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "OPENROUTER_API_KEY",
+      "website": "https://openrouter.ai/",
+      "signupUrl": "https://openrouter.ai/keys",
+      "freeTier": true,
+      "notes": "Free tier: 27+ free models, no credit card, ~200 requests/day (9router registry).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI / ChatGPT",
+      "baseURL": "https://chatgpt.com/backend-api/codex",
+      "protocol": "openai-responses",
+      "models": [
+        {
+          "id": "gpt-6-astra"
+        },
+        {
+          "id": "gpt-5.6-sol"
+        },
+        {
+          "id": "gpt-5.6-terra"
+        },
+        {
+          "id": "gpt-5.6-luna"
+        },
+        {
+          "id": "gpt-5.5"
+        },
+        {
+          "id": "gpt-5.4"
+        },
+        {
+          "id": "gpt-5.4-mini"
+        },
+        {
+          "id": "gpt-5.3-codex-spark"
+        }
+      ],
+      "authKind": "oauth",
+      "website": "https://openai.com/",
+      "signupUrl": "https://learn.chatgpt.com/docs/auth",
+      "freeTier": false,
+      "manualOnly": true,
+      "notes": "ChatGPT subscription via browser sign-in (connected account); responses wire on chatgpt.com/backend-api/codex.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "openai_api",
+      "name": "OpenAI API",
+      "baseURL": "https://api.openai.com/v1",
+      "protocol": "openai-responses",
+      "models": [
+        {
+          "id": "gpt-5.5"
+        },
+        {
+          "id": "gpt-5.4"
+        },
+        {
+          "id": "gpt-5.4-mini"
+        },
+        {
+          "id": "gpt-5.4-nano"
+        },
+        {
+          "id": "gpt-5.2"
+        },
+        {
+          "id": "gpt-5.1"
+        },
+        {
+          "id": "gpt-5"
+        },
+        {
+          "id": "gpt-5-mini"
+        },
+        {
+          "id": "gpt-5-nano"
+        },
+        {
+          "id": "gpt-4o"
+        },
+        {
+          "id": "gpt-4o-mini"
+        },
+        {
+          "id": "gpt-4-turbo"
+        },
+        {
+          "id": "gpt-4.1"
+        },
+        {
+          "id": "gpt-4.1-mini"
+        },
+        {
+          "id": "gpt-4.1-nano"
+        },
+        {
+          "id": "o3"
+        },
+        {
+          "id": "o3-mini"
+        },
+        {
+          "id": "o3-pro"
+        },
+        {
+          "id": "o4-mini"
+        },
+        {
+          "id": "o1"
+        },
+        {
+          "id": "o1-mini"
+        },
+        {
+          "id": "gpt-5.6-sol"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "website": "https://platform.openai.com/",
+      "signupUrl": "https://platform.openai.com/api-keys",
+      "freeTier": false,
+      "notes": "Platform API key; FCC drives this route over the Responses API. Non-chat ids (embeddings, speech, images) are omitted.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "opencode",
+      "name": "OpenCode Free",
+      "baseURL": "https://opencode.ai/zen/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "muse-spark-1.2-contributor-free"
+        },
+        {
+          "id": "muse-spark-1.3-contributor-free"
+        },
+        {
+          "id": "union-alpha"
+        },
+        {
+          "id": "jev-1.13-free"
+        }
+      ],
+      "authKind": "none",
+      "website": "https://opencode.ai",
+      "freeTier": true,
+      "notes": "Keyless free pool (noAuth) — the plugin’s own free lane speaks to the same /zen/v1 host and sends the same x-opencode-client header. Per-model wires differ: two models answer over /responses and union-alpha over the Anthropic wire (9router ",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "opencode_go",
+      "name": "OpenCode Go",
+      "baseURL": "https://opencode.ai/zen/go/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "deepseek-flash"
+        },
+        {
+          "id": "glm-5.3-flash"
+        },
+        {
+          "id": "glm-5.3"
+        },
+        {
+          "id": "glm-5.2"
+        },
+        {
+          "id": "glm-5.1"
+        },
+        {
+          "id": "kimi-k2.7-code"
+        },
+        {
+          "id": "kimi-k2.6"
+        },
+        {
+          "id": "kimi-k3"
+        },
+        {
+          "id": "deepseek-v4-pro"
+        },
+        {
+          "id": "deepseek-v4-flash"
+        },
+        {
+          "id": "deepseek-v4-flash-vision-exp"
+        },
+        {
+          "id": "longcat-2.0"
+        },
+        {
+          "id": "mimo-v2.5"
+        },
+        {
+          "id": "mimo-v2.5-pro"
+        },
+        {
+          "id": "minimax-m3"
+        },
+        {
+          "id": "minimax-m2.7"
+        },
+        {
+          "id": "minimax-m2.5"
+        },
+        {
+          "id": "qwen3.8-max"
+        },
+        {
+          "id": "qwen3.8-flash"
+        },
+        {
+          "id": "qwen3.7-max"
+        },
+        {
+          "id": "qwen3.7-plus"
+        },
+        {
+          "id": "qwen3.6-plus"
+        },
+        {
+          "id": "hy4-preview"
+        },
+        {
+          "id": "hy3"
+        },
+        {
+          "id": "grok-4.6"
+        },
+        {
+          "id": "gpt-5.6-luna"
+        },
+        {
+          "id": "muse-spark-1.2-contributor"
+        },
+        {
+          "id": "muse-spark-1.3-contributor"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "OPENCODE_API_KEY",
+      "website": "https://opencode.ai/go",
+      "signupUrl": "https://opencode.ai/auth",
+      "freeTier": false,
+      "notes": "OpenCode Go subscription ($5/mo per the 9router notice).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "opencode_zen",
+      "name": "OpenCode Zen",
+      "baseURL": "https://opencode.ai/zen/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "claude-fable-5"
+        },
+        {
+          "id": "claude-fable-5-1"
+        },
+        {
+          "id": "claude-opus-5"
+        },
+        {
+          "id": "claude-opus-4-8"
+        },
+        {
+          "id": "claude-opus-4-7"
+        },
+        {
+          "id": "claude-opus-4-6"
+        },
+        {
+          "id": "claude-opus-4-5"
+        },
+        {
+          "id": "claude-sonnet-5"
+        },
+        {
+          "id": "claude-sonnet-4-6"
+        },
+        {
+          "id": "claude-sonnet-4-5"
+        },
+        {
+          "id": "claude-sonnet-4"
+        },
+        {
+          "id": "claude-haiku-4-5"
+        },
+        {
+          "id": "gemini-3.6-flash"
+        },
+        {
+          "id": "gemini-3.8-flash"
+        },
+        {
+          "id": "gemini-3.7-flash"
+        },
+        {
+          "id": "gemini-3.5-flash-lite"
+        },
+        {
+          "id": "gemini-3.5-flash"
+        },
+        {
+          "id": "gemini-3.1-pro"
+        },
+        {
+          "id": "gemini-3-flash"
+        },
+        {
+          "id": "gpt-6-astra"
+        },
+        {
+          "id": "gpt-5.6-sol"
+        },
+        {
+          "id": "gpt-5.6-terra"
+        },
+        {
+          "id": "gpt-5.6-luna"
+        },
+        {
+          "id": "gpt-5.5"
+        },
+        {
+          "id": "gpt-5.5-pro"
+        },
+        {
+          "id": "gpt-5.4"
+        },
+        {
+          "id": "gpt-5.4-pro"
+        },
+        {
+          "id": "gpt-5.4-mini"
+        },
+        {
+          "id": "gpt-5.4-nano"
+        },
+        {
+          "id": "gpt-5.3-codex-spark"
+        },
+        {
+          "id": "gpt-5.3-codex"
+        },
+        {
+          "id": "gpt-5.2"
+        },
+        {
+          "id": "gpt-5.2-codex"
+        },
+        {
+          "id": "gpt-5.1"
+        },
+        {
+          "id": "gpt-5.1-codex-max"
+        },
+        {
+          "id": "gpt-5.1-codex"
+        },
+        {
+          "id": "gpt-5.1-codex-mini"
+        },
+        {
+          "id": "gpt-5"
+        },
+        {
+          "id": "gpt-5-codex"
+        },
+        {
+          "id": "gpt-5-nano"
+        },
+        {
+          "id": "grok-build-0.1"
+        },
+        {
+          "id": "grok-4.6"
+        },
+        {
+          "id": "grok-4.5"
+        },
+        {
+          "id": "muse-spark-1.3"
+        },
+        {
+          "id": "muse-spark-1.2"
+        },
+        {
+          "id": "qwen3.6-plus"
+        },
+        {
+          "id": "qwen3.5-plus"
+        },
+        {
+          "id": "deepseek-v4-pro"
+        },
+        {
+          "id": "deepseek-v4-flash"
+        },
+        {
+          "id": "deepseek-v4-flash-vision-exp"
+        },
+        {
+          "id": "glm-5.3-flash"
+        },
+        {
+          "id": "glm-5.3"
+        },
+        {
+          "id": "glm-5.2"
+        },
+        {
+          "id": "glm-5.1"
+        },
+        {
+          "id": "glm-5"
+        },
+        {
+          "id": "minimax-m3"
+        },
+        {
+          "id": "minimax-m2.7"
+        },
+        {
+          "id": "minimax-m2.5"
+        },
+        {
+          "id": "kimi-k3"
+        },
+        {
+          "id": "kimi-k2.7-code"
+        },
+        {
+          "id": "kimi-k2.6"
+        },
+        {
+          "id": "kimi-k2.5"
+        },
+        {
+          "id": "big-pickle"
+        },
+        {
+          "id": "union-alpha"
+        },
+        {
+          "id": "deepseek-v4-flash-free"
+        },
+        {
+          "id": "mimo-v2.6-flash-free"
+        },
+        {
+          "id": "mimo-v2.5-free"
+        },
+        {
+          "id": "ling-3.0-flash-fin-free"
+        },
+        {
+          "id": "nemotron-3-ultra-free"
+        },
+        {
+          "id": "nemotron-3.5-lightning-free"
+        },
+        {
+          "id": "muse-spark-1.3-contributor-free"
+        },
+        {
+          "id": "muse-spark-1.2-contributor-free"
+        },
+        {
+          "id": "jev-1.13"
+        },
+        {
+          "id": "jev-1.13-free"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "OPENCODE_API_KEY",
+      "website": "https://opencode.ai/zen",
+      "signupUrl": "https://opencode.ai/auth",
+      "freeTier": true,
+      "notes": "PAYG key with free models on the fast lane (9router notice); FCC dispatches each catalog route over chat or responses.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "opper",
+      "name": "Opper",
+      "baseURL": "https://api.opper.ai/v3/compat",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "claude-sonnet-4-6"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "OPPER_API_KEY",
+      "website": "https://opper.ai/",
+      "signupUrl": "https://platform.opper.ai/",
+      "freeTier": false,
+      "notes": "Opper gateway (v3/compat base).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "orcarouter",
+      "name": "OrcaRouter",
+      "baseURL": "https://api.orcarouter.ai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "deepseek/deepseek-v4-flash-free"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "ORCAROUTER_API_KEY",
+      "website": "https://www.orcarouter.ai/",
+      "signupUrl": "https://www.orcarouter.ai/console",
+      "freeTier": false,
+      "notes": "Multi-provider gateway with a free slug.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "perplexity",
+      "name": "Perplexity",
+      "baseURL": "https://api.perplexity.ai",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "sonar-pro"
+        },
+        {
+          "id": "sonar"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "PERPLEXITY_API_KEY",
+      "website": "https://www.perplexity.ai",
+      "signupUrl": "https://www.perplexity.ai/settings/api",
+      "freeTier": false,
+      "notes": "Search-augmented Sonar chat models.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "poolside",
+      "name": "Poolside AI",
+      "baseURL": "https://inference.poolside.ai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "poolside/laguna-s-2.1"
+        },
+        {
+          "id": "poolside/laguna-xs-2.1"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "POOLSIDE_API_KEY",
+      "website": "https://poolside.ai/",
+      "signupUrl": "https://platform.poolside.ai/",
+      "freeTier": false,
+      "notes": "Poolside platform key.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "qwencloud",
+      "name": "QwenCloud Token Plan",
+      "baseURL": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "qwen3.8-max-preview"
+        },
+        {
+          "id": "qwen3.7-max"
+        },
+        {
+          "id": "qwen3.7-plus"
+        },
+        {
+          "id": "qwen3.6-flash"
+        },
+        {
+          "id": "glm-5.2"
+        },
+        {
+          "id": "deepseek-v4-pro"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "QWENCLOUD_API_KEY",
+      "website": "https://qwencloud.com/",
+      "signupUrl": "https://home.qwencloud.com/api-keys",
+      "freeTier": false,
+      "notes": "QwenCloud Token Plan endpoint (9router alitp-intl, same base URL as FCC).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "qwencloud_coding",
+      "name": "QwenCloud Coding Plan",
+      "baseURL": "https://coding-intl.dashscope.aliyuncs.com/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "qwen3.5-plus"
+        },
+        {
+          "id": "kimi-k2.5"
+        },
+        {
+          "id": "glm-5"
+        },
+        {
+          "id": "MiniMax-M2.5"
+        },
+        {
+          "id": "qwen3-coder-next"
+        },
+        {
+          "id": "qwen3-coder-plus"
+        },
+        {
+          "id": "glm-4.7"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "QWENCLOUD_CODING_API_KEY",
+      "website": "https://qwencloud.com/",
+      "signupUrl": "https://home.qwencloud.com/api-keys",
+      "freeTier": false,
+      "notes": "QwenCloud Coding Plan endpoint (9router alicode-intl, same base URL as FCC).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "sambanova",
+      "name": "SambaNova",
+      "baseURL": "https://api.sambanova.ai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "Meta-Llama-3.3-70B-Instruct"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "SAMBANOVA_API_KEY",
+      "website": "https://sambanova.ai/",
+      "signupUrl": "https://cloud.sambanova.ai/apis",
+      "freeTier": false,
+      "notes": "FCC README example id; the 9router registry keeps this provider hidden.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "scaleway",
+      "name": "Scaleway",
+      "baseURL": "https://api.scaleway.ai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "deepseek/deepseek-v4-flash"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "SCW_SECRET_KEY",
+      "website": "https://www.scaleway.com/",
+      "signupUrl": "https://console.scaleway.com/iam/api-keys",
+      "freeTier": false,
+      "notes": "Scaleway Generative APIs; SCW secret key.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "siliconflow",
+      "name": "SiliconFlow",
+      "baseURL": "https://api.siliconflow.com/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "deepseek-ai/DeepSeek-V4-Pro"
+        },
+        {
+          "id": "deepseek-ai/DeepSeek-V4-Flash"
+        },
+        {
+          "id": "deepseek-ai/DeepSeek-V3.2"
+        },
+        {
+          "id": "deepseek-ai/DeepSeek-V3.2-Exp"
+        },
+        {
+          "id": "deepseek-ai/DeepSeek-V3.1"
+        },
+        {
+          "id": "deepseek-ai/DeepSeek-V3.1-Terminus"
+        },
+        {
+          "id": "deepseek-ai/DeepSeek-R1"
+        },
+        {
+          "id": "Qwen/Qwen3.5-397B-A17B"
+        },
+        {
+          "id": "Qwen/Qwen3.5-122B-A10B"
+        },
+        {
+          "id": "zai-org/GLM-5.1"
+        },
+        {
+          "id": "zai-org/GLM-5"
+        },
+        {
+          "id": "moonshotai/Kimi-K2.6"
+        },
+        {
+          "id": "moonshotai/Kimi-K2.5"
+        },
+        {
+          "id": "openai/gpt-oss-120b"
+        },
+        {
+          "id": "MiniMaxAI/MiniMax-M2.5"
+        },
+        {
+          "id": "inclusionAI/Ling-flash-2.0"
+        },
+        {
+          "id": "Qwen/Qwen3-32B"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "SILICONFLOW_API_KEY",
+      "website": "https://siliconflow.com/",
+      "signupUrl": "https://cloud.siliconflow.com/account/ak",
+      "freeTier": false,
+      "notes": "Chat ids from the 9router registry; listing is filtered with sub_type=chat.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "tencent",
+      "name": "Tencent Hunyuan",
+      "baseURL": "https://api.hunyuan.cloud.tencent.com/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "hunyuan-turbos-latest",
+          "contextWindow": 200000
+        },
+        {
+          "id": "hunyuan-t1-latest",
+          "contextWindow": 256000
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "HUNYUAN_API_KEY",
+      "website": "https://cloud.tencent.com/product/hunyuan",
+      "signupUrl": "https://console.cloud.tencent.com/hunyuan/api-key",
+      "freeTier": false,
+      "notes": "Tencent Hunyuan OpenAI-compatible endpoint.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "together",
+      "name": "Together AI",
+      "baseURL": "https://api.together.ai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+        },
+        {
+          "id": "deepseek-ai/DeepSeek-R1"
+        },
+        {
+          "id": "Qwen/Qwen3-235B-A22B"
+        },
+        {
+          "id": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
+        },
+        {
+          "id": "zai-org/GLM-5.2"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "TOGETHER_API_KEY",
+      "website": "https://www.together.ai/",
+      "signupUrl": "https://api.together.ai/settings/api-keys",
+      "freeTier": false,
+      "notes": "Embedding ids omitted; the FCC profile lists models at /models with context_length.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "tokenrouter",
+      "name": "TokenRouter",
+      "baseURL": "https://api.tokenrouter.com/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "anthropic/claude-haiku-4.5"
+        },
+        {
+          "id": "anthropic/claude-sonnet-4.6"
+        },
+        {
+          "id": "anthropic/claude-opus-4.8"
+        },
+        {
+          "id": "anthropic/claude-opus-4.8-fast"
+        },
+        {
+          "id": "openai/gpt-5.4"
+        },
+        {
+          "id": "openai/gpt-5.4-mini"
+        },
+        {
+          "id": "openai/gpt-5.4-pro"
+        },
+        {
+          "id": "openai/gpt-5.5"
+        },
+        {
+          "id": "openai/gpt-5.6-sol"
+        },
+        {
+          "id": "google/gemini-3.5-flash"
+        },
+        {
+          "id": "google/gemini-3.6-flash"
+        },
+        {
+          "id": "deepseek/deepseek-v4-flash"
+        },
+        {
+          "id": "deepseek/deepseek-v4-pro"
+        },
+        {
+          "id": "qwen/qwen3-coder-next"
+        },
+        {
+          "id": "qwen/qwen3.7-max"
+        },
+        {
+          "id": "qwen/qwen3.8-max"
+        },
+        {
+          "id": "moonshotai/kimi-k2.7-code"
+        },
+        {
+          "id": "moonshotai/kimi-k3-free"
+        },
+        {
+          "id": "z-ai/glm-5.3-free"
+        },
+        {
+          "id": "z-ai/glm-5.2"
+        },
+        {
+          "id": "z-ai/glm-5-turbo"
+        },
+        {
+          "id": "x-ai/grok-4.5"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "TOKENROUTER_API_KEY",
+      "website": "https://www.tokenrouter.com/",
+      "signupUrl": "https://www.tokenrouter.com/",
+      "freeTier": false,
+      "notes": "Multi-vendor gateway with free slugs.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "venice",
+      "name": "Venice AI",
+      "baseURL": "https://api.venice.ai/api/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "venice-uncensored-1-2"
+        },
+        {
+          "id": "zai-org-glm-5"
+        },
+        {
+          "id": "qwen3-235b-a22b-instruct-2507"
+        },
+        {
+          "id": "qwen3-coder-480b-a35b-instruct-turbo"
+        },
+        {
+          "id": "qwen3-vl-235b-a22b"
+        },
+        {
+          "id": "deepseek-v4-pro"
+        },
+        {
+          "id": "llama-3.3-70b"
+        },
+        {
+          "id": "hermes-3-llama-3.1-405b"
+        },
+        {
+          "id": "mistral-small-3-2-24b-instruct"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "VENICE_API_KEY",
+      "website": "https://venice.ai",
+      "signupUrl": "https://venice.ai/settings/api",
+      "freeTier": false,
+      "notes": "Private inference plus uncensored models (9router notice). Embedding and image ids omitted.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "vercel",
+      "name": "Vercel AI Gateway",
+      "baseURL": "https://ai-gateway.vercel.sh/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "openai/gpt-5.5"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "AI_GATEWAY_API_KEY",
+      "website": "https://vercel.com/ai-gateway",
+      "signupUrl": "https://vercel.com/docs/ai-gateway",
+      "freeTier": false,
+      "notes": "Vercel AI Gateway; models are vendor-namespaced.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "vertex",
+      "name": "Google Vertex AI",
+      "baseURL": "https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/endpoints/openapi",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "gemini-3.1-pro-preview"
+        },
+        {
+          "id": "gemini-3.1-flash-lite-preview"
+        },
+        {
+          "id": "gemini-3-flash-preview"
+        },
+        {
+          "id": "gemini-2.5-flash"
+        },
+        {
+          "id": "google/gemini-3.5-flash"
+        }
+      ],
+      "authKind": "adc",
+      "website": "https://cloud.google.com/vertex-ai",
+      "signupUrl": "https://cloud.google.com/docs/authentication/set-up-adc-local-dev-environment",
+      "freeTier": false,
+      "manualOnly": true,
+      "notes": "ADC (no key): VERTEX_PROJECT_ID and VERTEX_LOCATION compose the endpoint (FCC providers/vertex/endpoint.py).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "vertex-partner",
+      "name": "Vertex Partner Models",
+      "baseURL": "https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/endpoints/openapi",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "deepseek-ai/deepseek-v3.2-maas"
+        },
+        {
+          "id": "qwen/qwen3-next-80b-a3b-thinking-maas"
+        },
+        {
+          "id": "qwen/qwen3-next-80b-a3b-instruct-maas"
+        },
+        {
+          "id": "zai-org/glm-5-maas"
+        }
+      ],
+      "authKind": "adc",
+      "website": "https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/use-partner-models",
+      "signupUrl": "https://console.cloud.google.com/iam-admin/serviceaccounts",
+      "freeTier": false,
+      "manualOnly": true,
+      "notes": "Vertex MaaS partner models (9router model list); the OpenAI-compatible base is composed per project/location (FCC providers/vertex/endpoint.py).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "volcengine-ark",
+      "name": "Volcengine Ark",
+      "baseURL": "https://ark.cn-beijing.volces.com/api/coding/v3",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "Doubao-Seed-2.0-Code"
+        },
+        {
+          "id": "Doubao-Seed-2.0-pro"
+        },
+        {
+          "id": "Doubao-Seed-2.0-lite"
+        },
+        {
+          "id": "Doubao-Seed-Code"
+        },
+        {
+          "id": "DeepSeek-V4-Flash"
+        },
+        {
+          "id": "DeepSeek-V4-Pro"
+        },
+        {
+          "id": "GLM-5.1"
+        },
+        {
+          "id": "MiniMax-M2.7"
+        },
+        {
+          "id": "Kimi-K2.6"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "ARK_API_KEY",
+      "website": "https://console.volcengine.com/ark",
+      "signupUrl": "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey",
+      "freeTier": false,
+      "notes": "ByteDance Volcengine coding endpoint (CN); 9router registry declares the key URL.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "wafer",
+      "name": "Wafer",
+      "baseURL": "https://pass.wafer.ai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "DeepSeek-V4-Pro"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "WAFER_API_KEY",
+      "website": "https://www.wafer.ai/",
+      "signupUrl": "https://www.wafer.ai/pass",
+      "freeTier": false,
+      "notes": "Wafer pass endpoint.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "wandb",
+      "name": "W&B Inference",
+      "baseURL": "https://api.inference.wandb.ai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "openai/gpt-oss-20b"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "WANDB_API_KEY",
+      "website": "https://wandb.ai/site/inference/",
+      "signupUrl": "https://wandb.ai/settings",
+      "freeTier": false,
+      "notes": "W&B Serverless Inference; reasoning arrives as think tags (FCC profile).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "xai",
+      "name": "xAI (Grok)",
+      "baseURL": "https://api.x.ai/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "grok-4.6"
+        },
+        {
+          "id": "grok-4.5"
+        },
+        {
+          "id": "grok-4"
+        },
+        {
+          "id": "grok-4-fast-reasoning"
+        },
+        {
+          "id": "grok-code-fast-1"
+        },
+        {
+          "id": "grok-3"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "XAI_API_KEY",
+      "website": "https://x.ai/",
+      "signupUrl": "https://console.x.ai/team/default/api-keys",
+      "freeTier": false,
+      "notes": "Image and video ids from the same registry listing are omitted (chat catalog).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "xiaomi-tokenplan",
+      "name": "Xiaomi MiMo Token Plan",
+      "baseURL": "https://token-plan-sgp.xiaomimimo.com/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "mimo-v2.5-pro"
+        },
+        {
+          "id": "mimo-v2.5-pro-claude"
+        },
+        {
+          "id": "mimo-v2.5"
+        },
+        {
+          "id": "mimo-v2-pro"
+        },
+        {
+          "id": "mimo-v2-omni"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "XIAOMI_MIMO_API_KEY",
+      "website": "https://mimo.xiaomi.com",
+      "signupUrl": "https://mimo.xiaomi.com",
+      "freeTier": false,
+      "notes": "Token Plan subscription (keys start with tp-) and are cluster-specific; TTS ids omitted (9router notice).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "xkiro",
+      "name": "xKiro",
+      "baseURL": "https://api.xkiro.com/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "qwen/qwen3.7-flash:free"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "XKIRO_API_KEY",
+      "website": "https://xkiro.com/",
+      "signupUrl": "https://xkiro.com/dashboard/api/keys",
+      "freeTier": false,
+      "notes": "Multi-provider gateway; thinking is a capabilities.reasoning boolean in the listing (FCC profile).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "zai",
+      "name": "Z.ai Coding Plan",
+      "baseURL": "https://api.z.ai/api/coding/paas/v4",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "glm-5.3"
+        },
+        {
+          "id": "glm-5.3-flash"
+        },
+        {
+          "id": "glm-5.2"
+        },
+        {
+          "id": "glm-5.1"
+        },
+        {
+          "id": "glm-5-turbo"
+        },
+        {
+          "id": "glm-5"
+        },
+        {
+          "id": "glm-4.7"
+        },
+        {
+          "id": "glm-4.6v"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "ZAI_API_KEY",
+      "website": "https://z.ai/",
+      "signupUrl": "https://z.ai/manage-apikey/apikey-list",
+      "freeTier": false,
+      "notes": "Z.ai coding-plan endpoint; caller extra_body is rejected (FCC profile). Ids are shared across Z.ai routes per the 9router glm registry.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "zai_api",
+      "name": "Z.ai API",
+      "baseURL": "https://api.z.ai/api/paas/v4",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "glm-5.3"
+        },
+        {
+          "id": "glm-5.3-flash"
+        },
+        {
+          "id": "glm-5.2"
+        },
+        {
+          "id": "glm-5.1"
+        },
+        {
+          "id": "glm-5-turbo"
+        },
+        {
+          "id": "glm-5"
+        },
+        {
+          "id": "glm-4.7"
+        },
+        {
+          "id": "glm-4.6v"
+        },
+        {
+          "id": "glm-4.7-flash"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "ZAI_API_KEY",
+      "website": "https://z.ai/",
+      "signupUrl": "https://z.ai/manage-apikey/apikey-list",
+      "freeTier": false,
+      "notes": "Z.ai pay-as-you-go endpoint; ids are shared across Z.ai routes per the 9router glm registry.",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    },
+    {
+      "id": "zenmux",
+      "name": "ZenMux",
+      "baseURL": "https://zenmux.ai/api/v1",
+      "protocol": "openai-chat",
+      "models": [
+        {
+          "id": "deepseek/deepseek-v4-flash-free"
+        }
+      ],
+      "authKind": "apiKey",
+      "apiKeyEnv": "ZENMUX_API_KEY",
+      "website": "https://zenmux.ai/",
+      "signupUrl": "https://zenmux.ai/platform/pay-as-you-go",
+      "freeTier": false,
+      "notes": "max_tokens is sent as max_completion_tokens (FCC profile).",
+      "source": "mu-zi-lee/magpie-our-free-model (MIT) → vendor/ofm/src/providers/registry.json"
+    }
+  ],
+  "skipped": [
+    {
+      "id": "azure_openai",
+      "why": "无 baseUrl"
+    }
+  ]
+}

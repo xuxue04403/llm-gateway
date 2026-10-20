@@ -1849,4 +1849,77 @@ t('computeNoProxy：forceProxy 按父/子域剔除（只删字面量相同的条
   assert.ok(build([], ['127.0.0.1']).includes('127.0.0.1'), '回环不得被 forceProxy 剔除');
 });
 
+/* ==================== presets：供应商预设目录 ==================== */
+// 数据来源：mu-zi-lee/magpie-our-free-model（MIT）的渠道清单，归一化后随本项目分发。
+// 这里锁三件事：目录本身健康、免费档标记正确、applyPresets 的合并语义。
+
+t('presets：目录可加载，且**不含任何密钥**', () => {
+  const presets = require('../src/writers/presets');
+  const { presets: list, count } = presets.loadPresets();
+  assert.ok(count >= 70, '预设数量应 ≥70，实际 ' + count);
+  assert.ok(Array.isArray(list) && list.length === count);
+  const txt = fs.readFileSync(presets.PRESET_FILE, 'utf8');
+  for (const re of [/"sk-[A-Za-z0-9_-]{16,}"/, /ghp_[A-Za-z0-9]{20,}/, /nvapi-[A-Za-z0-9_-]{20,}/, /AIza[0-9A-Za-z_-]{30,}/]) {
+    assert.ok(!re.test(txt), '预设目录里不得出现明文密钥：' + re);
+  }
+  const ids = list.map((p) => p.id);
+  assert.strictEqual(new Set(ids).size, ids.length, '预设 id 不得重复');
+  for (const p of list) {
+    assert.ok(p.baseURL && /^https?:\/\//.test(p.baseURL), p.id + ' 的 baseURL 必须合法');
+    assert.ok(['openai-chat', 'anthropic-messages', 'openai-responses'].includes(p.protocol),
+      p.id + ' 的 protocol 必须是我们支持的三种之一，实际 ' + p.protocol);
+  }
+});
+
+t('presets：免费档清单正确，且**不含本地服务与需手工的渠道**', () => {
+  const presets = require('../src/writers/presets');
+  const free = presets.listPresets({ onlyFree: true });
+  assert.ok(free.length >= 5, '免费档应 ≥5 家，实际 ' + free.length);
+  for (const r of free) {
+    assert.strictEqual(r.manualOnly, false, r.id + ' 是需手工配置的渠道，不该算免费档');
+    // 本地服务（llamacpp/lmstudio/ollama）auth=none 但那是"本机自建"，不是免费档
+    assert.ok(!/^http:\/\/(localhost|127\.0\.0\.1)/.test(r.baseURL),
+      r.id + ' 是本地服务，不该标成免费档：' + r.baseURL);
+  }
+  const ids = free.map((r) => r.id);
+  for (const must of ['kilo', 'gemini', 'open_router']) {
+    assert.ok(ids.includes(must), '免费档应包含 ' + must + '，实际 ' + ids.join(','));
+  }
+});
+
+t('presets.applyPresets：默认 enabled=false，不改原对象，跳过重复与需手工项', () => {
+  const presets = require('../src/writers/presets');
+  const base = { port: 3091, apiKey: 'k', providers: [{ id: 'kilo', baseURL: 'https://x', enabled: true }] };
+  const snapshot = JSON.stringify(base);
+  const r = presets.applyPresets(base, ['kilo', 'gemini', 'bedrock', 'no-such-id'], {});
+  assert.strictEqual(JSON.stringify(base), snapshot, 'applyPresets 不得修改传入的 config 对象');
+  assert.deepStrictEqual(r.added.map((a) => a.id), ['gemini'],
+    '只应新增 gemini（kilo 已存在、bedrock 需手工、no-such-id 不存在）');
+  const added = r.cfg.providers.find((p) => p.id === 'gemini');
+  assert.strictEqual(added.enabled, false, '新增的家必须默认关闭（没 Key 只会白占候选位）');
+  assert.strictEqual(added.apiKey, '', '未提供 Key 时 apiKey 必须为空（绝不伪造）');
+  assert.strictEqual(added.models.length, 11, 'gemini 应带 11 个模型，实际 ' + added.models.length);
+  assert.strictEqual(r.skipped.length, 3, '三个跳过都应记录原因：' + JSON.stringify(r.skipped));
+});
+
+t('presets.applyPresets：--enable 与 Key 显式传入时才写入', () => {
+  const presets = require('../src/writers/presets');
+  const r = presets.applyPresets({ providers: [] }, ['kilo'], { keys: { kilo: 'sk-test-kilo' }, enabled: true, priority: 3 });
+  const p = r.cfg.providers[0];
+  assert.strictEqual(p.enabled, true, '显式 enabled 应生效');
+  assert.strictEqual(p.apiKey, 'sk-test-kilo', '显式 Key 应写入');
+  assert.strictEqual(p.priority, 3, 'priority 应生效');
+  assert.strictEqual(p.protocol, 'openai-chat', '协议应来自预设');
+});
+
+t('presets.presetToProvider：-free 后缀按引擎同规则归一为 as', () => {
+  const presets = require('../src/writers/presets');
+  const p = presets.presetToProvider({
+    id: 'x', baseURL: 'https://x', protocol: 'openai-chat',
+    models: [{ id: 'deepseek-v4.1-flash-free' }, { id: 'space-bunny' }],
+  }, {});
+  assert.strictEqual(p.models[0].as, 'deepseek-v4.1-flash', '带 -free 的应归一去后缀');
+  assert.strictEqual(p.models[1].as, undefined, '不带后缀的不应生成 as');
+});
+
 run();

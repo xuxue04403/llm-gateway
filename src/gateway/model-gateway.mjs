@@ -1910,10 +1910,15 @@ function outletStatus() {
 }
 
 /**
- * 上游明确说"这个 IP 被滥用"时的判据。
+ * 上游明确说"这个 **IP** 被滥用"时的判据。
  * 命中即说明**换出口才有意义**，重试同一个 IP 一定还是失败。
+ *
+ * ⚠ 判据必须**窄**。初版把「请求被拦截」也算了进来，结果和 WorkBuddy 的 11128
+ *   （displayMsg.zh = 「请求被拦截，请重新发送」）撞车 —— 那条是账户/角色问题，
+ *   换出口毫无用处，还会把 11128 的正确提示顶掉（既有用例当场红了）。
+ *   所以这里只保留**明确指向 IP/网络**的措辞。
  */
-const IP_BURNED_RE = /abusive\s+traffic|from your current network|your current network|IP\s+address|请求被拦截|too\s+many\s+requests\s+from/i;
+const IP_BURNED_RE = /abusive\s+traffic|from\s+your\s+current\s+network|current\s+network|this\s+IP\s+address/i;
 
 /**
  * 周期性复查代理是否恢复；恢复则清空运行期直连清单（切回代理）。
@@ -4348,37 +4353,97 @@ async function aggregateOpenAIStream(upstream, headBytes) {
 // `insufficient_user_quota`、`You exceeded your current quota` 等 new-api/one-api 措辞。
 const WORKBUDDY_CREDIT_RE = /insufficient credit|credit insufficient|no credit|credit exhausted|credits exhausted|out of credit|quota exceeded|quota exhaust|payment required|credit not enough|not enough credit|insufficient[_ ]?balance|insufficient[_a-z]*quota|exceeded\s+your\s+(?:current\s+)?quota|积分不足|额度不足|余额不足|积分用完|额度用尽|没有积分/i;
 const WORKBUDDY_SESSION_RE = /Offline user session not found|12153|session not found|login expired|重新登录/i;
+/**
+ * 「账户级失败」判定表（2026-10-20 改为**表驱动**）。
+ *
+ * 动机：这段原本是一串 if/return，而每一条都是某次真实事故换来的，顺序本身就是契约
+ * （例如"瞬时限流 429 必须排在欠费判定之前"，否则 sensenova 的 TPM 限流会被当成欠费冷却 1800 秒）。
+ * 散落的 if 很难看清顺序，也很难加新规则而不破坏旧顺序 —— 表形式让**顺序**和**理由**都显式化。
+ *
+ * 口径来自参照实现 mu-zi-lee/magpie-our-free-model 的 `src/route/classify.js`：
+ * 它把「错在哪（FailureKind）」和「这个账号该坐多久冷板凳（cooldown）」分成两套权威，
+ * 并用一张**有序规则表**表达，文本规则优先于状态码规则。这里只取"有序表"这个结构，
+ * 判定结果仍保持本文件原有的语义与返回码 —— **行为不变，只是变得可读、可加**。
+ *
+ * 返回值（kind）：
+ *   'rate'    瞬时限流 → 冷却账户一小段
+ *   'credit'  欠费/额度 → 长期冷却
+ *   'session' 这把 Key 失效 → 换下一把 Key
+ *   null      不是账户级问题（交给供应商级处理）
+ *
+ * @type {Array<{id:string, why:string, kind:string|null, test:(status:number, detail:string)=>boolean}>}
+ */
+const ACCOUNT_FAILURE_RULES = [
+  {
+    id: 'transient-quota-429',
+    kind: 'rate',
+    why: '429 里的配额字样多半是**瞬时限流**（TPM/RPM），不是欠费',
+    // ⚠ 必须排在 credit 之前：商汤回 `429 insufficient_quota`，实际是限流、几十秒即恢复。
+    // 判成 credit 会冷却 1800 秒，两把 Key 轮流被锁 → 整家静默失能。
+    test: (status, detail) => status === 429 && TRANSIENT_QUOTA_429_RE.test(detail),
+  },
+  {
+    id: 'client-fingerprint',
+    kind: null,
+    why: '客户端指纹类拒绝**不是账户的问题**（换 Key 一点用都没有）',
+    test: (_status, detail) => CLIENT_FINGERPRINT_RE.test(detail),
+  },
+  {
+    id: 'payment-required',
+    kind: 'credit',
+    why: 'HTTP 402 Payment Required',
+    test: (status) => status === 402,
+  },
+  {
+    id: 'credit-wording',
+    kind: 'credit',
+    why: '正文出现余额/欠费/额度字样',
+    test: (_status, detail) => WORKBUDDY_CREDIT_RE.test(detail),
+  },
+  {
+    id: 'session-wording',
+    kind: 'session',
+    why: '正文是会话过期/需重新登录',
+    test: (_status, detail) => WORKBUDDY_SESSION_RE.test(detail),
+  },
+  {
+    id: 'bare-401-403',
+    kind: 'session',
+    why: '裸 401/403 = 这把 Key 未授权/被禁用 → 换下一把（多 Key 轮换的前提）',
+    // 实测 nvidia 某把 Key 回 `403 {"detail":"Authorization failed"}`，旧实现当供应商级 403
+    // → 整家熔断 30 分钟，四把 Key 全部连坐。例外：内容/敏感词拦截换 Key 无用，不在此列。
+    test: (status, detail) => (status === 401 || status === 403) && !CONTENT_BLOCK_RE.test(detail),
+  },
+  {
+    id: 'rate-429',
+    kind: 'rate',
+    why: '其余 429 按限流处理',
+    test: (status) => status === 429,
+  },
+];
+
+/**
+ * 判定一次上游失败是否属于**账户级**（该换 Key 而不是换供应商）。
+ * @param {number} status 上游 HTTP 状态
+ * @param {string} detail 上游错误正文（已读并截断）
+ * @returns {'rate'|'credit'|'session'|null}
+ */
 function classifyAccountFailure(status, detail) {
-  // ⚠⚠ 2026-10-14：**位置必须在最前面**，而且必须在 WORKBUDDY_CREDIT_RE 之前。
-  //
-  // 实测事故（本机 sensenova 连续 5 天不可用，最后一次成功停在 10-09 09:55）：
-  // 商汤对 **RPM/TPM 限流**回
-  //   `429 {"error":{"message":"inference exceeds tpm/rpm limit","type":"rate_limit_error",
-  //             "code":"insufficient_quota"}}`
-  // `insufficient_quota` 命中 WORKBUDDY_CREDIT_RE 的 `insufficient[_a-z]*quota`
-  // → 被判成 **credit（欠费）→ 冷却 1800 秒**；而它其实是**瞬时限流**，几十秒即恢复。
-  // 两把 Key 轮流被锁 30 分钟 → 整家静默失能 → 网关每条请求都只能跳过它。
-  //
-  // 放最后是没用的：credit 那条分支在它之前 return 了（这是我第一版的错，已改到最前）。
-  // 真正的欠费 429（余额为 0）正文是 `credit insufficient balance: balance=0`，
-  // 含 balance/credit 而**不含**速率字样，仍然按长期状态处理，语义不变。
-  if (status === 429 && TRANSIENT_QUOTA_429_RE.test(String(detail || ''))) return 'rate';
-  // 客户端指纹类拒绝**不是账户的问题** → 不能冷却账户（换 Key 一点用都没有），
-  // 交给上层按"熔断该供应商"处理（见 failover 里的 CLIENT_FINGERPRINT_RE 分支）。
-  // 否则会白白把用户所有可用的 Key 逐把冷却掉，还继续往上打 —— 最坏的画像行为。
-  if (CLIENT_FINGERPRINT_RE.test(String(detail || ''))) return null;
-  if (status === 402) return 'credit';
-  if (WORKBUDDY_CREDIT_RE.test(detail)) return 'credit';
-  if (WORKBUDDY_SESSION_RE.test(detail)) return 'session';
-  // 2026-09-18（用户要求：**每把 Key 都要轮换，只有全部 Key 都不可用才换下一家**）：
-  // 「裸 401/403」= 这把 Key 未授权/被禁用（实测 nvidia 某把 Key：
-  //   `403 {"status":403,"title":"Forbidden","detail":"Authorization failed"}`）→ 属**账户级**失败：
-  // 标记该 Key（session 冷却）并换下一把；只有所有 Key 都失败才交回上层（下一家供应商）。
-  // 旧实现只认 402/429/特定文案，于是这种 403 被当成"供应商级 403" → **整家熔断 30 分钟**，
-  // 用户特意配的多把 Key 被连坐（实测 nvidia 4 把 Key 全废）。
-  // 例外：内容/敏感词拦截（换 Key 无用，属请求本身的问题）不在此列。
-  if ((status === 401 || status === 403) && !CONTENT_BLOCK_RE.test(String(detail || ''))) return 'session';
-  if (status === 429) return 'rate';
+  const d = String(detail || '');
+  for (const rule of ACCOUNT_FAILURE_RULES) {
+    let hit = false;
+    try { hit = rule.test(status, d); } catch (_) { hit = false; }   // 规则异常绝不影响分类主流程
+    if (hit) return rule.kind;
+  }
+  return null;
+}
+
+/** 命中的账户级判定规则（日志/诊断用；未命中返回 null）。 */
+function accountFailureRule(status, detail) {
+  const d = String(detail || '');
+  for (const rule of ACCOUNT_FAILURE_RULES) {
+    try { if (rule.test(status, d)) return rule; } catch (_) { /* 忽略 */ }
+  }
   return null;
 }
 
@@ -10163,6 +10228,21 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
           + '本程序运行在 Node 上，无法伪装 TLS/HTTP 客户端指纹，这是已知上限。');
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
         breakerRecordFail(provider.id, 403, 0, false, bModel);
+        return false;
+      }
+      // 「上游说本机 **出口 IP** 被标记」（2026-10-20）—— 必须与直通路径同步判定。
+      //
+      // ⚠ 这是第 9 处"同一判定两处实现"：只在 forward() 里加是**无效的** ——
+      //   Anthropic 客户端（Claude Code / Desktop）打声明了 openai-chat 的家走的是**这条**翻译路径，
+      //   实测日志里只出现 `upstream opencode HTTP 403`，轮换一次都没触发。
+      // 处置：换出口（换 IP），不熔断该家、不冷却账户 —— 问题在出口，不在账号。
+      if (IP_BURNED_RE.test(String(lastDetail || ''))) {
+        const rotated = rotateOutlet(provider, String(lastDetail || '').slice(0, 80));
+        log(`upstream ${provider.id} HTTP ${upstream.status} 上游判定**本机出口 IP 被标记**`
+          + `（abusive traffic / current network）`
+          + (rotated ? ' → 已轮换出口，下一次请求会从新 IP 出去' : ' → 但只配了一个出口，无可轮换（见配置 proxy.outlets）')
+          + '；继续 failover（不熔断该家、不冷却账户——问题在出口，不在账号）');
+        breakerReleaseSlot(provider.id, bModel);
         return false;
       }
       // ⚠⚠ 2026-10-10：WorkBuddy 软性渠道拦截 —— **本路径（矩阵/翻译）必须与直通路径同步**。
