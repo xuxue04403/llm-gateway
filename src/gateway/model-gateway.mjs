@@ -5090,7 +5090,15 @@ const dsmlReportedAt = new Map();
 /** 工具指纹同样限频 */
 const toolReportedAt = new Map();
 
-/** 记录本次请求向上游声明的工具（数量 + 名字），便于分辨"网关有没有把 tools 传下去" */
+/**
+ * 记录本次请求向上游声明的工具（数量 + 名字），便于分辨"网关有没有把 tools 传下去"。
+ *
+ * 2026-10-20：工具数动辄几百，只打前 12 个名字没法判断**来源**。改成：
+ *   · 前 12 个名字（保留原有可读性）
+ *   · **按前缀分组计数** —— `mcp__<server>__*` 归到 `mcp__<server>` 一组，
+ *     内置工具各自成组。一眼就能看出这几百个工具是客户端自带的内置工具，
+ *     还是某个 MCP 服务器贡献的 —— 这正是"配置残留 vs 客户端自带"的分水岭。
+ */
 function noteToolFingerprint(providerId, body) {
   try {
     const tools = body && Array.isArray(body.tools) ? body.tools : null;
@@ -5098,9 +5106,24 @@ function noteToolFingerprint(providerId, body) {
     const now = Date.now();
     if (now - (toolReportedAt.get(providerId) || 0) < 30000) return;
     toolReportedAt.set(providerId, now);
-    const names = tools.slice(0, 12).map((t) => (t && (t.name || (t.function && t.function.name))) || '?');
+    const nameOf = (t) => (t && (t.name || (t.function && t.function.name))) || '?';
+    const names = tools.slice(0, 12).map(nameOf);
+    // 按前缀分组：mcp__srv__toolx → mcp__srv；其它 → 各自成组（内置工具）
+    const groups = new Map();
+    for (const t of tools) {
+      const n = nameOf(t);
+      const m = /^(mcp__[^_]+(?:__)?)/i.exec(n);
+      const key = m ? m[1].replace(/__$/, '') : n;
+      groups.set(key, (groups.get(key) || 0) + 1);
+    }
+    const top = [...groups.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([k, v]) => `${k}×${v}`)
+      .join(', ');
     log(`[tools] ${providerId}: 向上游声明 ${tools.length} 个工具`
-      + `（${names.join(', ')}${tools.length > 12 ? ' …' : ''}）`);
+      + `（${names.join(', ')}${tools.length > 12 ? ' …' : ''}）`
+      + `｜分组：${top}${groups.size > 10 ? ` …共 ${groups.size} 组` : ''}`);
   } catch (_) { /* 观测失败绝不影响转发 */ }
 }
 
