@@ -1774,6 +1774,147 @@ async function switchHostToDirect(provider) {
   return true;
 }
 
+/* ---------------- 出口轮换（2026-10-20）----------------
+ * 现场动机：`opencode` 免费车道今天 **0 成功 / 6 失败**，上游明确说
+ *
+ *   "free models aren't available from your current network because we've detected
+ *    abusive traffic from this IP address... turn it off and try again"
+ *
+ * 也就是说：**免费车道是按出口 IP 判的**，一个 IP 被标记，整条车道归零。
+ * 而 llm-gateway 原来只有一个静态 `proxy.url`，没有轮换 —— IP 一废就无解，
+ * 只能等它冷却，或者手动改配置重启。
+ *
+ * 参照实现 mu-zi-lee/magpie-our-free-model 的 `src/egress.js` 做了「一个可切换出口」，
+ * 并且会在健康检查遇到 429 时把节点判死、踢出轮换。这里取它的**核心思想**，
+ * 但刻意不引入它那套 mihomo 子进程 + 订阅解析（那属于代理软件本身的能力，
+ * 网关只该管"用哪个已存在的出口"）：
+ *
+ *   · 配置 `proxy.outlets` 给一组已存在的出口（http/https/socks5 均可，Node 支持 http(s)）
+ *   · 失败时**先轮换出口**（换一个 IP），换不动了才退回原来的"切直连"（规则 1）
+ *   · 被打掉的出口**冷却**一段时间（默认 10 分钟），期间不再选它
+ *   · 全部因过被冷却 → 清空冷却重新来（宁可重试，也不要永久卡死）
+ *
+ * ⚠ 前提：本进程必须由宿主注入 `NODE_USE_ENV_PROXY=1`（Node 才认 env 代理）。
+ *   该值在进程启动时读入，运行期改不了 —— 所以这里只校验并告警，不去伪造。
+ */
+const DEFAULT_OUTLET_COOLDOWN_MS = 10 * 60_000;
+/** 出口列表（归一化后的 URL 字符串）。长度 ≤1 表示不做轮换。 */
+let outletList = [];
+/** 当前出口下标。 */
+let outletCursor = 0;
+/** 出口冷却表：url → 解冻时间戳。 */
+const outletCooldown = new Map();
+/** 出口冷却时长（可由 proxy.rotateCooldownMs 覆盖）。 */
+let outletCooldownMs = DEFAULT_OUTLET_COOLDOWN_MS;
+
+/** 把 outlets 配置归一化成字符串列表（容忍 `{id,url}` 对象形态与空值）。 */
+function normalizeOutlets(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  const out = [];
+  for (const item of list) {
+    const url = String((item && typeof item === 'object' ? item.url : item) || '').trim();
+    if (url && !out.includes(url)) out.push(url);
+  }
+  return out;
+}
+
+/**
+ * 启动时由配置初始化出口列表；并把当前出口写进 env。
+ *
+ * ⚠ 配置里**既没有 `outlets` 也没有 `url`** 时，本函数**完全不碰 env**：
+ *   那种情况下代理是宿主（gateway-manager）注入的，网关不该去清掉它。
+ *   初版漏了这条，导致"没配 outlets 的用户"一启动就丢了 `HTTPS_PROXY`
+ *   （既有测试 `/health 应暴露代理地址` 当场就红了）。
+ *
+ * @returns {{count:number, active:string, envProxy:boolean, managed:boolean}}
+ */
+function initOutlets(proxyCfg, envProxyOn) {
+  const explicit = normalizeOutlets(proxyCfg && proxyCfg.outlets);
+  const list = explicit.length
+    ? explicit.slice()
+    : (proxyCfg && proxyCfg.url ? [String(proxyCfg.url)] : []);
+  const cd = Number(proxyCfg && proxyCfg.rotateCooldownMs);
+  outletCooldownMs = (Number.isFinite(cd) && cd > 0) ? cd : DEFAULT_OUTLET_COOLDOWN_MS;
+  outletList = list;
+  outletCursor = 0;
+  outletCooldown.clear();
+  const managed = list.length > 0;
+  if (managed) syncOutletEnv();
+  return { count: outletList.length, active: activeOutletUrl(), envProxy: !!envProxyOn, managed };
+}
+
+/** 当前生效的出口 URL（空串 = 直连）。 */
+function activeOutletUrl() {
+  return outletList.length ? (outletList[outletCursor] || '') : '';
+}
+
+/** 把"当前出口"写进 env。**每次都从 outletList 重建**，避免残留。 */
+function syncOutletEnv() {
+  const url = activeOutletUrl();
+  try {
+    if (url) {
+      process.env.HTTPS_PROXY = url;
+      process.env.HTTP_PROXY = url;
+      process.env.https_proxy = url;
+      process.env.http_proxy = url;
+    } else {
+      for (const k of ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy']) delete process.env[k];
+    }
+  } catch (_) { /* 忽略 */ }
+}
+
+/**
+ * 轮换到下一个可用出口（本次失败的那个进入冷却）。
+ *
+ * @param {object} provider 当前失败的家（只用于日志）
+ * @param {string} reason   失败原因摘要
+ * @returns {boolean} true = 真的换了（调用方可以据此重试一次）
+ */
+function rotateOutlet(provider, reason) {
+  if (outletList.length < 2) return false;   // 单出口无可轮换
+  const now = Date.now();
+  const failed = outletList[outletCursor];
+  if (failed) outletCooldown.set(failed, now + outletCooldownMs);
+  // 往后找第一个未冷却的
+  let next = -1;
+  for (let step = 1; step <= outletList.length; step++) {
+    const i = (outletCursor + step) % outletList.length;
+    const until = outletCooldown.get(outletList[i]) || 0;
+    if (until <= now) { next = i; break; }
+  }
+  if (next < 0) {
+    // 全部在冷却 → 清空并顺延一个（宁可重试，也不要永久卡死）
+    outletCooldown.clear();
+    next = (outletCursor + 1) % outletList.length;
+    log(`[egress] 全部 ${outletList.length} 个出口都在冷却中 → 清空冷却重新轮换`);
+  }
+  outletCursor = next;
+  syncOutletEnv();
+  const short = (u) => String(u).replace(/^https?:\/\//, '');
+  log(`[egress] ${provider && provider.id ? provider.id + ' ' : ''}出口失败（${String(reason || '').slice(0, 60)}）`
+    + ` → 轮换：${short(failed) || '(直连)'}（冷却 ${Math.round(outletCooldownMs / 60_000)} 分钟）`
+    + ` → 现在用 ${short(activeOutletUrl()) || '(直连)'}`);
+  return true;
+}
+
+/** /health 与日志用的出口状态快照。 */
+function outletStatus() {
+  const now = Date.now();
+  return {
+    count: outletList.length,
+    active: activeOutletUrl() || null,
+    cooling: outletList
+      .filter((u) => (outletCooldown.get(u) || 0) > now)
+      .map((u) => ({ url: u, remainMs: (outletCooldown.get(u) || 0) - now })),
+  };
+}
+
+/**
+ * 上游明确说"这个 IP 被滥用"时的判据。
+ * 命中即说明**换出口才有意义**，重试同一个 IP 一定还是失败。
+ */
+const IP_BURNED_RE = /abusive\s+traffic|from your current network|your current network|IP\s+address|请求被拦截|too\s+many\s+requests\s+from/i;
+
 /**
  * 周期性复查代理是否恢复；恢复则清空运行期直连清单（切回代理）。
  * 没有"切回"会怎样：clash 重启后所有家仍然直连 —— 被墙的上游会**全部失败**，
@@ -6564,7 +6705,13 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     //（那一次就会走直连；否则重试还是撞同一个坏代理，白白多等一轮）。
     // 自己的超时（abort）不触发切换：那类是"这家**对这个模型**慢"，不是代理的问题。
     if (!describeAbortIfOurs(e, { signal: controller.signal, timeoutMs, elapsedMs: elapsed })) {
-      try { await switchHostToDirect(provider); } catch (_) { /* 切换绝不连累转发 */ }
+      // 出口轮换**优先于**切直连：直连用的往往正是刚被上游标记的那个出口 IP，
+      // 换一个出口比切直连更有希望（见 rotateOutlet 上方注释）。
+      let rotated = false;
+      try { rotated = rotateOutlet(provider, causeText); } catch (_) { /* 轮换绝不连累转发 */ }
+      if (!rotated) {
+        try { await switchHostToDirect(provider); } catch (_) { /* 切换绝不连累转发 */ }
+      }
     }
     if (isTransientNetError(e) && elapsed < NET_RETRY_MAX_ELAPSED_MS) {
       log(`upstream ${provider.id} 网络错误（${causeText}，${elapsed}ms）→ 原地重试一次`);
@@ -6763,6 +6910,26 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       //   ③ User-Agent 必须是 `opencode/<≥1.18.0>`（太旧 → 426）
       //   ④ body 必须 stream:true，且 tools 里同时有 bash 与 read
       // 所以这里给出**可执行的修复方向**，而不是让用户去猜是不是被封了。
+      // 「上游说这个 **IP** 被标记了」（2026-10-20 实测，opencode 免费档）
+      //
+      // 原文：`free models aren't available from your current network because we've detected
+      //       abusive traffic from this IP address... If you're on a VPN or proxy, turn it off`
+      // 它**不是**"这家坏了"，也不是"你的请求有问题" —— 是**我们的出口 IP 被标记**。
+      // 所以处置必须是「**换出口**」，而不是长熔断整家（那会让这家在 IP 恢复前一直不可用），
+      // 也不是换账户（同一个 IP，换账户毫无意义）。
+      //
+      // ⚠ 必须在 FreeTierError 分支**之前**判定：两句话都出现在免费车道的 403 里，
+      //   而只有这一句指向"换出口才有用"。
+      if (IP_BURNED_RE.test(String(detail || ''))) {
+        const rotated = rotateOutlet(provider, String(detail || '').slice(0, 80));
+        log(`upstream ${provider.id} HTTP ${upstream.status} 上游判定**本机出口 IP 被标记**`
+          + `（abusive traffic / current network）`
+          + (rotated ? ' → 已轮换出口，下一次请求会从新 IP 出去' : ' → 但只配了一个出口，无可轮换（见配置 proxy.outlets）')
+          + '；继续 failover（不熔断该家、不冷却账户——问题在出口，不在账号）');
+        if (opts.failureSink) opts.failureSink.modelScopeOnly = true;
+        breakerReleaseSlot(provider.id, bModel);
+        return rawMode ? { retryable: upstream.status } : false;
+      }
       if (/FreeTierError/i.test(String(detail || ''))) {
         log(`upstream ${provider.id} HTTP ${upstream.status} FreeTierError —— 这条免费车道的四个条件需全部满足：`
           + `① 端点用 /zen/v1/chat/completions（不要 /messages）；`
@@ -9868,9 +10035,14 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       clearTimeout(timer);
       const causeText = describeFetchError(e);
       const elapsed = Date.now() - startedAt;
-      // 规则 1：与直通路径同一处理（详见 switchHostToDirect 的注释）
+      // 规则 1：与直通路径同一处理（详见 switchHostToDirect 的注释）。
+      // 出口轮换同样**优先于**切直连（理由见 rotateOutlet 上方注释）。
       if (!describeAbortIfOurs(e, { signal: controller.signal, timeoutMs: effectiveTimeoutMs(provider, scopeModel, opts), elapsedMs: elapsed })) {
-        try { await switchHostToDirect(provider); } catch (_) { /* 切换绝不连累转发 */ }
+        let rotated = false;
+        try { rotated = rotateOutlet(provider, causeText); } catch (_) { /* 轮换绝不连累转发 */ }
+        if (!rotated) {
+          try { await switchHostToDirect(provider); } catch (_) { /* 切换绝不连累转发 */ }
+        }
       }
       if (isTransientNetError(e) && elapsed < NET_RETRY_MAX_ELAPSED_MS) {
         log(`upstream ${provider.id} 网络错误（${causeText}，${elapsed}ms）→ 原地重试一次`);
@@ -11138,6 +11310,17 @@ function startServer(cfg) {
     {
       const st = proxyStatus();
       log(`proxy: ${st.url ? '走 ' + st.url + (st.envProxy ? '（NODE_USE_ENV_PROXY=1）' : '') : '直连（未注入代理）'}；NO_PROXY=${st.noProxy || '(空)'}`);
+      // 出口轮换（2026-10-20）：见 rotateOutlet 上方注释
+      const info = initOutlets(cfg.proxy, st.envProxy);
+      if (info.count > 1) {
+        if (!info.envProxy) {
+          log(`[egress] ⚠ 配了 ${info.count} 个出口，但本进程没有 NODE_USE_ENV_PROXY=1`
+            + ' → Node 不会使用 env 代理，轮换不会生效（需要宿主注入该变量）');
+        } else {
+          log(`[egress] 出口轮换已启用：${info.count} 个出口，当前 ${info.active}，`
+            + `失败冷却 ${Math.round(outletCooldownMs / 60_000)} 分钟`);
+        }
+      }
     }
     console.log(`[gateway] listening on http://127.0.0.1:${cfg.port}`);
   });
@@ -11246,7 +11429,8 @@ async function routeRequest(cfg, req, res) {
       // 一眼看出"哪个账户在冷却、为什么"。无账户池时该字段为空数组，不影响旧客户端解析。
       // 代理可见性（v1.8.2）：把"是否走代理 / 哪些域名直连"也放进来——2026-09-16 事故里
       // 上游 ECONNREFUSED 的真凶是 clash 端口没在监听，而 /health 当时只有 accounts。
-      json(res, 200, { ok: true, accounts: accountPoolSnapshot(cfg), proxy: proxyStatus() });
+      // egress（2026-10-20）：多出口轮换的状态（当前用哪个、哪些在冷却）。
+      json(res, 200, { ok: true, accounts: accountPoolSnapshot(cfg), proxy: proxyStatus(), egress: outletStatus() });
       return;
     }
 

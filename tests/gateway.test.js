@@ -6464,6 +6464,67 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up); }
   });
 
+  t('网关（2026-10-20）：多出口 proxy.outlets —— 出口失败时轮换到下一个（出口 IP 被标记时的自救）', async () => {
+    // 动机：opencode 免费车道今天 0 成功 / 6 失败，上游明确说
+    //   "free models aren't available from your current network because we've detected
+    //    abusive traffic from this IP address"
+    // —— 免费档是**按出口 IP** 判的，一个 IP 被标记整条车道归零。
+    // 旧实现只有一个静态 proxy.url，没有轮换，IP 一废就无解。
+    //
+    // 这条用例用两个**必死**的出口（127.0.0.1:1 / :2），验证：
+    //   ① /health 暴露 egress（count / active）
+    //   ② 出口连不上时真的轮换，日志点名新出口
+    // ⚠ 上游不能用 127.0.0.1：**Node 的 env 代理会跳过回环地址**，那样根本走不到代理，
+    //   也就测不出轮换（初版这么写，请求直接 200 直连成功）。改用 RFC 5737 的
+    //   TEST-NET-1 不可路由地址，代理才会真的被应用。
+    const p = {
+      id: 'egress', baseURL: 'http://192.0.2.1:9/v1', apiKey: 'sk-egresstest0000000000',
+      models: ['test-model'], priority: 1, enabled: true, timeoutMs: 5000,
+    };
+    const gw = await startGatewayWith([p], 'egress', { NODE_USE_ENV_PROXY: '1' }, {
+      proxy: {
+        enabled: true,
+        outlets: ['http://127.0.0.1:1', 'http://127.0.0.1:2'],
+        noProxy: [],
+        // 冷却设短一点，避免影响同一进程内后续断言
+        rotateCooldownMs: 2000,
+      },
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const h = await call({ port: gw.port, method: 'GET', p: '/health' });
+      const hj = JSON.parse(h.text);
+      assert.ok(hj.egress, '/health 应暴露 egress 状态');
+      assert.strictEqual(hj.egress.count, 2, '应报告 2 个出口，实际 ' + hj.egress.count);
+
+      // 出口必死 → 请求会失败，但过程中必须轮换
+      const r = await call({ port: gw.port });
+      assert.ok(r.status >= 400, '两个出口都是死的，请求应失败，实际 ' + r.status);
+
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/出口轮换已启用/.test(logText), '启动时应声明轮换已启用：' + logText.slice(-600));
+      assert.ok(/\[egress\].*轮换/.test(logText),
+        '出口失败时日志必须写明轮换（否则用户只看到 ECONNREFUSED，不知道有没有换出口）：' + logText.slice(-800));
+      assert.ok(/127\.0\.0\.1:2/.test(logText), '轮换目标应指向第二个出口：' + logText.slice(-800));
+    } finally { killGw(gw); }
+  });
+
+  t('网关（2026-10-20）：未配置 outlets 时**不得**改动宿主注入的代理 env', async () => {
+    // 初版 initOutlets 无条件 syncOutletEnv()，在"没配 outlets 也没配 url"时把
+    // 宿主注入的 HTTPS_PROXY **删掉**，等于把代理静默关掉（既有用例 `/health 应暴露代理地址` 当场红了）。
+    const up = await startFakeUpstream({ status: 200 });
+    const p = providerOf('noproxycfg', up, { priority: 1 });
+    const gw = await startGatewayWith([p], 'egress-keep', { NODE_USE_ENV_PROXY: '1', HTTPS_PROXY: 'http://127.0.0.1:7890' }, {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const h = await call({ port: gw.port, method: 'GET', p: '/health' });
+      const hj = JSON.parse(h.text);
+      assert.strictEqual(hj.proxy.url, 'http://127.0.0.1:7890',
+        '未配置 outlets 时，宿主注入的代理必须原样保留，实际 ' + JSON.stringify(hj.proxy));
+      assert.strictEqual(hj.egress.count, 0, '未配置出口时 count 应为 0，实际 ' + hj.egress.count);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
   t('网关：请求体过大时会 failover 到下一家（不是整轮失败）', async () => {
     // 第一家（优先级高）配了上限 → 会被跳过；第二家**未配置**（默认不检查）→ 应被正常调用。
     //
