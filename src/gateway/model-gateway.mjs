@@ -3169,6 +3169,71 @@ async function refreshWorkBuddyToken(provider, acct, cred) {
 const workbuddyCredCache = new Map();      // key → { cred, ts }
 const workbuddyInflight = new Map();       // key → Promise（单飞：并发请求共享一次刷新）
 
+/**
+ * 作废某家 WorkBuddy 的**全部**凭据缓存（下次解析会重新读桌面 auth 文件）。
+ *
+ * 为什么需要它（2026-10-20 实测事故，用户报"workbuddy 的 api 调用失败"）：
+ *
+ *   09:48–09:51 连续 6 次 `HTTP 400 {"code":11128,"msg":"Illegal API invocation from an
+ *   unapproved channel"}`，而 09:55 之后**同样的请求全部成功**。两者之间唯一的变化是
+ *   **网关进程重启了一次**。重启能"修好"的东西只有一样：内存里的凭据缓存。
+ *
+ * 也就是说：11128 在这类情形下**不是**渠道风控，而是**手里那份 accessToken 已经不认了**
+ * （桌面 App 升级到 5.8.3 后凭据轮换/换发，而网关缓存里还是旧的，且它的 `expiresAtMs`
+ * 还没到 → 不会触发刷新 → 一直拿旧 token 重发 → 一直 11128）。
+ *
+ * 旧实现对 11128 的处置是"≈2% 随机风控，换下一发就行"，于是**永远在重发同一份旧 token**。
+ * 现在改为：收到 11128 就作废缓存，让下一次尝试重新解析凭据 —— 这才是"重启就好了"
+ * 那个现象的正确自动化。
+ */
+function invalidateWorkBuddyCredential(providerId) {
+  const prefix = String(providerId) + '#';
+  let dropped = 0;
+  for (const k of [...workbuddyCredCache.keys()]) {
+    if (String(k).startsWith(prefix)) { workbuddyCredCache.delete(k); dropped++; }
+  }
+  for (const k of [...workbuddyInflight.keys()]) {
+    if (String(k).startsWith(prefix)) workbuddyInflight.delete(k);
+  }
+  return dropped;
+}
+
+/**
+ * WorkBuddy 会话渠道三头（照抄参照实现 corrinehu/dsh-workbuddy-connect 的
+ * `conversationHeaders()`，issue #139）。
+ *
+ * 自 2026-10-16 起，国际版 `www.workbuddy.ai` 对**缺全部三个 `X-Conversation-*` 头**的
+ * `/v2/chat/completions` 回 `400 / code 11128 / msg "conversation id missing"`，
+ * 用户看到的 `displayMsg.zh` 是「请求被拦截，请重新发送」—— 与渠道风控文案**完全相同**，
+ * 因此极易误判成"随机风控"（本网关此前就是这么判的）。
+ *
+ * 三个值都是 v4 UUID，**每次请求新铸一组**即可：参照实现实测上游不按该 id 存历史，
+ * 两次调用共享同一组也没有任何收益。
+ *
+ * ⚠ 国内版 `copilot.tencent.com` 实测**不要求**这三头（带与不带都 200），
+ *   所以这是兼容性防护，不是国内链路的必要条件。
+ */
+function workbuddyConversationHeaders() {
+  return {
+    'X-Conversation-ID': crypto.randomUUID(),
+    'X-Conversation-Request-ID': crypto.randomUUID(),
+    'X-Conversation-Message-ID': crypto.randomUUID(),
+  };
+}
+
+/**
+ * WorkBuddy 只认 `system`，不认 OpenAI 新式的 `developer` 角色。
+ *
+ * 参照实现 `prepareChatBody` 把这条标为 "load-bearing"：pi-ai 把系统提示发成
+ * `role: "developer"`，上游直接回 `400 code 11128
+ * ("Illegal API invocation from an unapproved channel")` —— **同一个错误码的第三种含义**
+ *（另两种：会话三头缺失、token 已不认）。三种含义共用一句话术，这正是 11128 长期被误判的原因。
+ *
+ * ⚠ 本网关**不需要**为此单独实现：`translateBody`（见其 "role 兼容" 一节）早已把
+ * `developer` 合并成 `system`，且直通路径与翻译路径都经过它。
+ * 这里只保留这条说明，避免后来者误以为漏了而重复实现一遍。
+ */
+
 /** 解析该账户当前可用的凭据（缓存 → 自留副本 → 桌面 auth 文件），必要时单飞刷新 */
 async function resolveWorkBuddyCredential(provider, acct) {
   if (acct.apiKey) return { accessToken: acct.apiKey, refreshToken: '', expiresAtMs: Date.now() + 3600_000, domain: '', uid: '' };
@@ -3423,13 +3488,18 @@ function workbuddyChatUserAgent(domain) {
  * （codebuddy.js：`ey[IDE_TYPE_HEADER]=ideType`、`ey[IDE_NAME_HEADER]=platform`、
  * `ey[IDE_VERSION_HEADER]=platformVersion`；桌面端 banner 请求同款三头 + `X-Product: WorkBuddy`）。
  * 只发 UA 时上游认不出使用端——腾讯控制台「积分消耗明细 → 使用端」显示为 `-`（网关调用全被记成无归属）。
+ *
+ * ⚠ 版本兜底用 {@link WORKBUDDY_FALLBACK_APP_VERSION}（5.5.6），**不是** `'0.0.0'`。
+ * 参照实现把这个兜底值称为"**形状要求**，不是版本声明"—— 上游只要求这个头是个像样的版本号；
+ * 而 `0.0.0` 是个明显不合法的版本号，比缺这个头更可疑。
+ * 旧实现在这里兜底成 `'0.0.0'`，与上方常量定义处的意图自相矛盾（常量早就存在却没被用上）。
  */
 function workbuddyIdeHeaders() {
   const { appVersion } = workbuddyVersions();
   return {
     'X-IDE-Type': 'WorkBuddy',
     'X-IDE-Name': 'WorkBuddy',
-    'X-IDE-Version': appVersion || '0.0.0',
+    'X-IDE-Version': appVersion || WORKBUDDY_FALLBACK_APP_VERSION,
   };
 }
 
@@ -3457,6 +3527,9 @@ function workbuddyHeaders(provider, cred, extra, forChat) {
   if (forChat) {
     h['User-Agent'] = workbuddyChatUserAgent(cred.domain);
     Object.assign(h, workbuddyIdeHeaders());
+    // 会话渠道三头（参照实现 issue #139）：国际版缺了就 400/11128 "conversation id missing"。
+    // 国内版不要求，但带上无害 —— 实测带/不带都 200，所以统一加，避免按域名分叉。
+    Object.assign(h, workbuddyConversationHeaders());
   } else h['User-Agent'] = WORKBUDDY_CLI_UA;
   return h;
 }
@@ -6760,22 +6833,35 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
           + `（${maskSecrets(String(detail || '')).slice(0, 80)}）→ 继续 failover（不熔断该家）`);
         return rawMode ? { retryable: upstream.status } : false;
       }
-      // 2026-10-10 新增：WorkBuddy 的**软性渠道拦截**（上游明确要求"请重发"）→ 继续 failover。
+      // WorkBuddy 的 `11128` —— **同一个错误码有三种完全不同的成因**（2026-10-20 修订）。
       //
-      // 实测（本机日志）：`claude-haiku-5-5` 52 次成功里夹 1 次这个 400（≈2%），
-      // 用户侧表现是 **Claude Code 任务"不时"被中止** ——
-      // 而这条回复本来完全能拿到（换一家/重发即可）。
+      // 旧实现只认一种：「≈2% 随机渠道风控，换下一发就行」，于是**永远重发同一份旧凭据**。
+      // 实测事故：09:48–09:51 连续 6 次 11128，而 09:55 之后同样请求全成功 ——
+      // 两者之间唯一变化是**网关重启**（= 内存里的凭据缓存被清掉）。
       //
-      // 与上面两条同一类修正：**别把"供应商此刻不想服务"当成"你的请求有问题"**。
-      // 刻意**不调 breakerRecordFail**：这是瞬时风控，按供应商粒度记失败会连坐整家
-      // （该家下一秒就正常了）。半开名额已在上方交还。
+      // 三种成因（参照实现 corrinehu/dsh-workbuddy-connect 均已记录）：
+      //   ① **accessToken 已不认**：桌面 App 升级/轮换凭据后缓存里还是旧的，
+      //      且 `expiresAtMs` 未到 → 不触发刷新 → 一直 11128。**这就是本次事故**。
+      //   ② **缺 X-Conversation-\* 三头**：上游 msg 是 "conversation id missing"（issue #139）。
+      //      现在 workbuddyHeaders 已统一补上，不会再走到这里。
+      //   ③ **`role: "developer"`**：上游只认 `system`（参照实现标为 load-bearing；translateBody 已处理）。
+      //      translateBody 的 "role 兼容" 一节早已改写，无需重复实现。
       //
-      // ⚠ 也不能记成账户级（`classifyAccountFailure` 的 'rate'）——
-      // 它 ~2% 随机命中，冷却账户会让多把 Key 被逐个耗尽，反而更糟。
-      // 正确语义就是"这一发没中，换下一发"：交给 failover 循环。
+      // 因此处置改为：**作废该家凭据缓存**（让下一次尝试重新读桌面 auth 文件）+ 继续 failover。
+      // 这样即使真的是①，下一轮候选/下一次请求也能自愈 —— 不必再靠"重启网关"。
+      //
+      // ⚠ 仍**不调 breakerRecordFail**：11128 不代表"这家坏了"（下一秒就可能好），
+      //   按供应商粒度记失败会连坐整家。半开名额已在上方交还。
+      // ⚠ 也不记账户级冷却：多账户轮换时会把所有 Key 逐个拖黑，反而更糟。
       if (WORKBUDDY_CHANNEL_BLOCK_RE.test(detail)) {
-        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"软性渠道拦截/风控"`
-          + `（上游要求重发；实测约 2% 随机命中）→ 继续 failover，不终止客户端任务`);
+        const missingConv = /conversation\s+id\s+missing/i.test(String(detail || ''));
+        const dropped = String(provider.auth || '').toLowerCase() === 'workbuddy'
+          ? invalidateWorkBuddyCredential(provider.id) : 0;
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为 WorkBuddy 渠道校验拒绝（11128）`
+          + (missingConv
+            ? '：上游明确说 **conversation id missing** → 缺 X-Conversation-* 三头（本版已自动补，若仍出现请反馈）'
+            : `：已作废该家 ${dropped} 条凭据缓存，下一次尝试会重新读取桌面 auth 文件`)
+          + ' → 继续 failover，不终止客户端任务');
         return rawMode ? { retryable: upstream.status } : false;
       }
       // 2026-10-14 新增（实测：opencode-go 的 `400 {"model":"deepseek-v4.1-flash"}`）：
@@ -9719,11 +9805,18 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       // → **Claude Code 整个任务中止**（用户报的"不时报错停止任务"，实测 52 次成功夹 1 次）。
       //
       // 这是本轮第 7 处"同一判定在两处实现、改一处漏一处"。
-      // 与直通路径一致：不熔断该家（瞬时风控，下一秒就好）、不冷却账户（~2% 随机命中，
-      // 冷却会让多把 Key 被逐个耗尽），只**继续换下一家**。
+      // 与直通路径一致：不熔断该家、不冷却账户，只**继续换下一家**；
+      // 但**必须作废凭据缓存** —— 见 forward() 里同一条分支的详细说明
+      // （11128 的真实成因多为 accessToken 已不认，而不是随机风控）。
       if (WORKBUDDY_CHANNEL_BLOCK_RE.test(String(lastDetail || ''))) {
-        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"软性渠道拦截/风控"`
-          + `（上游要求重发；实测约 2% 随机命中）→ 继续 failover，不终止客户端任务`);
+        const missingConv = /conversation\s+id\s+missing/i.test(String(lastDetail || ''));
+        const dropped = String(provider.auth || '').toLowerCase() === 'workbuddy'
+          ? invalidateWorkBuddyCredential(provider.id) : 0;
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为 WorkBuddy 渠道校验拒绝（11128）`
+          + (missingConv
+            ? '：上游说 **conversation id missing** → 缺 X-Conversation-* 三头（本版已自动补）'
+            : `：已作废该家 ${dropped} 条凭据缓存，下一次尝试会重新读取桌面 auth 文件`)
+          + ' → 继续 failover，不终止客户端任务');
         breakerReleaseSlot(provider.id, bModel);   // 上游连接性是健康的 → 交还半开名额（不清失败计数）
         return false;
       }

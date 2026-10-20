@@ -562,7 +562,72 @@ let upstreamPort = 0;
   });
 
 
-  t('网关：WorkBuddy 软性渠道拦截 400 → 继续 failover（不中止客户端任务）', async () => {
+  t('网关：WorkBuddy chat 必须带 X-Conversation-* 三头（国际版缺了必 400/11128）', async () => {
+    // 参照实现 issue #139（2026-10-16 起生效）：国际版 www.workbuddy.ai 对**缺全部三个**
+    // `X-Conversation-*` 头的 /v2/chat/completions 回
+    //   400 / code 11128 / msg "conversation id missing"
+    // 而用户看到的 displayMsg.zh 是「请求被拦截，请重新发送」—— 与渠道风控文案完全相同，
+    // 极易被误判成"随机风控"（本网关此前就这么判，于是永远重发同一份请求）。
+    //
+    // 三个值都必须是 v4 UUID，且**每次请求新铸一组**（上游不按该 id 存历史，
+    // 参照实现实测两次调用共享同一组没有任何收益）。
+    const seen = [];
+    const s = http.createServer((req, res) => {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        seen.push({ url: req.url, headers: { ...req.headers } });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          id: 'c1', object: 'chat.completion', created: 1, model: 'test-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+        }));
+      });
+    });
+    await new Promise((r) => s.listen(0, '127.0.0.1', r));
+
+    const dir = fs.mkdtempSync(path.join(tmp, 'wbconv-'));
+    const port = await freePort();
+    fs.writeFileSync(path.join(dir, 'c.json'), JSON.stringify({
+      port, apiKey: GATEWAY_KEY,
+      providers: [{
+        id: 'wb-conv', baseURL: 'http://127.0.0.1:' + s.address().port + '/v2', protocol: 'openai-chat',
+        // ⚠ auth='workbuddy' 才会走 workbuddyHeaders（桌面身份 + 三头）；
+        //   这里给 apiKey 让凭据解析短路，避免依赖本机 WorkBuddy 安装
+        auth: 'workbuddy', apiKey: 'sk-cccccccccccccccccccccccc',
+        models: ['test-model'], priority: 1, enabled: true,
+      }],
+    }), 'utf8');
+
+    const proc = spawn(process.execPath,
+      [MJS, '--config', path.join(dir, 'c.json'), '--log', path.join(dir, 'g.log'), '--port', String(port)],
+      { stdio: 'ignore', windowsHide: true });
+    try {
+      const ok = await waitHealth(port, 20000);
+      if (!ok) { console.log('    [SKIP] 网关未就绪'); return; }
+      const V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+      for (let i = 0; i < 2; i++) {
+        const r = await call({ port, body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }] } });
+        assert.strictEqual(r.status, 200, '第 ' + (i + 1) + ' 次应 200，实际 ' + r.status + ' ' + r.text.slice(0, 160));
+      }
+      assert.ok(seen.length >= 2, '上游应收到 ≥2 次请求，实际 ' + seen.length);
+      for (const h of seen.map((x) => x.headers)) {
+        for (const name of ['x-conversation-id', 'x-conversation-request-id', 'x-conversation-message-id']) {
+          assert.ok(h[name], '缺头 ' + name + '（国际版会回 11128 conversation id missing）');
+          assert.ok(V4.test(h[name]), name + ' 必须是 v4 UUID，实际 ' + h[name]);
+        }
+      }
+      const t1 = seen[0].headers['x-conversation-id'];
+      const t2 = seen[1].headers['x-conversation-id'];
+      assert.notStrictEqual(t1, t2, '三次会话头应每请求新铸一组（参照实现实测共享无收益），实际两次都是 ' + t1);
+    } finally {
+      try { proc.kill(); } catch { /* 忽略 */ }
+      try { s.close(); } catch { /* 忽略 */ }
+    }
+  });
+
+  t('网关：WorkBuddy 渠道校验拒绝 400 → 继续 failover（不中止客户端任务）', async () => {
     // ⚠ 实测事故（2026-10-10，本机日志）：WorkBuddy 会**随机**（≈2%，52 次成功夹 1 次）回
     //   HTTP 400 {"code":11128,"msg":"Illegal API invocation from an unapproved channel",
     //             "displayMsg":{"en":"Request blocked. Please send it again"}}
@@ -630,9 +695,11 @@ let upstreamPort = 0;
         '软性拦截应继续 failover 拿到 B 家的 200，实际 ' + r.status + ' ' + r.text.slice(0, 220));
       assert.ok(/来自 B 家/.test(r.text), '应拿到 B 家的正文，实际：' + r.text.slice(0, 200));
       assert.strictEqual(bHits, 1, 'B 家应被尝试 1 次，实际 ' + bHits);
-      // 日志里必须是"软性渠道拦截"，不能是"确定性 4xx"
+      // 日志必须点明是 **WorkBuddy 渠道校验拒绝（11128）**，不能是"确定性 4xx"
+      //（2026-10-20 改文案：旧文案叫"软性渠道拦截/风控、约 2% 随机命中"，
+      //  而实测这个错误码有三种成因，其中最常见的是**凭据已不认**，不是随机风控）
       const log = fs.readFileSync(path.join(dir, 'g.log'), 'utf8');
-      assert.ok(/软性渠道拦截/.test(log), '日志应记"软性渠道拦截"，实际：' + log.slice(-400));
+      assert.ok(/渠道校验拒绝（11128）/.test(log), '日志应点明 11128，实际：' + log.slice(-400));
       assert.ok(!/确定性 4xx/.test(log), '不该再判成"确定性 4xx"（那会终止客户端任务）');
     } finally {
       try { proc.kill(); } catch { /* 忽略 */ }
