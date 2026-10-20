@@ -6408,7 +6408,63 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up); }
   });
 
-  t('请求体过大时会 failover 到下一家（不是整轮失败）', async () => {
+  t('网关（2026-10-20）：maxTools 开启后按上限裁剪工具 —— 内置工具全额保留，MCP 工具按序补足', async () => {
+    // 现场：用户的 Claude Code 配了 4 个全局 MCP 服务器（Playwright / context7 / excel / rea），
+    // 于是**一个很简单的任务**也会向上游声明 366 个工具 —— 结果
+    //   workbuddy   → HTTP 400 code 11128（渠道校验拒绝）
+    //   commandcode → 节点数超过上游硬限 32768 → 本家被跳过
+    //   opencode    → 免费档对大体量请求同样 403
+    // 三条候选全废，整轮失败。
+    //
+    // 裁剪规则：**内置工具（非 mcp__ 前缀）优先全额保留**，再用 MCP 工具按原顺序补到上限。
+    // 默认关闭（maxTools 未设/0），必须显式开启 —— 否则会静默改变上游可见的工具集。
+    const up = await startFakeOpenAIUpstream({ behavior: 'ok' });
+    const prov = openaiProvider('trimtools', up, { priority: 1 });
+    const gw = await startGatewayWith([prov], 'trimtools', {}, { maxTools: 12 });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const builtins = Array.from({ length: 5 }, (_, i) => ({
+        type: 'function', function: { name: 'Builtin' + i, description: '内置工具', parameters: { type: 'object', properties: {} } },
+      }));
+      const mcps = Array.from({ length: 30 }, (_, i) => ({
+        type: 'function', function: { name: 'mcp__srv__tool' + i, description: 'MCP 工具', parameters: { type: 'object', properties: {} } },
+      }));
+      const r = await call({ port: gw.port, body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }], tools: [...builtins, ...mcps] } });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 160));
+
+      const sent = up.st.bodies[up.st.bodies.length - 1];
+      const names = (sent.tools || []).map((t) => (t.function && t.function.name) || t.name);
+      assert.strictEqual(names.length, 12, '上游应只收到上限内的 12 个工具，实际 ' + names.length);
+      for (const b of builtins) {
+        assert.ok(names.includes(b.function.name), '内置工具必须全额保留，缺了 ' + b.function.name);
+      }
+      const mcpKept = names.filter((n) => /^mcp__/.test(n)).length;
+      assert.strictEqual(mcpKept, 7, '剩余名额应给 MCP 工具（12-5=7），实际 ' + mcpKept);
+      assert.ok(names.slice(5).every((n) => /^mcp__/.test(n)), 'MCP 工具应按原顺序补在后面');
+
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/工具裁剪：35 → 12/.test(logText), '日志须写明裁剪前后数量：' + logText.slice(-500));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关（2026-10-20）：maxTools 未设时**不裁剪**（保持既有"全量转发"语义）', async () => {
+    const up = await startFakeOpenAIUpstream({ behavior: 'ok' });
+    const prov = openaiProvider('notrim', up, { priority: 1 });
+    const gw = await startGatewayWith([prov], 'notrim', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const tools = Array.from({ length: 40 }, (_, i) => ({
+        type: 'function', function: { name: 'T' + i, description: 'x', parameters: { type: 'object', properties: {} } },
+      }));
+      const r = await call({ port: gw.port, body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }], tools } });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      const sent = up.st.bodies[up.st.bodies.length - 1];
+      assert.strictEqual((sent.tools || []).length, 40, '未配置 maxTools 时不得裁剪，实际 ' + (sent.tools || []).length);
+      assert.ok(!/工具裁剪：/.test(fs.readFileSync(gw.logPath, 'utf8')), '未开启时不得出现裁剪日志');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关：请求体过大时会 failover 到下一家（不是整轮失败）', async () => {
     // 第一家（优先级高）配了上限 → 会被跳过；第二家**未配置**（默认不检查）→ 应被正常调用。
     //
     // ⚠ 这个用例记录了本特性一次**重要的方向修正**：初版是"默认对所有家生效、

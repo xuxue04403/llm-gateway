@@ -144,6 +144,61 @@ function requestBudgetMs(cfg) {
   return (Number.isFinite(n) && n > 0) ? n : DEFAULT_REQUEST_BUDGET_MS;
 }
 
+/* ---------------- 工具裁剪（2026-10-20） ----------------
+ * 现场：用户只是跑一个**很简单的任务**，但 Claude Code 向上游声明了 **366 个工具** ——
+ * 因为他的 Claude Code 配了 4 个全局 MCP 服务器（Playwright / context7 / excel / rea），
+ * 而 Claude Code 不管任务多简单都会把**全部工具**塞进请求。
+ *
+ * 后果是两条车道同时失效：
+ *   · workbuddy     → HTTP 400 code 11128（366 个工具触发渠道校验拒绝）
+ *   · commandcode   → 节点数超过上游硬限 32768 → 本家直接被跳过
+ *   · opencode      → 免费档对大体量请求同样 403
+ * 于是"一个简单任务"整轮失败。
+ *
+ * 修法：请求要发给上游时，把工具数压到上限以内。取舍规则是**保留全部非 MCP 工具**
+ *（内置工具才是 agent 的骨架），再用 MCP 工具按原顺序补足 —— MCP 工具通常成组出现，
+ * 截断时宁可丢尾部，也不要打乱内置工具的完整性。
+ *
+ * ⚠ 代价必须说清楚：被裁掉的工具模型**调不到**。这是个有意的取舍 ——
+ *   一个 100% 失败的请求，价值低于一个能跑完的请求。
+ *
+ * ⚠⚠ **默认关闭**（缺省值 0），必须由配置显式开启 `"maxTools": 128`。
+ *   理由：这会改变"请求体过大 → 跳过这家"这条既有约定（既有测试锁死了它），
+ *   默认开启属于静默改变上游可见的工具集，不该替用户决定。现场那台机器已在配置里开启。
+ */
+const DEFAULT_MAX_TOOLS = 0;
+/** 由 startServer 从 cfg.maxTools 初始化（forward() 拿不到 cfg，故用模块级持有）。0 = 不裁剪。 */
+let ACTIVE_MAX_TOOLS = DEFAULT_MAX_TOOLS;
+/** MCP 工具的命名约定（Claude Code / DSH 都这么加前缀） */
+const MCP_TOOL_RE = /^mcp__/i;
+
+function toolNameOf(t) {
+  return (t && t.function && t.function.name) || (t && t.name) || '';
+}
+
+/**
+ * 按上限裁剪 body.tools。不裁剪时返回 null（调用方据此跳过日志）。
+ * @returns {{body:object, total:number, kept:number, builtins:number, mcp:number}|null}
+ */
+function trimToolsForUpstream(body) {
+  if (!body || typeof body !== 'object' || !Array.isArray(body.tools)) return null;
+  const limit = ACTIVE_MAX_TOOLS;
+  if (!(limit > 0) || body.tools.length <= limit) return null;
+  const builtins = body.tools.filter((t) => !MCP_TOOL_RE.test(toolNameOf(t)));
+  const mcps = body.tools.filter((t) => MCP_TOOL_RE.test(toolNameOf(t)));
+  // 内置工具优先全额保留；超限时只取前 limit 个（正常情况下远不会超）
+  const keptBuiltins = builtins.length >= limit ? builtins.slice(0, limit) : builtins;
+  const room = Math.max(0, limit - keptBuiltins.length);
+  const kept = keptBuiltins.concat(room > 0 ? mcps.slice(0, room) : []);
+  return {
+    body: { ...body, tools: kept },
+    total: body.tools.length,
+    kept: kept.length,
+    builtins: keptBuiltins.length,
+    mcp: kept.length - keptBuiltins.length,
+  };
+}
+
 /**
  * 本次候选实际可用的超时 = min(该家 timeoutMs, **本轮预算能分给它的额度**)。
  *
@@ -3224,6 +3279,71 @@ function invalidateWorkBuddyCredential(providerId) {
 const workbuddyForceDesktop = new Set();
 
 /**
+ * 11128 现场转储（默认关闭，`DSH_GATEWAY_DUMP_WB11128=1` 才写）。
+ *
+ * 为什么需要它：这个错误码的三种成因（token 失效 / 缺会话头 / 角色）都已修过，
+ * 但用户真实的 **366 工具**请求仍然 100% 命中，而合成请求（同数量、同名字、1.5MB、
+ * 5 万节点）却全部 200 —— 说明触发条件在我没复现到的某个维度上。
+ * 继续靠猜只会浪费往返，直接落一份真实现场比什么都省事。
+ *
+ * 只写**元数据 + 工具名 + 结构指纹**，不写 messages 正文（那是用户的对话内容）。
+ * 目录沿用项目既有的 logs/dump，并只保留最近若干份。
+ */
+function dumpWorkbuddy11128(provider, bodyText, detail) {
+  if (process.env.DSH_GATEWAY_DUMP_WB11128 !== '1') return;
+  try {
+    const dir = path.join(path.dirname(LOG_PATH), 'dump');
+    fs.mkdirSync(dir, { recursive: true });
+    let meta = {};
+    try {
+      const b = JSON.parse(bodyText || '{}');
+      const tools = Array.isArray(b.tools) ? b.tools : [];
+      const names = tools.map((t) => (t && t.function && t.function.name) || (t && t.name) || '?');
+      meta = {
+        keys: Object.keys(b),
+        model: b.model,
+        stream: b.stream,
+        tool_choice: b.tool_choice,
+        max_tokens: b.max_tokens,
+        messageCount: Array.isArray(b.messages) ? b.messages.length : 0,
+        roles: Array.isArray(b.messages) ? b.messages.map((m) => m && m.role) : [],
+        toolCount: tools.length,
+        toolNames: names,
+        // 每个工具 schema 的"形状指纹"：键集合 + 节点数，便于定位是哪种 schema 触发的
+        toolShapes: tools.slice(0, 40).map((t) => {
+          const fn = (t && t.function) || t || {};
+          const params = fn.parameters || fn.input_schema || {};
+          return {
+            name: fn.name,
+            topKeys: Object.keys(params),
+            propCount: params && params.properties ? Object.keys(params.properties).length : 0,
+            required: params && Array.isArray(params.required) ? params.required.length : 0,
+            nodes: jsonNodeFootprint(params),
+          };
+        }),
+      };
+    } catch (e) {
+      meta = { parseError: (e && e.message) || String(e) };
+    }
+    const out = {
+      at: new Date().toISOString(),
+      provider: provider && provider.id,
+      bytes: Buffer.byteLength(bodyText || ''),
+      nodes: (() => { try { return jsonNodeFootprint(JSON.parse(bodyText || '{}')); } catch { return null; } })(),
+      upstreamStatus: '11128',
+      upstreamDetail: String(detail || '').slice(0, 600),
+      meta,
+    };
+    const file = path.join(dir, 'wb11128-' + Date.now() + '.json');
+    fs.writeFileSync(file, JSON.stringify(out, null, 2), 'utf8');
+    log(`WorkBuddy 11128 现场已转储 → ${file}`
+      + `（bytes=${out.bytes} nodes=${out.nodes} tools=${meta.toolCount || '?'}）`);
+  } catch (e) {
+    log(`WorkBuddy 11128 转储失败：${(e && e.message) || e}`);
+  }
+}
+
+/**
  * WorkBuddy 会话渠道三头（照抄参照实现 corrinehu/dsh-workbuddy-connect 的
  * `conversationHeaders()`，issue #139）。
  *
@@ -6288,6 +6408,19 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
             + '（缺了上游会 403 FreeTierError；它们只是指纹占位，本网关并不提供这些工具，'
             + '模型若真的调用会失败——这正是网关只能"补声明"、无法像进程内插件那样拿真实工具顶替的局限）');
         }
+      }
+    }
+    // ── 工具裁剪（2026-10-20）──────────────────────────────────────────────
+    // 必须在 JSON.stringify 与节点预算检查**之前**：裁剪后的 body 才是真正发出去、
+    // 也才是被量节点数的那一份。现场见 trimToolsForUpstream 的注释
+    //（客户端 366 个工具 → workbuddy 11128 / commandcode 节点超限，两条车道同时失效）。
+    if (!rawMode) {
+      const trimmed = trimToolsForUpstream(outBody);
+      if (trimmed) {
+        outBody = trimmed.body;
+        log(`工具裁剪：${trimmed.total} → ${trimmed.kept} 个（保留内置 ${trimmed.builtins} + MCP ${trimmed.mcp}）`
+          + `｜原因：客户端声明的工具数超过网关上限 ${ACTIVE_MAX_TOOLS}，原样发送会让上游拒绝`
+          + `（顶层 maxTools=0 可关闭此裁剪）`);
       }
     }
     // raw 模式不带 body：显式传 undefined，避免 fetch 在没有 content-length 时挂起等待请求体
@@ -9653,6 +9786,16 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
     }
     // 复用 OpenAI 路径的角色/推理档位归一（developer→system、reasoning_effort 按家映射）
     let finalBody = translateBody(openaiBody, provider);
+    // 工具裁剪：这条路径**不经过 forward()**，必须同样裁一次，否则"声明了 openai-chat 的家"
+    // 会带着全部工具打上游（现场：workbuddy 366 工具 → 11128，commandcode → 节点超限被跳过）。
+    {
+      const trimmed = trimToolsForUpstream(finalBody);
+      if (trimmed) {
+        finalBody = trimmed.body;
+        log(`工具裁剪（翻译路径）：${trimmed.total} → ${trimmed.kept} 个`
+          + `（保留内置 ${trimmed.builtins} + MCP ${trimmed.mcp}）｜上限 ${ACTIVE_MAX_TOOLS}`);
+      }
+    }
     // OpenCode 车道的工具指纹门：这条路径上 body 已经是 OpenAI 形状，style 用 'chat'。
     // ⚠ 工具配对修复 / 指纹门都写在 forward() 里，而**这条路径不经过 forward()** ——
     // 少了这一处，"声明了 openai-chat 的家"就缺了免费档要求的工具声明。
@@ -10933,6 +11076,18 @@ function upstreamBase(baseURL) {
 }
 
 function startServer(cfg) {
+  // 工具数上限（见 trimToolsForUpstream 的说明）。顶层 `maxTools`：>0 启用裁剪、0 关闭、未设用缺省值。
+  {
+    const raw = Number(cfg && cfg.maxTools);
+    ACTIVE_MAX_TOOLS = (cfg && cfg.maxTools !== undefined && Number.isFinite(raw) && raw > 0)
+      ? Math.floor(raw) : DEFAULT_MAX_TOOLS;
+    if (ACTIVE_MAX_TOOLS > 0) {
+      log(`工具裁剪上限 = ${ACTIVE_MAX_TOOLS}（超出时保留全部内置工具、按序补 MCP 工具；`
+        + `顶层 maxTools=0 可关闭）`);
+    } else {
+      log('工具裁剪已关闭（maxTools=0）—— 客户端声明的工具会**全部**发给上游');
+    }
+  }
   const server = http.createServer((req, res) => {
     // 审计修复（P2）：路由整体兜底。旧版 handler 是 async 但返回的 promise 被丢弃——
     // 任何未预期抛出（畸形 Host 让 new URL 抛错、提供应商条目非法等）只进
