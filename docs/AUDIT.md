@@ -1223,6 +1223,150 @@ messages 里），Anthropic 与 Responses 都能无损落到它上面。既有�
 7 条审计发现逐条用原审计脚本复跑验证（全部由 🔴/❌ 转为 ✅）
 ```
 
+## Q. 第七轮：WorkBuddy 反反代（11128）真因定位 + 文档不实数字审计（2026-10-24）
+
+用户诉求原文：*"因 workbuddy 客户端增强防反代能力，因此 llm-gateway 已无法使用 workbuddy
+的 api 了，请检索 github 项目及网页寻找解决方案"*。
+
+### Q.1 结论先行
+
+`400 / code 11128` 的真因**不是**凭据、不是出口 IP、不是工具体量、不是会话长度，而是
+**`system` / `developer` 消息里的宿主身份句指纹**：
+
+```
+You are an AI agent powered by DeepSeek Harness.
+```
+
+2026-10-20 傍晚起，`copilot.tencent.com/v2/chat/completions` 对请求体文本做逐字匹配，
+命中即回
+
+```json
+{"code":11128,"msg":"Illegal API invocation from an unapproved channel",
+ "displayMsg":{"zh":"请求被拦截，请重新发送"}}
+```
+
+### Q.2 为什么前面几轮全跑偏（这是本轮最重要的教训）
+
+同一个错误码 `11128` 到本轮为止共有**四种完全不同的成因**，而它们**共用同一句文案**
+（"请求被拦截，请重新发送"），于是每次只撞见其中一种就以为找到了全部：
+
+| # | 成因 | 何时发现 | 症状细节 |
+|---|---|---|---|
+| ① | accessToken 已不被认（桌面 App 轮换过） | 2026-10-20 下午 | 首次请求失败，作废缓存后恢复 |
+| ② | 缺 `X-Conversation-*` 会话头（国际版） | 2026-10-16 起 | `msg: "conversation id missing"` |
+| ③ | `role: "developer"`（上游只认 `system`） | 参照实现标注为 load-bearing | 整单拒绝 |
+| ④ | **`system` 里的身份句指纹** | **2026-10-20 傍晚起** | **与请求大小、工具数、凭据新鲜度全无关** |
+
+③④ 之间还有一个**被证伪的假成因**：曾把 11128 记成"366 个工具触发渠道校验拒绝"。
+本轮用同一 token、同一套头做受控实验破掉了它 —— 366 个富 schema 工具一直加到
+**1.5MB 请求体仍全 200**，直到 2.1MB 才换成 `11115 prompt is too long`。当初之所以
+"看起来与工具有关"，是因为身份句一直在，**大小请求全会失败**，工具数只是被牵连的变量。
+（引擎里 4 处相关注释已按此更正。）
+
+**教训写在这里**：一个错误码承载多种含义时，**先把"能复现的最小差异"找出来**，
+再谈修法。本轮真正的突破口不是读代码，而是做了一组**只改一个变量**的受控实验
+（同 token、同头、同模型，只改 system 文本），五分钟定位了前几轮几小时没定位的东西。
+
+### Q.3 受控实验（本机实测，非推断）
+
+探针 `_scratch/probe-wb-identity.cjs`，经网关 3091 打真上游 `deepseek-v4-pro`：
+
+| 用例 | 修前 | 修后 |
+|---|---|---|
+| A `system` 首行即身份句（string） | **503**（all providers unavailable） | **200** |
+| B 中性开场白 | 200 | 200 |
+| C 身份句在第 2 行 | 200 | 200 |
+| D 块数组 `[{type:"text"}]` 形态 | — | **200** |
+| E 逗号形态 `agent, powered by the DeepSeek Harness.` | — | **200** |
+| F 只剩品牌词被引用 | — | **200** |
+| `/v1/messages`（Anthropic 翻译路径） | — | **200** |
+| `/v1/responses`（instructions） | — | **200** |
+| G 身份句只出现在 `user` 里 | 200（**不该改**） | 200（**确实没改**） |
+
+→ 判据是**文本内容**，与角色无关的那部分（user）实测不触发；但**位置无关**
+（行 2、块数组、逗号形态都触发）。
+
+### Q.4 修法：一处实现覆盖三条协议
+
+在 `translateBody()` 与 `translateResponsesBody()` 里做身份改写，两处都是**发上游前的
+唯一入口**：
+
+- 主正则容忍分隔符（`,` `;` `:` `，` `、` `—` `–` `-`），覆盖逗号形态：
+  ```js
+  const WB_CHANNEL_IDENTITY_RE =
+    /You are an?[ \t]+(?:AI[ \t]+)?(?:coding[ \t]+)?agent[ \t]*(?:[,;:，、—–-][ \t]*)?powered[ \t]+by[^.\n]{1,60}?Harness\.?/giu;
+  const WB_NEUTRAL_IDENTITY = 'You are an AI agent.';
+  ```
+- 品牌词兜底（防上游把指纹从整句退化成关键词），**但必须跳过路径语境**：
+  ```js
+  const WB_BRAND_RE = /(?<![\\/])DeepSeek[\s_-]*Harness(?![\\/])/giu;
+  const WB_BRAND_NEUTRAL = 'DeepSeekRuntime';
+  ```
+  ⚠ 这条负向断言是本轮**第二个真缺陷**：DSH 的 runtime context 里有
+  `C:\Users\…\Programs\DeepSeek Harness\resources\app.asar\dsh\`，往路径里插字符会让模型
+  拿到不存在的路径 → 工具调用失败。症状与 11128 毫无关系，极难归因 —— "为了修好它反而
+  弄坏它"。参照实现 `simlerick/dsh-wb400-fix` 用的是同一套断言。
+- 范围三档 `wbIdentityScrubScope()`：`off` / `identity`（默认，只 system+developer）/
+  `all`（连 user、tool 结果、`tool_calls.arguments` 一起改）。两派参照实现在这点上有实质
+  分歧（见 Q.6），所以把选择权交给配置而不是替用户选边。
+- `scrubWorkbuddyMessage()` 覆盖三个文本位：`content: string`、`content: [{type:'text'}]`、
+  `tool_calls[].function.arguments`（换成纯 ASCII 词不破坏 JSON）。
+
+### Q.5 会话四头
+
+国际版 5.7 起要求四个会话头，缺任一即 `400/11128 "conversation id missing"`。
+`workbuddyConversationHeaders()` 从三头补到四头，`X-Root-Request-ID` 与
+`X-Conversation-Request-ID` 同值（同一个请求的根 id）。国内版实测不要求，带上无害。
+
+### Q.6 参照实现的实质分歧（如实记录，不替用户选边）
+
+| 议题 | `misakano7545/workbuddy2api-panel`（Go） | `chengshenyangtai/dsh-workbuddy-trae-qoder-connect` | 本网关 |
+|---|---|---|---|
+| 改哪些角色 | 可配；默认 `all`，`identity` 档只改 system | 主张**全都改**（"文本匹配不认角色"） | 默认 `identity`，`identityScrub:"all"` 可全改 |
+| 替换成什么 | `DeepSeek Harness` → `DeepSeekRuntime` | 整句换成 `You are an AI coding agent.` + 品牌词兜底 | 两者都做 |
+| 手法 | 文本替换 | 文本替换 | 文本替换（`simlerick` 那派用**零宽空格**，语义零损失，但会让日志/回放出现不可见字符） |
+| user 是否触发 | 实测**不**触发 | 认为会触发（未给反例） | 本机实测**不**触发（用例 G） |
+
+### Q.7 顺带审计出的文档不实（已订正）
+
+- README 写"253 项测试" → 实际 **411 项**
+- README 写"parity：38 处声明改动、0 处未声明" → 实际**恒 FAIL**，白名单外 **45 条**未声明
+  （`DECLARED` 停在 v1.0.7 附近，v1.0.8–v1.0.18 的改动大量未登记。已用
+  `git show <tag>:…` 做基线快照逐块复核，确认是**清单维护欠债**而非功能回退）
+- README 测试套件表 6 行项数全部过期（66/33/29/12/18/114 → 98/42/29/15/19/208）
+- 引擎 4 处注释把 11128 归因成"366 工具触发渠道校验"
+
+这些不是"文档小瑕疵"：README 里那句"0 处未声明"会让下一个人以为差异清单是可信的，
+而它已经腐烂了 10 个版本。
+
+### Q.8 验收
+
+```
+测试 411 项 0 失败（gateway 由 204 → 208，+4 为本轮新增）
+  unit 98 / writers 42 / edge 29 / security 19 / renderer 15 / gateway 208
+新增 3 个用例：
+  ① 身份指纹 7 条 message：首行 / 第 2 行 / 块数组 / 逗号形态 / 只剩品牌词 /
+     路径语境必须原样保留 / user 不得改
+  ② /v1/responses 的 instructions 也要改写
+  ③ identityScrub="all" 时连 user 与工具结果一起改写
+直播复测（真上游）：A 200 / B 200 / C 200 / D 200 / messages 200 / responses 200
+引擎日志出现 4 条「WorkBuddy 渠道身份改写（范围 identity）」，upstream 4xx 计数 0
+```
+
+### Q.9 未解决 / 需要用户决定
+
+- **这是猫鼠游戏**。判的是字符串，上游换一次指纹就得跟着改一次；且它是**抽样拦截**
+  （社区实测约 0.05%），单次 200 不能证明"已经稳了"。
+- 长期只有两条路：用官方客户端，或换一家不依赖腾讯网关的供应商。
+- 更彻底的减面在宿主侧：DSH 的 `system-prompt` 插件支持
+  `config.includeHarnessIdentity: false`，从**源头**不生成那句身份句。官方文档措辞是
+  "仅当兼容性部署拥有完整系统提示词时设为 false" —— 本场景符合，但需要在
+  `C:\Users\xuexu\.dsh\profiles\web\cordis.patch.yml` 里额外加一条覆盖，**尚未落地**。
+- 发布未完成：本地 5 个提交未推送（缺 `GITHUB_TOKEN`，`gh` CLI 未安装，
+  git 凭据管理器在非交互环境下不可用）。
+- 遗留：`nvidia` 四把 Key 中两把恒 403、两把连不上，会在候选链白打（等用户决定删不删）；
+  `opencode` 免费档真实上下文上限未知（配置声明 1048576）。
+
 
 
 
