@@ -617,6 +617,12 @@ let upstreamPort = 0;
           assert.ok(h[name], '缺头 ' + name + '（国际版会回 11128 conversation id missing）');
           assert.ok(V4.test(h[name]), name + ' 必须是 v4 UUID，实际 ' + h[name]);
         }
+        // 国际版 5.7 起多要求一个 X-Root-Request-ID（同一错误码、同一句 "conversation id
+        // missing"）；缺了在 5.7+ 上仍是 400/11128，所以这里必须一起钉住
+        assert.ok(h['x-root-request-id'], '缺头 x-root-request-id（国际版 5.7+ 会回 11128）');
+        assert.ok(V4.test(h['x-root-request-id']), 'x-root-request-id 必须是 v4 UUID，实际 ' + h['x-root-request-id']);
+        assert.strictEqual(h['x-root-request-id'], h['x-conversation-request-id'],
+          '根 id 应与本次请求 id 同源（同属一个请求），实际 ' + h['x-root-request-id'] + ' vs ' + h['x-conversation-request-id']);
       }
       const t1 = seen[0].headers['x-conversation-id'];
       const t2 = seen[1].headers['x-conversation-id'];
@@ -625,6 +631,227 @@ let upstreamPort = 0;
       try { proc.kill(); } catch { /* 忽略 */ }
       try { s.close(); } catch { /* 忽略 */ }
     }
+  });
+
+  t('网关：WorkBuddy 系统提示词指纹 → 发上游前必须改写身份句（2026-10-20 起的 11128 真因）', async () => {
+    // ⚠ 实测（本机，2026-10-21，同一 token / 同一套头，只改 system 首行）：
+    //     首行是 "You are an AI agent powered by DeepSeek Harness." → 400 / 11128
+    //     同一句放到第 2 行                                      → 200
+    //     换成中性开场白                                          → 200，流式正常
+    //   也就是说 2026-10-20 傍晚起，copilot.tencent.com/v2/chat/completions 开始对**请求体**
+    //   做系统提示词指纹校验 —— 与凭据、会话三头、出口 IP、工具体量全都无关
+    //  （那一轮把这四项逐条排除过：366 个富 schema 工具加到 1.5MB 仍 200）。
+    //
+    // 因此网关必须在**发上游之前**把 system/developer 里的身份句改写掉，否则这条车道恒 400。
+    // 参照实现 Hourz26/dsh-workbuddy-connect-patched 的第二版补丁强调"位置无关"：
+    // 宿主会在身份段前面渲染问候语，长会话还会重发多个 system 消息，只匹配行首会漏。
+    const IDENT = 'You are an AI agent powered by DeepSeek Harness.';
+    const NEUTRAL = 'You are an AI agent.';
+    const seen = [];
+    const s = http.createServer((req, res) => {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        let body = null;
+        try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { /* 忽略 */ }
+        seen.push(body);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          id: 'c1', object: 'chat.completion', created: 1, model: 'test-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+        }));
+      });
+    });
+    await new Promise((r) => s.listen(0, '127.0.0.1', r));
+
+    const dir = fs.mkdtempSync(path.join(tmp, 'wbident-'));
+    const port = await freePort();
+    fs.writeFileSync(path.join(dir, 'c.json'), JSON.stringify({
+      port, apiKey: GATEWAY_KEY,
+      providers: [{
+        id: 'wb-ident', baseURL: 'http://127.0.0.1:' + s.address().port + '/v2', protocol: 'openai-chat',
+        auth: 'workbuddy', apiKey: 'sk-cccccccccccccccccccccccc',
+        models: ['test-model'], priority: 1, enabled: true,
+      }],
+    }), 'utf8');
+
+    const proc = spawn(process.execPath,
+      [MJS, '--config', path.join(dir, 'c.json'), '--log', path.join(dir, 'g.log'), '--port', String(port)],
+      { stdio: 'ignore', windowsHide: true });
+    try {
+      const ok = await waitHealth(port, 20000);
+      if (!ok) { console.log('    [SKIP] 网关未就绪'); return; }
+      const r = await call({
+        port,
+        body: {
+          model: 'test-model',
+          messages: [
+            { role: 'system', content: IDENT + '\n\n你是 DSH 助手。' },
+            // 位置无关的第二处：句中/第 2 行同样要改（宿主会把问候语渲染在身份段之前）
+            { role: 'system', content: '以下是身份说明。\n' + IDENT },
+            // 块数组形态：只处理字符串会漏掉这种客户端拼装方式
+            { role: 'system', content: [{ type: 'text', text: IDENT }] },
+            // 逗号形态：桌面版渲染出来是 "You are an AI coding agent, powered by …"，
+            // 正则若要求 "agent\s+powered" 直连就会漏这一种（照抄参照实现踩过的坑）
+            { role: 'system', content: 'You are an AI coding agent, powered by the DeepSeek Harness.' },
+            // 品牌词兜底：整句已被换成别的写法，只剩品牌词被引用 —— 单独出现该品牌词时上游
+            // 也不放行（ardeyouxipianyi/workbuddy2api-hub PR #540 的逐句二分实测），必须抹掉
+            { role: 'system', content: '参见 "DeepSeek Harness" 的文档。' },
+            // user 里出现同一句**不得**改动（实测只出现在 user 里时上游 200，改了反而损语义）
+            { role: 'user', content: IDENT },
+          ],
+        },
+      });
+      assert.strictEqual(r.status, 200, '应 200，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(seen.length, 1, '上游应收到 1 次请求，实际 ' + seen.length);
+      const msgs = seen[0].messages;
+      assert.strictEqual(msgs[0].content, NEUTRAL + '\n\n你是 DSH 助手。',
+        'system 首行身份句必须被改写，实际 ' + JSON.stringify(msgs[0].content.slice(0, 80)));
+      assert.strictEqual(msgs[1].content, '以下是身份说明。\n' + NEUTRAL,
+        '句中身份句同样要改写（位置无关），实际 ' + JSON.stringify(msgs[1].content));
+      assert.strictEqual(msgs[2].content[0].text, NEUTRAL,
+        '块数组形态同样要改写，实际 ' + JSON.stringify(msgs[2].content));
+      assert.strictEqual(msgs[3].content, NEUTRAL,
+        '逗号形态（agent, powered by）同样要改写，实际 ' + JSON.stringify(msgs[3].content));
+      assert.strictEqual(msgs[4].content, '参见 "DeepSeekRuntime" 的文档。',
+        '只剩品牌词时也必须抹掉，实际 ' + JSON.stringify(msgs[4].content));
+      assert.strictEqual(msgs[5].content, IDENT, 'user 消息不得被改写');
+      // 出站文本里一个 "DeepSeek Harness" 都不该再出现（断言**出口**文本，不是断言入参）
+      assert.ok(!JSON.stringify(msgs.slice(0, 5)).includes('DeepSeek Harness'),
+        'system 里不得残留身份句指纹');
+    } finally {
+      try { proc.kill(); } catch { /* 忽略 */ }
+      try { s.close(); } catch { /* 忽略 */ }
+    }
+  });
+
+  t('网关：非 WorkBuddy 家不得改写 system 提示词（身份改写必须只对本家生效）', async () => {
+    // 反例保护：身份改写是"给 workbuddy 车道擦指纹"，一旦漏到别家就是**静默篡改用户提示词**。
+    const IDENT = 'You are an AI agent powered by DeepSeek Harness.';
+    const seen = [];
+    const s = http.createServer((req, res) => {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        let body = null;
+        try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { /* 忽略 */ }
+        seen.push(body);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          id: 'c1', object: 'chat.completion', created: 1, model: 'test-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+        }));
+      });
+    });
+    await new Promise((r) => s.listen(0, '127.0.0.1', r));
+
+    const dir = fs.mkdtempSync(path.join(tmp, 'wbident-off-'));
+    const port = await freePort();
+    fs.writeFileSync(path.join(dir, 'c.json'), JSON.stringify({
+      port, apiKey: GATEWAY_KEY,
+      providers: [{
+        id: 'plain', baseURL: 'http://127.0.0.1:' + s.address().port + '/v2', protocol: 'openai-chat',
+        apiKey: 'sk-dddddddddddddddddddddddd',
+        models: ['test-model'], priority: 1, enabled: true,
+      }],
+    }), 'utf8');
+
+    const proc = spawn(process.execPath,
+      [MJS, '--config', path.join(dir, 'c.json'), '--log', path.join(dir, 'g.log'), '--port', String(port)],
+      { stdio: 'ignore', windowsHide: true });
+    try {
+      const ok = await waitHealth(port, 20000);
+      if (!ok) { console.log('    [SKIP] 网关未就绪'); return; }
+      const r = await call({
+        port,
+        body: { model: 'test-model', messages: [{ role: 'system', content: IDENT }, { role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '应 200，实际 ' + r.status);
+      assert.strictEqual(seen[0].messages[0].content, IDENT,
+        '非 workbuddy 家的 system 必须原样透传，实际 ' + JSON.stringify(seen[0].messages[0].content));
+    } finally {
+      try { proc.kill(); } catch { /* 忽略 */ }
+      try { s.close(); } catch { /* 忽略 */ }
+    }
+  });
+
+  t('网关：/v1/responses 的 instructions 也要改写身份句（Responses 是另一份实现，易漏）', async () => {
+    // 为什么单独立一条：Responses 协议把 system 提示放在顶层的 `instructions`，会话放在 `input`，
+    // 与 chat 的 `messages[]` 完全不是一个形状 —— chat 路径的改写对它**一点作用都没有**。
+    // 这正是本项目历史上的老坑（"同一判定两处实现，修了一处另一处还是红的"）。
+    const IDENT = 'You are an AI agent powered by DeepSeek Harness.';
+    const NEUTRAL = 'You are an AI agent.';
+    const up = await startFakeUpstream({ responses: true });
+    const prov = providerOf('wb-resp', up, { models: ['test-model'] });
+    prov.auth = 'workbuddy';
+    prov.apiKey = 'sk-' + 'b'.repeat(24);
+    const gw = await startGatewayWith([prov], 'wbresp');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/responses', body: {
+          model: 'test-model',
+          instructions: IDENT + '\n\n你是助手。',
+          input: [
+            { type: 'message', role: 'system', content: [{ type: 'input_text', text: IDENT }] },
+            { type: 'message', role: 'user', content: '你好' },
+          ],
+        },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const sent = up.st.lastRespBody;
+      const sentText = JSON.stringify(sent);
+      assert.ok(sent, '上游应收到 Responses 请求体');
+      assert.strictEqual(sent.instructions, NEUTRAL + '\n\n你是助手。',
+        'instructions 里的身份句必须改写，实际 ' + JSON.stringify(sent.instructions));
+      assert.strictEqual(sent.input[0].content[0].text, NEUTRAL,
+        'input 里 system 项的文本必须改写，实际 ' + JSON.stringify(sent.input[0].content));
+      assert.strictEqual(sent.input[1].content, '你好', 'user 项不得被改动');
+      assert.ok(!sentText.includes('DeepSeek Harness'), '出站 Responses 体里不得残留指纹：' + sentText.slice(0, 300));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关：identityScrub="all" 时连 user 与工具结果一起改写（保守派口径，可关闭）', async () => {
+    // 两份参照实现对此有分歧：panel 实测"user 里不触发拦截"→ 默认只改 system；
+    // 另一派认为"校验是文本匹配、不认角色，只改 system 会漏掉工具结果里的复述"。
+    // 这里把选择权交给配置：默认 identity（只 system），显式写 all 才全改。
+    const IDENT = 'You are an AI agent powered by DeepSeek Harness.';
+    const NEUTRAL = 'You are an AI agent.';
+    const up = await startFakeUpstream({});
+    const prov = providerOf('wb-all', up, { models: ['test-model'] });
+    prov.auth = 'workbuddy';
+    prov.apiKey = 'sk-' + 'e'.repeat(24);
+    prov.identityScrub = 'all';
+    const gw = await startGatewayWith([prov], 'wball');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, body: {
+          model: 'test-model',
+          messages: [
+            { role: 'system', content: IDENT },
+            { role: 'user', content: '引用：' + IDENT },
+            // tool 结果必须挂在 assistant.tool_calls 后面，否则引擎会当"孤儿 tool 消息"丢掉
+            // （repairToolPairingChat 的正常行为，与本用例无关）—— 这里给配对，让工具结果真到上游
+            {
+              role: 'assistant', content: null,
+              tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: '{"q":"' + IDENT + '"}' } }],
+            },
+            { role: 'tool', tool_call_id: 'c1', content: '工具结果是 ' + IDENT },
+          ],
+        },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const sent = up.st.lastBody;
+      const ms = sent.messages || [];
+      assert.strictEqual(ms[0].content, NEUTRAL);
+      assert.strictEqual(ms[1].content, '引用：' + NEUTRAL, 'all 模式下 user 也要改：' + JSON.stringify(ms));
+      assert.ok(!JSON.stringify(ms[2]).includes('Harness'),
+        'all 模式下 tool_calls.arguments 也要改：' + JSON.stringify(ms[2]));
+      assert.strictEqual(ms[3].content, '工具结果是 ' + NEUTRAL, 'all 模式下工具结果也要改：' + JSON.stringify(ms));
+    } finally { killGw(gw); closeUp(up); }
   });
 
   t('网关：WorkBuddy 渠道校验拒绝 400 → 继续 failover（不中止客户端任务）', async () => {

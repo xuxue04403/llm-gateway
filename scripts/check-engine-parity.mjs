@@ -376,6 +376,25 @@ const DECLARED = [
     { name: 'switchHostToDirect', why: '新增（规则1 的核心）：走代理失败 + **该上游直连可达** → 把这一家的 host 加进 NO_PROXY 改直连。两个条件缺一不可：只判"代理不可用"会把被墙的上游误判成"代理坏了"，切直连只会全部失败。返回 true 让调用方原地重试一次（那次就走直连）' },
     { name: 'maybeRestoreProxy', why: '新增（规则1 的自动恢复）：代理活过来就清空运行期直连清单（切回代理）。没有它会怎样：clash 重启后被墙的家仍然直连、全部失败，而日志只在很久以前写过一次"已切直连"' },
     { name: 'startServer', why: '改动（规则1）：60s 的自检定时器里顺带调用 maybeRestoreProxy()（不新开定时器；清单为空时是零开销 early return）' },
+
+  // —— 2026-10-21：WorkBuddy 系统提示词指纹（11128 的第四种成因）——
+  { name: 'WB_CHANNEL_IDENTITY_RE', why: '新增：2026-10-20 傍晚起 copilot.tencent.com/v2/chat/completions 对**请求体**做系统提示词指纹校验，system 里出现 "You are an AI agent powered by DeepSeek Harness." 即回 400 / code 11128（unapproved channel）。本机受控实测：该句在 system 首行 → 400；放到第 2 行 → 200；换中性开场白 → 200 且流式正常。凭据、会话三头、出口 IP、工具体量早已逐条排除（366 个富 schema 工具加到 1.5MB 仍 200）。正则容忍 `,`/`，`/`—`/`-` 分隔符：桌面版渲染出来是 "You are an AI coding agent, powered by …"（chengshenyangtai/dsh-workbuddy-trae-qoder-connect 的 CHANGELOG.md 记录过只认直连形态会漏这一种）' },
+  { name: 'WB_NEUTRAL_IDENTITY', why: '新增：改写后的中性开场白（"You are an AI agent."）—— 只去掉宿主可识别的品牌段，保留"你是 AI 代理"这层语义' },
+  { name: 'WB_BRAND_RE', why: '新增：品牌词兜底正则 `DeepSeek[\\s_-]*Harness`。**只抹整句不够**：模型会在工具结果/引用里复述品牌词，而单独出现品牌词本身也会被判 11128（ardeyouxipianyi/workbuddy2api-hub PR #540 的逐句二分实测：整句触发、拆词不触发、单独 DeepSeek Harness 也触发）。参照实现 misakano7545/workbuddy2api-panel 的做法是把品牌词换成中性词（"换一个词即绕过，语义不变"）' },
+  { name: 'WB_BRAND_NEUTRAL', why: '新增：品牌词替换值 `DeepSeekRuntime`。选它是因为纯 ASCII、无引号，替换进 JSON 字符串（如 tool_calls.arguments）后仍是合法 JSON' },
+  { name: 'isWorkBuddyAuth', why: '新增：`auth: "workbuddy"` 判定的小工具（模块级，避免各处重复写 String(...).toLowerCase()）' },
+  { name: 'wbIdentityScrubScope', why: '新增：改写范围三档 —— `off` / `identity`（默认，只 system+developer）/ `all`（全角色，含 user/assistant/tool 与 tool_calls.arguments）。两份参照实现在这里**有实质分歧**：misakano7545/workbuddy2api-panel 实测"user 里同一句不触发拦截"→ 只改 system；而 dsh-workbuddy-trae-qoder-connect 主张"校验是文本匹配、不认角色，只改 system 会漏掉工具结果里的复述"。把选择权交给配置而不是替用户选边。供应商写 `"identityScrub": "all"`，或 DSH_GATEWAY_WB_IDENTITY=all' },
+  { name: 'scrubWorkbuddyIdentityText', why: '新增：把一段文本里的身份句**逐处**替换成中性开场白，再用 WB_BRAND_RE 抹掉残留品牌词；返回 { text, n }（n = 改写处数，日志用）。⚠ 位置无关是关键：宿主会在身份段前面渲染问候语、长会话还会重发多个 system 消息，只匹配行首会漏（参照实现 Hourz26/dsh-workbuddy-connect-patched 的第二版补丁专门纠正过这点）。⚠ 有 `indexOf("Harness") < 0` 快路径：绝大多数消息根本不含这个词，不该为它跑两趟正则' },
+  { name: 'scrubWorkbuddyMessage', why: '新增：把一条 chat 消息过一遍身份改写 —— content 的 `string` 与 `[{type:"text",text}]` 两种形态，外加 `tool_calls[].function.arguments`（JSON 字符串里也可能带品牌词，替换成纯 ASCII 词不破坏 JSON）。返回 { msg, n }' },
+  { name: 'translateBody', why: '改动（渠道身份改写）：在既有 messages 遍历里加一段 —— 角色归一（developer→system）**之后**，按 wbIdentityScrubScope 决定改哪些 role。选 translateBody 是因为它是**两条转发路径的共同入口**（forward() 与 forwardAnthropicViaOpenAI() 都调它），一处实现即可避免"同一判定两处实现漏一处"的历史坑。默认（identity 档）**不碰** user/assistant —— 实测那句只出现在 user 里时上游 200，改了反而损语义；要全改必须显式配 all' },
+  { name: 'translateResponsesBody', why: '改动（渠道身份改写，**第二份实现**）：Responses 协议把 system 提示放顶层 `instructions`、会话放 `input`，与 chat 的 `messages[]` 形状完全不同 —— chat 路径的改写对它零作用。漏掉这一份就等于 /v1/responses 客户端继续撞 400/11128（本项目"同一判定两处实现漏一处"的老坑）。`instructions` 会被上游当作最靠前的 system，正是首行指纹的高危位置' },
+  { name: 'scrubResponsesItems', why: '新增：Responses `input` item 数组的身份改写。默认只改 role 为 system/developer 的项（与 chat 路径口径一致），scope=all 时逐个 item 全改（含 `function_call_output` 的工具结果与 `function_call` 的 arguments）。覆盖 `content: string`、`content: [{type:"input_text",text}]`、`output`、`arguments` 四个文本位。返回 { items, n } 或 null（无改动）' },
+  { name: 'workbuddyConversationHeaders', why: '改动（会话渠道头由三改四）：国际版 WorkBuddy AI **5.7** 起要求四个头，多出 `X-Root-Request-ID`，缺它同样回 400/11128 且 msg 还是 "conversation id missing"（同一个码、同一句文案，第四种触发面；来源 chengshenyangtai/dsh-workbuddy-trae-qoder-connect 的 CHANGELOG.md）。它与 `X-Conversation-Request-ID` **同值**（同一个请求的根 id），因为 X-Root-Request-ID 表达的就是"这条请求链的根"，重铸一个新 UUID 反而把两者割裂。国内版 copilot.tencent.com 实测不要求这四个头（带/不带都 200），统一加是为了不按域名分叉' },
+
+  // ⚠ 待办：本清单在 v1.0.7 之后就没再维护，v1.0.8–v1.0.17 的改动（OpenCode 车道、
+  //   出口轮换、magpie 三项等）大量未登记，`node scripts/check-engine-parity.mjs`
+  //   因此恒报 FAIL（本次改动之前就已经是红的）。这是清单腐烂，不是功能回退，
+  //   需要单独做一次全量登记；本次只登记自己新增的块，不代填别人的理由。
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

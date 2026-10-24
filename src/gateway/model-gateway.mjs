@@ -3501,14 +3501,22 @@ function dumpWorkbuddy11128(provider, bodyText, detail) {
  * 三个值都是 v4 UUID，**每次请求新铸一组**即可：参照实现实测上游不按该 id 存历史，
  * 两次调用共享同一组也没有任何收益。
  *
- * ⚠ 国内版 `copilot.tencent.com` 实测**不要求**这三头（带与不带都 200），
+ * ⚠ 2026-10-24 补：国际版 **5.7** 起要求**四个**头，多一个是 `X-Root-Request-ID`
+ *   （chengshenyangtai/dsh-workbuddy-trae-qoder-connect 的 CHANGELOG 记录：缺它同样
+ *   回 400/11128 "conversation id missing"）。这里一并补上 —— 与既有三头同源（同一个
+ *   请求的根 id），旧版上游多收一个未声明的头无副作用。
+ *
+ * ⚠ 国内版 `copilot.tencent.com` 实测**不要求**这些头（带与不带都 200），
  *   所以这是兼容性防护，不是国内链路的必要条件。
  */
 function workbuddyConversationHeaders() {
+  const conversationId = crypto.randomUUID();
+  const requestId = crypto.randomUUID();
   return {
-    'X-Conversation-ID': crypto.randomUUID(),
-    'X-Conversation-Request-ID': crypto.randomUUID(),
+    'X-Conversation-ID': conversationId,
+    'X-Conversation-Request-ID': requestId,
     'X-Conversation-Message-ID': crypto.randomUUID(),
+    'X-Root-Request-ID': requestId,
   };
 }
 
@@ -3824,8 +3832,9 @@ function workbuddyHeaders(provider, cred, extra, forChat) {
   if (forChat) {
     h['User-Agent'] = workbuddyChatUserAgent(cred.domain);
     Object.assign(h, workbuddyIdeHeaders());
-    // 会话渠道三头（参照实现 issue #139）：国际版缺了就 400/11128 "conversation id missing"。
-    // 国内版不要求，但带上无害 —— 实测带/不带都 200，所以统一加，避免按域名分叉。
+    // 会话渠道头（参照实现 issue #139 + 国际版 5.7）：国际版缺了任一个就 400/11128
+    // "conversation id missing"（5.7 起多要求 X-Root-Request-ID）。国内版不要求，
+    // 但带上无害 —— 实测带/不带都 200，所以统一加，避免按域名分叉。
     Object.assign(h, workbuddyConversationHeaders());
   } else h['User-Agent'] = WORKBUDDY_CLI_UA;
   return h;
@@ -4984,8 +4993,129 @@ function maskSecretTokens(text) {
     });
 }
 
+/* ---------------- WorkBuddy 渠道身份改写（2026-10-21）----------------
+ *
+ * ## 现场
+ * 2026-10-20 傍晚起，`copilot.tencent.com/v2/chat/completions` 对**请求体**做系统提示词
+ * 指纹校验：只要 `system` / `developer` 消息里出现宿主身份句
+ *
+ *     You are an AI agent powered by DeepSeek Harness.
+ *
+ * 就判定"不是官方客户端"，回
+ *
+ *     HTTP 400 {"code":11128,"msg":"Illegal API invocation from an unapproved channel"}
+ *     displayMsg.zh : 请求被拦截，请重新发送
+ *
+ * ## 为什么之前那一轮排查全部无效
+ * 凭据轮换、会话三头（X-Conversation-*）、X-IDE-Version、出口 IP、工具体量（366 个富
+ * schema 工具加到 1.5MB 仍 200）逐条排除过 —— 因为这道门判的是**提示词文本**，与它们无关。
+ * 本机实测（同一 token、同一套头，只改 system 首行）：
+ *
+ *     首行就是身份句            → 400 / 11128
+ *     身份句在第 2 行           → 200
+ *     身份句换成中性开场白      → 200，流式正常
+ *
+ * ## 为什么不只处理"开头"
+ * 参照实现（Hourz26/dsh-workbuddy-connect-patched）第二版补丁的实测结论：宿主会在身份段
+ * 前面渲染问候语，身份句于是落在**中段**；长会话还会重发多个 system 消息。所以这里做的是
+ * **位置无关、逐处替换**，而不是只匹配行首。
+ *
+ * ## 三条实测边界（来自两份参照实现 + 本机复现）
+ *   1. **位置无关**：不是只挡开头，句子在 system 中段也挡；长会话会重发多个 system。
+ *   2. **逗号形态也挡**：`You are an AI agent, powered by the DeepSeek Harness.`（桌面版
+ *      渲染出来的写法）与不带逗号的同样命中，所以分隔符必须容忍 `,`/`，`/`—`/`-`。
+ *   3. **只抹句子不够**：模型/工具结果里可能复述品牌词，所以再叠一层"品牌词兜底"
+ *      （`DeepSeek Harness` → `DeepSeekRuntime`），保证出站文本里不会残留指纹子串。
+ *      这一条来自 misakano7545/workbuddy2api-panel 的实测："换一个词即绕过，语义不变"。
+ *
+ * ## 边界与开关
+ *   · 默认只改 `system` / `developer`（developer 在本函数里已先归一成 system）；
+ *     **默认不碰** `user` / `assistant` —— 实测那句只出现在 user 里时上游 200，改了反而损语义；
+ *   · `identityScrub: "all"`（或 `DSH_GATEWAY_WB_IDENTITY=all`）时改为**全角色**改写，
+ *     连 tool 结果与 `tool_calls.arguments` 一起过（参照实现的保守派口径：校验是文本匹配，
+ *     不认角色；代价是可能改动用户原话）；
+ *   · 只对 `auth: "workbuddy"` 的家生效，其他家一个字节都不动；
+ *   · 关闭方式：`DSH_GATEWAY_WB_IDENTITY=0`，或该供应商写 `"identityScrub": false`。
+ *
+ * ⚠ 这是猫鼠游戏：上游下次换指纹就得跟着改，而且它**是抽样拦截**（社区实测约 0.05%）——
+ *   单次 200 不能当成"已解决"。真要长期稳定，只有"用官方客户端"或"换一家不依赖腾讯网关
+ *   的供应商"两条路（参照实现作者的原话）；上游侧则可用 DSH 的
+ *   `system-prompt.config.includeHarnessIdentity: false` 从源头不生成这句。
+ */
+const WB_CHANNEL_IDENTITY_RE =
+  /You are an?[ \t]+(?:AI[ \t]+)?(?:coding[ \t]+)?agent[ \t]*(?:[,;:，、—–-][ \t]*)?powered[ \t]+by[^.\n]{1,60}?Harness\.?/giu;
+const WB_NEUTRAL_IDENTITY = 'You are an AI agent.';
+// 品牌词兜底：句子被改写/换句式/被引用之后仍可能残留 → 统一抹成中性词（JSON 安全，不动引号）
+const WB_BRAND_RE = /DeepSeek[\s_-]*Harness/giu;
+const WB_BRAND_NEUTRAL = 'DeepSeekRuntime';
+
+/** 该供应商是否走 WorkBuddy 凭据适配 */
+function isWorkBuddyAuth(provider) {
+  return String((provider && provider.auth) || '').toLowerCase() === 'workbuddy';
+}
+
+/** 渠道身份改写范围：'off' | 'identity'（默认，只 system/developer）| 'all'（全角色） */
+function wbIdentityScrubScope(provider) {
+  if (provider && provider.identityScrub === false) return 'off';
+  if (provider && String(provider.identityScrub).toLowerCase() === 'all') return 'all';
+  const v = String(process.env.DSH_GATEWAY_WB_IDENTITY || '').trim().toLowerCase();
+  if (v === '0' || v === 'off' || v === 'false' || v === 'no') return 'off';
+  if (v === 'all' || v === 'everywhere') return 'all';
+  return 'identity';
+}
+
+/** 把一段文本里的身份句逐处换成中性开场白，再抹掉残留品牌词；返回 { text, n }（n = 改写处数） */
+function scrubWorkbuddyIdentityText(text) {
+  if (!text || typeof text !== 'string' || text.indexOf('Harness') < 0) return { text, n: 0 };
+  let n = 0;
+  WB_CHANNEL_IDENTITY_RE.lastIndex = 0;
+  let out = text.replace(WB_CHANNEL_IDENTITY_RE, () => { n += 1; return WB_NEUTRAL_IDENTITY; });
+  if (out.indexOf('Harness') >= 0) {
+    WB_BRAND_RE.lastIndex = 0;
+    out = out.replace(WB_BRAND_RE, () => { n += 1; return WB_BRAND_NEUTRAL; });
+  }
+  return { text: out, n };
+}
+
+/** 把一条消息的文本内容（string / [{type:'text'}]）过一遍身份改写；返回 { msg, n } */
+function scrubWorkbuddyMessage(msg) {
+  let n = msg;
+  let hits = 0;
+  if (typeof n.content === 'string') {
+    const r = scrubWorkbuddyIdentityText(n.content);
+    if (r.n) { n = { ...n, content: r.text }; hits += r.n; }
+  } else if (Array.isArray(n.content)) {
+    let partsChanged = false;
+    const parts = n.content.map((b) => {
+      if (b && typeof b === 'object' && typeof b.text === 'string') {
+        const r = scrubWorkbuddyIdentityText(b.text);
+        if (r.n) { partsChanged = true; hits += r.n; return { ...b, text: r.text }; }
+      }
+      return b;
+    });
+    if (partsChanged) n = { ...n, content: parts };
+  }
+  // tool_calls.arguments 是 JSON 字符串，替换进去的也是纯词 → 仍是合法 JSON
+  if (Array.isArray(n.tool_calls)) {
+    let callsChanged = false;
+    const calls = n.tool_calls.map((c) => {
+      const args = c && c.function && c.function.arguments;
+      if (typeof args === 'string') {
+        const r = scrubWorkbuddyIdentityText(args);
+        if (r.n) { callsChanged = true; hits += r.n; return { ...c, function: { ...c.function, arguments: r.text } }; }
+      }
+      return c;
+    });
+    if (callsChanged) n = { ...n, tool_calls: calls };
+  }
+  return { msg: n, n: hits };
+}
+
 function translateBody(body, provider) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  const wbScope = isWorkBuddyAuth(provider) ? wbIdentityScrubScope(provider) : 'off';
+  const wbScrub = wbScope !== 'off';
+  let wbScrubbed = 0;
   let out = translateReasoningBody(body, provider);
   if (!out || typeof out !== 'object' || Array.isArray(out)) return out;
   let changed = false;
@@ -5012,9 +5142,20 @@ function translateBody(body, provider) {
         });
         if (blocksChanged) { n = { ...n, content: blocks }; changed = true; }
       }
+      // WorkBuddy 渠道身份改写（必须在本轮角色归一**之后**：developer 此时已是 system）
+      //   · 默认（identity）：只改 system/developer —— 实测 user 里同一句不触发拦截
+      //   · all：全角色改写（含 tool 结果与 tool_calls.arguments），参照实现的保守派口径
+      if (wbScrub && (n.role === 'system' || wbScope === 'all')) {
+        const r = scrubWorkbuddyMessage(n);
+        if (r.n) { n = r.msg; changed = true; wbScrubbed += r.n; }
+      }
       return n;
     });
     if (changed) out = { ...out, messages: msgs };
+  }
+  if (wbScrubbed) {
+    log(`WorkBuddy 渠道身份改写（范围 ${wbScope}）：${wbScrubbed} 处身份句/品牌词 → 「${WB_NEUTRAL_IDENTITY}」/「${WB_BRAND_NEUTRAL}」`
+      + `｜不改则上游必回 400/11128（关闭：DSH_GATEWAY_WB_IDENTITY=0，全角色：=all）`);
   }
   return out;
 }
@@ -5073,7 +5214,71 @@ function translateResponsesBody(body, provider) {
     const items = maskResponsesItems(out.input);
     if (items) detach().input = items;
   }
+
+  // 3) WorkBuddy 渠道身份改写（2026-10-21，与 chat 路径同一套指纹）
+  //    Responses 不是 chat：system 提示在 `instructions`，会话在 `input`。这是**第二份实现**，
+  //    漏掉这一份就等于 /v1/responses 客户端继续撞 400/11128（历史上"两处实现漏一处"的坑）。
+  //    注意 instructions 可能被上游当作"最靠前的 system"，正是首行指纹的高危位置。
+  const wbScope = isWorkBuddyAuth(provider) ? wbIdentityScrubScope(provider) : 'off';
+  if (wbScope !== 'off') {
+    let hits = 0;
+    if (typeof out.instructions === 'string') {
+      const r = scrubWorkbuddyIdentityText(out.instructions);
+      if (r.n) { detach().instructions = r.text; hits += r.n; }
+    }
+    if (Array.isArray(out.input)) {
+      const s = scrubResponsesItems(out.input, wbScope);
+      if (s) { detach().input = s.items; hits += s.n; }
+    } else if (wbScope === 'all' && typeof out.input === 'string') {
+      const r = scrubWorkbuddyIdentityText(out.input);
+      if (r.n) { detach().input = r.text; hits += r.n; }
+    }
+    if (hits) {
+      log(`WorkBuddy 渠道身份改写（Responses/instructions，范围 ${wbScope}）：${hits} 处 → 「${WB_NEUTRAL_IDENTITY}」`
+        + `｜不改则上游必回 400/11128（关闭：DSH_GATEWAY_WB_IDENTITY=0，全角色：=all）`);
+    }
+  }
   return out;
+}
+
+/** Responses input item 数组的身份改写：默认只改 system/developer 项（与 chat 路径口径一致），
+ *  scope='all' 时逐个 item 全改（含 function_call_output 的工具结果、function_call 参数）。
+ * @returns { items, n } 或 null（无改动） */
+function scrubResponsesItems(items, scope) {
+  let hits = 0;
+  const next = items.map((it) => {
+    if (!it || typeof it !== 'object' || Array.isArray(it)) return it;
+    const isSystemItem = it.role === 'system' || it.role === 'developer';
+    if (!isSystemItem && scope !== 'all') return it;
+    let n = it;
+    let localHits = 0;
+    const hit = (r) => { if (r.n) { localHits += r.n; return r.text; } return null; };
+    if (typeof n.content === 'string') {
+      const t = hit(scrubWorkbuddyIdentityText(n.content));
+      if (t !== null) n = { ...n, content: t };
+    } else if (Array.isArray(n.content)) {
+      let partsChanged = false;
+      const parts = n.content.map((pt) => {
+        if (pt && typeof pt === 'object' && !Array.isArray(pt) && typeof pt.text === 'string') {
+          const t = hit(scrubWorkbuddyIdentityText(pt.text));
+          if (t !== null) { partsChanged = true; return { ...pt, text: t }; }
+        }
+        return pt;
+      });
+      if (partsChanged) n = { ...n, content: parts };
+    }
+    if (typeof n.output === 'string') {
+      const t = hit(scrubWorkbuddyIdentityText(n.output));
+      if (t !== null) n = { ...n, output: t };
+    }
+    if (typeof n.arguments === 'string') {
+      const t = hit(scrubWorkbuddyIdentityText(n.arguments));
+      if (t !== null) n = { ...n, arguments: t };
+    }
+    hits += localHits;
+    return n;
+  });
+  return hits ? { items: next, n: hits } : null;
 }
 
 /** Responses input item 数组：developer→system（R5 role 兼容）+ 文本打码（R9）。
@@ -7252,21 +7457,26 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
           + `（${maskSecrets(String(detail || '')).slice(0, 80)}）→ 继续 failover（不熔断该家）`);
         return rawMode ? { retryable: upstream.status } : false;
       }
-      // WorkBuddy 的 `11128` —— **同一个错误码有三种完全不同的成因**（2026-10-20 修订）。
+      // WorkBuddy 的 `11128` —— **同一个错误码有四种完全不同的成因**（2026-10-21 修订）。
       //
       // 旧实现只认一种：「≈2% 随机渠道风控，换下一发就行」，于是**永远重发同一份旧凭据**。
       // 实测事故：09:48–09:51 连续 6 次 11128，而 09:55 之后同样请求全成功 ——
       // 两者之间唯一变化是**网关重启**（= 内存里的凭据缓存被清掉）。
       //
-      // 三种成因（参照实现 corrinehu/dsh-workbuddy-connect 均已记录）：
+      // 四种成因：
       //   ① **accessToken 已不认**：桌面 App 升级/轮换凭据后缓存里还是旧的，
-      //      且 `expiresAtMs` 未到 → 不触发刷新 → 一直 11128。**这就是本次事故**。
+      //      且 `expiresAtMs` 未到 → 不触发刷新 → 一直 11128。**2026-10-20 那次事故是这个**。
       //   ② **缺 X-Conversation-\* 三头**：上游 msg 是 "conversation id missing"（issue #139）。
       //      现在 workbuddyHeaders 已统一补上，不会再走到这里。
       //   ③ **`role: "developer"`**：上游只认 `system`（参照实现标为 load-bearing；translateBody 已处理）。
       //      translateBody 的 "role 兼容" 一节早已改写，无需重复实现。
+      //   ④ **系统提示词指纹**（2026-10-20 傍晚起，见 WB_CHANNEL_IDENTITY_RE 上方注释）：
+      //      system 里出现 "You are an AI agent powered by DeepSeek Harness." 即被拒，
+      //      与凭据、头、出口 IP、请求体量全都无关。本版由 translateBody 的渠道身份改写消除。
+      //      ⚠ 若这里**仍然**收到 11128，说明上游换了新指纹 → 开 `DSH_GATEWAY_DUMP_WB11128=1`
+      //      转储现场，再照 WB_CHANNEL_IDENTITY_RE 的实测表逐项做受控实验。
       //
-      // 因此处置改为：**作废该家凭据缓存**（让下一次尝试重新读桌面 auth 文件）+ 继续 failover。
+      // 因此处置仍是：**作废该家凭据缓存**（让下一次尝试重新读桌面 auth 文件）+ 继续 failover。
       // 这样即使真的是①，下一轮候选/下一次请求也能自愈 —— 不必再靠"重启网关"。
       //
       // ⚠ 仍**不调 breakerRecordFail**：11128 不代表"这家坏了"（下一秒就可能好），
@@ -7279,7 +7489,8 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为 WorkBuddy 渠道校验拒绝（11128）`
           + (missingConv
             ? '：上游明确说 **conversation id missing** → 缺 X-Conversation-* 三头（本版已自动补，若仍出现请反馈）'
-            : `：已作废该家 ${dropped} 条凭据缓存，下一次尝试会重新读取桌面 auth 文件`)
+            : `：已作废该家 ${dropped} 条凭据缓存，下一次尝试会重新读取桌面 auth 文件`
+              + '（若身份改写已开启仍反复出现，多半是上游换了提示词指纹 → DSH_GATEWAY_DUMP_WB11128=1 转储比对）')
           + ' → 继续 failover，不终止客户端任务');
         return rawMode ? { retryable: upstream.status } : false;
       }
@@ -10264,7 +10475,8 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为 WorkBuddy 渠道校验拒绝（11128）`
           + (missingConv
             ? '：上游说 **conversation id missing** → 缺 X-Conversation-* 三头（本版已自动补）'
-            : `：已作废该家 ${dropped} 条凭据缓存，下一次尝试会重新读取桌面 auth 文件`)
+            : `：已作废该家 ${dropped} 条凭据缓存，下一次尝试会重新读取桌面 auth 文件`
+              + '（若身份改写已开启仍反复出现，多半是上游换了提示词指纹 → DSH_GATEWAY_DUMP_WB11128=1 转储比对）')
           + ' → 继续 failover，不终止客户端任务');
         breakerReleaseSlot(provider.id, bModel);   // 上游连接性是健康的 → 交还半开名额（不清失败计数）
         return false;
