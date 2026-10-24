@@ -149,11 +149,19 @@ function requestBudgetMs(cfg) {
  * 因为他的 Claude Code 配了 4 个全局 MCP 服务器（Playwright / context7 / excel / rea），
  * 而 Claude Code 不管任务多简单都会把**全部工具**塞进请求。
  *
- * 后果是两条车道同时失效：
- *   · workbuddy     → HTTP 400 code 11128（366 个工具触发渠道校验拒绝）
+ * 后果是三条车道同时出问题：
+ *   · workbuddy     → HTTP 400 code 11128
  *   · commandcode   → 节点数超过上游硬限 32768 → 本家直接被跳过
  *   · opencode      → 免费档对大体量请求同样 403
  * 于是"一个简单任务"整轮失败。
+ *
+ * ⚠ **归因更正（v1.0.18）**：当时把 workbuddy 的 11128 记成了"366 个工具触发渠道校验拒绝"，
+ * 这是错的。后来用同一 token、同一套头做受控实验：366 个富 schema 工具一直加到 **1.5MB
+ * 请求体仍然全 200**，直到 2.1MB 才换成 `11115 prompt is too long` —— 与工具**数量**无关。
+ * 11128 的真因是 system 消息里的宿主身份句（见下方「WorkBuddy 渠道身份改写」）。当初之所以
+ * 看起来"工具有关"，是因为那时身份句一直在，大小请求全会失败，工具数只是被牵连的变量。
+ * 所以：**工具裁剪对 workbuddy 并不是 11128 的解药**；保留它的理由只剩 commandcode 的节点
+ * 硬限与 opencode 免费档的体量限制，这两条是各自独立实测过的。
  *
  * 修法：请求要发给上游时，把工具数压到上限以内。取舍规则是**保留全部非 MCP 工具**
  *（内置工具才是 agent 的骨架），再用 MCP 工具按原顺序补足 —— MCP 工具通常成组出现，
@@ -3401,6 +3409,11 @@ const workbuddyInflight = new Map();       // key → Promise（单飞：并发�
  *   14:20:31  366 工具 → 200（dur=17s）
  * 也就是说修复生效了，但**要撞两次**才恢复。因为第一次重新解析时 `own` 仍然赢。
  *
+ * ⚠ 时间线别弄混：上面这段证据是 **2026-10-20 14:02**，发生在身份指纹校验上线**之前**
+ *（那是当天傍晚才开始的事）。所以那次的 11128 确实是 token 不认，本函数对症。
+ * 指纹上线之后，同一个错误码多了第四种含义（system 身份句），处置在
+ * `translateBody` / `translateResponsesBody` 里，**与本函数互不替代**。
+ *
  * 所以这里额外把该家登记进 {@link workbuddyForceDesktop}：下一次解析**忽略 `own`**，
  * 强制以桌面 auth 文件为权威（它才是"现在登录的是谁、当前 token 是什么"的权威）。
  */
@@ -3427,10 +3440,16 @@ const workbuddyForceDesktop = new Set();
 /**
  * 11128 现场转储（默认关闭，`DSH_GATEWAY_DUMP_WB11128=1` 才写）。
  *
- * 为什么需要它：这个错误码的三种成因（token 失效 / 缺会话头 / 角色）都已修过，
- * 但用户真实的 **366 工具**请求仍然 100% 命中，而合成请求（同数量、同名字、1.5MB、
- * 5 万节点）却全部 200 —— 说明触发条件在我没复现到的某个维度上。
- * 继续靠猜只会浪费往返，直接落一份真实现场比什么都省事。
+ * 为什么需要它：这个错误码的四种成因（token 失效 / 缺会话头 / 角色 / **system 身份句指纹**）
+ * 里有三种是"猜了很多轮才猜到"的，还有一个（366 工具那个说法）后来被证伪。当时的困境是：
+ * 合成请求（同数量工具、同名字、1.5MB、5 万节点）全部 200，用户真实请求却 100% 命中，
+ * 触发条件落在没复现到的某个维度上 —— 那时靠猜纯属浪费往返。
+ *
+ * **后来查清了（v1.0.18）**：那个维度是**文本内容**，具体是 system 消息里的
+ * `You are an AI agent powered by DeepSeek Harness.`。合成请求当时用的是自造的中性
+ * system，所以永远 200；真实请求带着 DSH 的身份句，所以永远失败。工具数量纯属被牵连。
+ *
+ * 现在这个转储的用途变了：**上游换指纹时用来比对**。默认仍关闭（要写用户对话的元数据）。
  *
  * 只写**元数据 + 工具名 + 结构指纹**，不写 messages 正文（那是用户的对话内容）。
  * 目录沿用项目既有的 logs/dump，并只保留最近若干份。
@@ -3490,7 +3509,7 @@ function dumpWorkbuddy11128(provider, bodyText, detail) {
 }
 
 /**
- * WorkBuddy 会话渠道三头（照抄参照实现 corrinehu/dsh-workbuddy-connect 的
+ * WorkBuddy 会话渠道头（照抄参照实现 corrinehu/dsh-workbuddy-connect 的
  * `conversationHeaders()`，issue #139）。
  *
  * 自 2026-10-16 起，国际版 `www.workbuddy.ai` 对**缺全部三个 `X-Conversation-*` 头**的
@@ -3526,7 +3545,8 @@ function workbuddyConversationHeaders() {
  * 参照实现 `prepareChatBody` 把这条标为 "load-bearing"：pi-ai 把系统提示发成
  * `role: "developer"`，上游直接回 `400 code 11128
  * ("Illegal API invocation from an unapproved channel")` —— **同一个错误码的第三种含义**
- *（另两种：会话三头缺失、token 已不认）。三种含义共用一句话术，这正是 11128 长期被误判的原因。
+ *（另三种：会话头缺失、token 已不认、**system 身份句指纹**）。四种含义共用同一句话术，
+ * 这正是 11128 长期被反复误判的原因 —— 每次只看到其中一种成因就以为找到了全部。
  *
  * ⚠ 本网关**不需要**为此单独实现：`translateBody`（见其 "role 兼容" 一节）早已把
  * `developer` 合并成 `system`，且直通路径与翻译路径都经过它。
@@ -6860,7 +6880,9 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     // ── 工具裁剪（2026-10-20）──────────────────────────────────────────────
     // 必须在 JSON.stringify 与节点预算检查**之前**：裁剪后的 body 才是真正发出去、
     // 也才是被量节点数的那一份。现场见 trimToolsForUpstream 的注释
-    //（客户端 366 个工具 → workbuddy 11128 / commandcode 节点超限，两条车道同时失效）。
+    //（客户端 366 个工具 → commandcode 节点超限 / opencode 免费档 403。
+    //  ⚠ 别再把 workbuddy 的 11128 算在工具头上：实测 366 工具 1.5MB 仍 200，
+    //  11128 是 system 身份句指纹，见 trimToolsForUpstream 顶部的归因更正）。
     if (!rawMode) {
       const trimmed = trimToolsForUpstream(outBody);
       if (trimmed) {
@@ -10266,7 +10288,8 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
     // 复用 OpenAI 路径的角色/推理档位归一（developer→system、reasoning_effort 按家映射）
     let finalBody = translateBody(openaiBody, provider);
     // 工具裁剪：这条路径**不经过 forward()**，必须同样裁一次，否则"声明了 openai-chat 的家"
-    // 会带着全部工具打上游（现场：workbuddy 366 工具 → 11128，commandcode → 节点超限被跳过）。
+    // 会带着全部工具打上游（现场：commandcode → 节点超限被跳过，opencode 免费档 → 403。
+    //  ⚠ workbuddy 的 11128 与此无关，见 trimToolsForUpstream 顶部的归因更正）。
     {
       const trimmed = trimToolsForUpstream(finalBody);
       if (trimmed) {
