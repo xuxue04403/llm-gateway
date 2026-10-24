@@ -64,8 +64,8 @@ npm run portable
 
 npm run icon     # 仅生成图标（程序化绘制，零外部素材）
 
-npm test         # 253 项测试，应全绿
-npm run parity   # 引擎差异校验：38 处声明改动、0 处未声明
+npm test         # 411 项测试，应全绿
+npm run parity   # 引擎差异校验：清单已腐烂、恒 FAIL（45 条历史欠债，详见下文）
 ```
 
 要求 Node.js ≥ 20。
@@ -170,7 +170,7 @@ npm run parity   # 引擎差异校验：38 处声明改动、0 处未声明
 ## 测试与校验
 
 ```powershell
-npm test                    # 253 项，全绿
+npm test                    # 411 项，全绿
 npm run parity              # 引擎相对 dsh-app 版本的差异是否与"声明清单"一致
 npm run check               # 语法检查
 npm run test:models         # 模型全量体检：逐个模型真跑一次（见下）
@@ -178,12 +178,12 @@ npm run test:models         # 模型全量体检：逐个模型真跑一次（�
 
 | 套件 | 项数 | 覆盖 |
 |---|---|---|
-| `tests/unit.js` | 66 | 纯函数与文件读写：原子写/备份/恢复、TOML 词法、脱敏、模型清单推导、**模型元数据与自动映射**、配置校验、代理解析、Settings、**TOML 行形状自检**、**日志着色分级** |
-| `tests/writers.test.js` | 33 | 5 个一键写入目标的 preview → apply → restore 全流程；"只动自己那一块"；baseURL 形态；**原文件已损坏时拦下**、**失败时仍带出备份路径**、**恢复部分失败要报出原因** |
+| `tests/unit.js` | 98 | 纯函数与文件读写：原子写/备份/恢复、TOML 词法、脱敏、模型清单推导、**模型元数据与自动映射**、配置校验、代理解析、Settings、**TOML 行形状自检**、**日志着色分级** |
+| `tests/writers.test.js` | 42 | 5 个一键写入目标的 preview → apply → restore 全流程；"只动自己那一块"；baseURL 形态；**原文件已损坏时拦下**、**失败时仍带出备份路径**、**恢复部分失败要报出原因** |
 | `tests/edge.test.js` | 29 | 边界与降级：无供应商/全停用/无模型/空 Key/坏 JSON/目标是目录/引擎缺失；dsh 预览与引擎落盘逐字一致 |
-| `tests/renderer.test.js` | 12 | 界面（渲染层）：用最小 DOM 桩**真实执行** `core.js`/`providers.js`；一键获取模型的选择器、编辑抽屉的监听器生命周期、数字列转义、双击行为 |
-| `tests/security.test.js` | 18 | **每条都对应一次实跑确认过的真实缺陷**：TOML 写坏形态、读不到就中止、占位 Key、空 Key 不覆盖凭据、脚本注入、密钥脱敏 |
-| `tests/gateway.test.js` | 114 | 网关引擎端到端：鉴权、SSE、三协议翻译、熔断、账户池、客户端仿真、**逐模型超时**、**仿真头镜像防漂移**、gzip 压缩 SSE、地区受限 403 不连坐、客户端指纹被拒、Retry-After 遵循 |
+| `tests/renderer.test.js` | 15 | 界面（渲染层）：用最小 DOM 桩**真实执行** `core.js`/`providers.js`；一键获取模型的选择器、编辑抽屉的监听器生命周期、数字列转义、双击行为 |
+| `tests/security.test.js` | 19 | **每条都对应一次实跑确认过的真实缺陷**：TOML 写坏形态、读不到就中止、占位 Key、空 Key 不覆盖凭据、脚本注入、密钥脱敏 |
+| `tests/gateway.test.js` | 208 | 网关引擎端到端：鉴权、SSE、三协议翻译、熔断、账户池、客户端仿真、**逐模型超时**、**仿真头镜像防漂移**、gzip 压缩 SSE、地区受限 403 不连坐、客户端指纹被拒、Retry-After 遵循、**WorkBuddy 渠道身份改写（chat / Anthropic 翻译 / Responses 三协议 + 路径语境不得改写 + 非本家不得改写）** |
 
 ### 超时怎么定（三级，就近优先）
 
@@ -225,7 +225,12 @@ npm run test:models         # 模型全量体检：逐个模型真跑一次（�
 - 所有变化过的块**必须**在脚本内的 `DECLARED` 清单里，且每条写明"改了什么、为什么"；
 - 清单里挂着但实际没变的条目也会报错（防止清单腐烂成历史遗留）。
 
-当前 38 处声明改动，0 处未声明。`--verbose` 可打印每一条的理由。
+当前清单**已腐烂，脚本恒报 FAIL**：`DECLARED` 停在 v1.0.7 附近，v1.0.8–v1.0.18 的
+改动（OpenCode 车道、出口轮换、magpie 三项、WorkBuddy 身份改写等）大量未登记，
+白名单外还剩 **45 条**未声明块。这是**清单维护欠债**，不是功能回退 —— 已用
+`git show <tag>:src/gateway/model-gateway.mjs` 做基线快照逐块复核过：那些块对应的
+功能都是有意加的，只是当时没补理由。要恢复绿色，需要单独做一次全量登记（逐块写清
+"改了什么、为什么"），不能靠脚本放水。`--verbose` 可打印已声明的每一条理由。
 找不到 dsh-app 基线时会明确说明并跳过（不算失败）。
 
 #### 这个校验**能**保证什么、**不能**保证什么
