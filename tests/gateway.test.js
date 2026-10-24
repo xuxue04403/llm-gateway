@@ -698,6 +698,11 @@ let upstreamPort = 0;
             // 品牌词兜底：整句已被换成别的写法，只剩品牌词被引用 —— 单独出现该品牌词时上游
             // 也不放行（ardeyouxipianyi/workbuddy2api-hub PR #540 的逐句二分实测），必须抹掉
             { role: 'system', content: '参见 "DeepSeek Harness" 的文档。' },
+            // ⚠ 路径语境必须**保留原样**：DSH 的 runtime context 里就写着安装目录
+            //   `…\Programs\DeepSeek Harness\resources\app.asar\dsh\`。把品牌词在这里
+            //   也抹掉 = 交给模型一个不存在的路径 → 工具调用全坏（修好一个 bug 造出一个更大的）。
+            //   参照实现 simlerick/dsh-wb400-fix 的 lexicon.mjs 同样用负向断言跳过路径。
+            { role: 'system', content: '安装目录：D:\\Programs\\DeepSeek Harness\\resources\\app.asar\\dsh\\' },
             // user 里出现同一句**不得**改动（实测只出现在 user 里时上游 200，改了反而损语义）
             { role: 'user', content: IDENT },
           ],
@@ -716,8 +721,12 @@ let upstreamPort = 0;
         '逗号形态（agent, powered by）同样要改写，实际 ' + JSON.stringify(msgs[3].content));
       assert.strictEqual(msgs[4].content, '参见 "DeepSeekRuntime" 的文档。',
         '只剩品牌词时也必须抹掉，实际 ' + JSON.stringify(msgs[4].content));
-      assert.strictEqual(msgs[5].content, IDENT, 'user 消息不得被改写');
+      // 路径语境的品牌词**必须原样保留** —— 改了就是给模型一个不存在的安装目录
+      assert.strictEqual(msgs[5].content, '安装目录：D:\\Programs\\DeepSeek Harness\\resources\\app.asar\\dsh\\',
+        '路径里的品牌词不得改写（否则工具会拿到坏路径），实际 ' + JSON.stringify(msgs[5].content));
+      assert.strictEqual(msgs[6].content, IDENT, 'user 消息不得被改写');
       // 出站文本里一个 "DeepSeek Harness" 都不该再出现（断言**出口**文本，不是断言入参）
+      // 注意：路径那条（msgs[5]）是唯一的例外，所以这里只查前 5 条
       assert.ok(!JSON.stringify(msgs.slice(0, 5)).includes('DeepSeek Harness'),
         'system 里不得残留身份句指纹');
     } finally {

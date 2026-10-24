@@ -5026,7 +5026,16 @@ function maskSecretTokens(text) {
  *      渲染出来的写法）与不带逗号的同样命中，所以分隔符必须容忍 `,`/`，`/`—`/`-`。
  *   3. **只抹句子不够**：模型/工具结果里可能复述品牌词，所以再叠一层"品牌词兜底"
  *      （`DeepSeek Harness` → `DeepSeekRuntime`），保证出站文本里不会残留指纹子串。
- *      这一条来自 misakano7545/workbuddy2api-panel 的实测："换一个词即绕过，语义不变"。
+ *      ⚠ 如实记录：ardeyouxipianyi/workbuddy2api-hub 的 PR #540 逐句二分实测显示
+ *      **单独出现 `DeepSeek Harness` 并不触发**（只有带完整 system prompt 的整句触发）。
+ *      所以这一层是**防御性**的 —— 防上游把指纹从"整句匹配"改成"关键词匹配"。
+ *      参照实现 misakano7545/workbuddy2api-panel 也把它当成同一类加固（"换一个词即绕过"）。
+ *   4. **但绝不能碰路径**：DSH 的 runtime context 里就有
+ *      `C:\Users\…\Programs\DeepSeek Harness\resources\app.asar\dsh\`
+ *      （安装目录本身叫这个名字）。把品牌词在路径里替换掉 = 给模型一个不存在的路径，
+ *      工具调用会失败 —— 这是"为了修好它反而弄坏它"。所以品牌词兜底带**前后负向断言**：
+ *      紧邻 `\` 或 `/` 的出现一律跳过（simlerick/dsh-wb400-fix 的 lexicon.mjs 同样做法：
+ *      `/(?<![\\/])(DeepSeek)[ \u00A0]+(Harness)(?![\\/])/gi`）。
  *
  * ## 边界与开关
  *   · 默认只改 `system` / `developer`（developer 在本函数里已先归一成 system）；
@@ -5046,7 +5055,11 @@ const WB_CHANNEL_IDENTITY_RE =
   /You are an?[ \t]+(?:AI[ \t]+)?(?:coding[ \t]+)?agent[ \t]*(?:[,;:，、—–-][ \t]*)?powered[ \t]+by[^.\n]{1,60}?Harness\.?/giu;
 const WB_NEUTRAL_IDENTITY = 'You are an AI agent.';
 // 品牌词兜底：句子被改写/换句式/被引用之后仍可能残留 → 统一抹成中性词（JSON 安全，不动引号）
-const WB_BRAND_RE = /DeepSeek[\s_-]*Harness/giu;
+// ⚠ 前后负向断言不能去掉：紧邻路径分隔符的出现一律跳过。DSH 的 runtime context 里就写着
+//   `…\Programs\DeepSeek Harness\resources\app.asar\dsh\`（安装目录本身叫这个名字），
+//   在路径里改品牌词 = 交给模型一个不存在的路径 → 工具调用失败（为了修好它反而弄坏它）。
+//   代价：路径语境里的品牌词会**保留**，若上游哪天连它也拦，只能靠调用方改安装目录名。
+const WB_BRAND_RE = /(?<![\\/])DeepSeek[\s_-]*Harness(?![\\/])/giu;
 const WB_BRAND_NEUTRAL = 'DeepSeekRuntime';
 
 /** 该供应商是否走 WorkBuddy 凭据适配 */
