@@ -804,6 +804,24 @@ function loadConfig() {
 /* ---------------- upstream catalog cache ---------------- */
 const catalogCache = new Map(); // providerId -> { models:Set, ts }
 
+/**
+ * 从上游目录学到的"上下文窗口"表：providerId -> { ctx: Map<upstreamId, number>, ts }。
+ *
+ * 为什么要单独一张表（不复用 catalogCache）：两者的**刷新节奏**完全不同。
+ * 模型列表是路由正确性的一部分（60s TTL 合理）；上下文窗口只是排序提示，
+ * 学到一次就能长期用，而探测本身可能很慢（实测 x666 2.7s / muyuan.do 3.0s /
+ * opencode 3.2s / aihubmix 3.2s）。按 60s 刷会让慢家每 60 秒被打一次，纯属浪费。
+ *
+ * ⚠ 只收**上游明确给出**的值。实测 15 家里只有 3 家（commandcode / sensenova / amd）
+ * 的 `/models` 带 `context_length`，其余 12 家只回 `{id,object,created,owned_by}` ——
+ * 那些家永远学不到，`windowOf` 也就永远返回 0（= 不可知 = roomy 不动作）。
+ * 这正是 README「参数拿不到就留空，不编数字」原则在路由侧的落地。
+ */
+const catalogMetaCache = new Map();
+
+// 学到一次就记 30 分钟。窗口是模型属性，不是运行时状态 —— 它不会在半小时内变。
+const CATALOG_META_TTL_MS = 30 * 60_000;
+
 // S1 轮询计数器：model -> 下次起始偏移（round-robin 路由模式用）
 const rrCounters = new Map();
 
@@ -2012,10 +2030,26 @@ function breakerCooldownSecs(providers, model) {
 const DEFAULT_LOOP_GUARD = true;
 const DEFAULT_TOOL_LOOP = true;
 const DEFAULT_ROOMY = true;
+/**
+ * `roomyLearn`：是否允许 roomy 去上游 `/models` **学**上下文窗口。**默认关闭**。
+ *
+ * 为什么默认关（2026-10-25 决定，有实测依据）：
+ *  ① 实测 15 个启用家里只有 commandcode / commandcode-haiku / sensenova / amd 四家的目录带
+ *     `context_length`，其余 11 家只回 `{id,object,created,owned_by}` —— 对多数家是白跑一趟。
+ *  ② 它与本工程一条既有承诺冲突：「配置齐全时请求路径上零探测」（`needsCatalog` = 一条模型
+ *     都没配才探目录；2026-09-15 事故正是探测把"目录里有但不能服务"的家拉进候选）。
+ *     启动时对所有"有条目缺窗口"的家探一遍，等于把那条教训的方向反过来再走一遍。
+ *  ③ 探测是**真实上游请求**：某些家目录很慢（实测 x666 2.7s / muyuan.do 3.0s / aihubmix 3.2s），
+ *     还有些直接 401/404（agentrouter / workbuddy）。
+ * 所以做成显式开关，默认不动用户的上游：知道自己那几家给窗口的人打开它，roomy 就多一份依据；
+ * 不开也完全可用 —— 窗口来源退回配置声明，声明不到就"不可知"，roomy 对那家不动作、绝不猜数字。
+ */
+const DEFAULT_ROOMY_LEARN = false;
 /** 由 startServer 从 cfg 初始化（forward()/handleXxx 拿不到 cfg 时的模块级持有）。 */
 let ACTIVE_LOOP_GUARD = DEFAULT_LOOP_GUARD;
 let ACTIVE_TOOL_LOOP = DEFAULT_TOOL_LOOP;
 let ACTIVE_ROOMY = DEFAULT_ROOMY;
+let ACTIVE_ROOMY_LEARN = DEFAULT_ROOMY_LEARN;
 
 /** 三态布尔：配置里写 true/false/"on"/"off"/1/0 都认；未设 → 用缺省值。 */
 function cfgBool(v, dflt) {
@@ -2332,10 +2366,115 @@ function serveLocalAnswer(res, wire, model, text) {
   return true;
 }
 
-/** 该候选声明的上下文窗口（逻辑模型名口径）；不可知返回 0。 */
+/** 该候选声明的上下文窗口（逻辑模型名口径）；不可知返回 0。
+ *
+ * 三个来源，优先级从高到低：
+ *  ① 配置里该模型条目声明的 `contextWindow`（用户自己填的，最权威）
+ *  ② 从上游 `/models` 学到并缓存的 `context_length`（见 catalogMetaCache）
+ *  ③ 不可知 → 0（roomy 不动作）
+ *
+ * ⚠ 同一逻辑名可能有多条映射（如 vision 变体与普通变体）。旧实现取 `.find()` 的**第一条**，
+ * 于是"第一条没填、第二条填了"会被误判成不可知 —— roomy 静默失效，且完全没有日志。
+ * 现在优先取**有窗口值**的那条：同一逻辑名的窗口本就该一致（实测配置里 0 处冲突）。
+ */
 function windowOf(provider, model) {
-  const hit = modelEntries(provider).find((e) => e.as === model);
-  return (hit && Number.isFinite(hit.contextWindow) && hit.contextWindow > 0) ? hit.contextWindow : 0;
+  const list = modelEntries(provider).filter((e) => e.as === model);
+  if (!list.length) return 0;
+  for (const e of list) {
+    if (Number.isFinite(e.contextWindow) && e.contextWindow > 0) return e.contextWindow;
+  }
+  const learned = catalogMetaCache.get(provider && provider.id);
+  if (learned && learned.ctx && learned.ctx.size) {
+    for (const e of list) {
+      const v = learned.ctx.get(e.up);
+      if (Number.isFinite(v) && v > 0) return v;
+    }
+  }
+  return 0;
+}
+
+/**
+ * 从上游 `/models` 条目里挖上下文窗口。**引擎不能 require src/model-meta.js**
+ *（那是宿主侧的 CommonJS 模块，而本引擎是零依赖 ESM，只 import `node:`），
+ * 所以这里只实现 roomy 需要的那一小块：认 context_length / context_window / max_context_length，
+ * 以及部分中转塞在 `metadata` / `limits` 里的形态（与 model-meta.js 的口径一致，
+ * 但**只取窗口**，不取 maxTokens/vision —— 那两个字段对路由排序没有意义）。
+ */
+function ctxWindowFromCatalogEntry(entry) {
+  if (!entry || typeof entry !== 'object') return 0;
+  const pick = (v) => {
+    let n;
+    if (typeof v === 'number') n = v;
+    else if (typeof v === 'string' && /^\s*\d+\s*$/.test(v)) n = Number(v);
+    else return 0;
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return Math.floor(n);
+  };
+  let w = pick(entry.context_length ?? entry.contextLength ?? entry.context_window ?? entry.contextWindow);
+  if (!w && entry.top_provider && typeof entry.top_provider === 'object') {
+    w = pick(entry.top_provider.context_length);
+  }
+  if (!w) {
+    for (const k of ['metadata', 'config', 'limits']) {
+      const o = entry[k];
+      if (o && typeof o === 'object') {
+        w = pick(o.context_length ?? o.context_window ?? o.max_context_length ?? o.contextLength);
+        if (w) break;
+      }
+    }
+  }
+  return w;
+}
+
+// 在途的"学窗口"请求：providerId -> Promise（与 catalogInflight 同思路，防重复探测）
+const catalogMetaInflight = new Map();
+
+/**
+ * 去上游 `/models` 学一次上下文窗口（**供 roomy 用，不在请求的关键路径上**）。
+ *
+ * 为什么是"学到了才用"而不是"猜一个"：实测 15 个启用家（2026-10-25）里只有
+ * commandcode / sensenova / amd 三家的目录带 `context_length`，其余 12 家只回
+ * `{id,object,created,owned_by}`。对那 12 家**没有**任何可信来源 —— 猜一个数字会让
+ * roomy 把好模型永久排到最后，比不做更糟。所以学不到就保持"不可知"。
+ *
+ * 失败静默（只在日志里留一行）：这是纯优化，学不到只是 roomy 少一份依据，绝不能影响路由。
+ */
+function learnCatalogMeta(provider, cfg) {
+  if (!provider || !provider.id) return null;
+  const id = provider.id;
+  const hit = catalogMetaCache.get(id);
+  if (hit && Date.now() - hit.ts < CATALOG_META_TTL_MS) return null;
+  if (catalogMetaInflight.has(id)) return catalogMetaInflight.get(id);
+  if (breakerIsOpen(id)) return null;   // 与 fetchCatalog 同一条纪律：熔断期不打上游
+  const promise = (async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    try {
+      const headers = upstreamRequestHeaders({}, provider.apiKey, cfg && cfg.clientUA, false, effectiveClientProfile(cfg, provider), cfg);
+      const res = await fetch(`${upstreamBase(provider.baseURL)}/models`, { headers, signal: controller.signal });
+      if (!res.ok) return;
+      const j = await res.json();
+      const arr = Array.isArray(j && j.data) ? j.data : (Array.isArray(j && j.models) ? j.models : []);
+      const ctx = new Map();
+      for (const m of arr) {
+        const up = String((m && (m.id ?? m.model)) || '').trim();
+        if (!up) continue;
+        const w = ctxWindowFromCatalogEntry(m);
+        if (w > 0) ctx.set(up, w);
+      }
+      catalogMetaCache.set(id, { ctx, ts: Date.now() });
+      if (ctx.size) {
+        log(`[roomy] 从上游目录学到 ${id} 的 ${ctx.size} 条上下文窗口（其余 ${Math.max(0, arr.length - ctx.size)} 条上游没给，保持不可知）`);
+      }
+    } catch (e) {
+      log(`[roomy] 学 ${id} 的上下文窗口失败（不影响路由）：${maskSecrets(e && e.message ? e.message : e)}`);
+    } finally {
+      clearTimeout(timer);
+      catalogMetaInflight.delete(id);
+    }
+  })();
+  catalogMetaInflight.set(id, promise);
+  return promise;
 }
 
 /**
@@ -12241,10 +12380,38 @@ function startServer(cfg) {
   ACTIVE_LOOP_GUARD = cfgBool(cfg && cfg.loopGuard, cfgBool(process.env.DSH_GATEWAY_LOOP_GUARD, DEFAULT_LOOP_GUARD));
   ACTIVE_TOOL_LOOP = cfgBool(cfg && cfg.toolLoop, cfgBool(process.env.DSH_GATEWAY_TOOL_LOOP, DEFAULT_TOOL_LOOP));
   ACTIVE_ROOMY = cfgBool(cfg && cfg.roomy, cfgBool(process.env.DSH_GATEWAY_ROOMY, DEFAULT_ROOMY));
+  ACTIVE_ROOMY_LEARN = cfgBool(cfg && cfg.roomyLearn, cfgBool(process.env.DSH_GATEWAY_ROOMY_LEARN, DEFAULT_ROOMY_LEARN));
   log(`magpie 三项：循环守卫=${ACTIVE_LOOP_GUARD ? 'on' : 'off'}`
     + ` 工具死循环拦截=${ACTIVE_TOOL_LOOP ? 'on' : 'off'}`
     + ` 上下文窗口过滤=${ACTIVE_ROOMY ? 'on' : 'off'}`
-    + '（顶层 loopGuard / toolLoop / roomy 可单独关闭，或 env DSH_GATEWAY_LOOP_GUARD / _TOOL_LOOP / _ROOMY=0）');
+    + `（窗口学自上游目录=${ACTIVE_ROOMY_LEARN ? 'on' : 'off'}）`
+    + ' ｜顶层 loopGuard / toolLoop / roomy / roomyLearn 可单独关闭，'
+    + '或 env DSH_GATEWAY_LOOP_GUARD / _TOOL_LOOP / _ROOMY / _ROOMY_LEARN=0');
+  // ── roomy 的窗口来源（2026-10-25）──
+  // roomy 需要"这家这个模型能装多少"。最权威的是用户在配置里填的 contextWindow；
+  // 没填的那部分**可选**去上游 `/models` 学（`roomyLearn`，默认关 —— 理由见 DEFAULT_ROOMY_LEARN）。
+  // 学不到就保持"不可知"：此时 roomy 对这家不动作，**绝不猜数字**（猜大了会把请求发给装不下的家，
+  // 猜小了会把好模型永久排到最后，两种都比不做更糟）。
+  //
+  // 开了也严格后台、不阻塞启动：learnCatalogMeta 自带 10s 超时 + 熔断期不探测 + 30 分钟缓存，
+  // 失败只在日志留一行，任何异常都不许影响路由。
+  if (ACTIVE_ROOMY && ACTIVE_ROOMY_LEARN) {
+    const need = (cfg.providers || []).filter((p) => p && p.enabled !== false
+      && modelEntries(p).some((e) => !(Number.isFinite(e.contextWindow) && e.contextWindow > 0)));
+    if (need.length) {
+      log(`[roomy] ${need.length} 家有模型条目未声明上下文窗口 → 稍后后台向上游目录学（学不到就保持不可知，不影响路由）`);
+      const delayMs = (() => {
+        const v = Number(process.env.DSH_GATEWAY_ROOMY_LEARN_MS);
+        return Number.isFinite(v) && v >= 0 ? v : 1500;
+      })();
+      const t = setTimeout(() => {
+        for (const p of need) {
+          try { learnCatalogMeta(p, cfg); } catch { /* 纯优化，绝不影响路由 */ }
+        }
+      }, delayMs);
+      if (t && typeof t.unref === 'function') t.unref();
+    }
+  }
   const server = http.createServer((req, res) => {
     // 审计修复（P2）：路由整体兜底。旧版 handler 是 async 但返回的 promise 被丢弃——
     // 任何未预期抛出（畸形 Host 让 new URL 抛错、提供应商条目非法等）只进

@@ -2369,7 +2369,12 @@ let upstreamPort = 0;
     const httpMod = require('node:http');
     const hang = await new Promise((resolve) => {
       const st = { calls: 0 };
-      const srv = httpMod.createServer((req) => { st.calls++; req.resume(); /* 永不回响应 */ });
+      // ⚠ 只统计"被当作转发目标"的请求：/v1/models 是目录探测（roomy 学上下文窗口走这条，
+      // 不计费也不产生模型输出），把它算进 calls 会让"慢家被尝试几次"这条断言失去意义。
+      const srv = httpMod.createServer((req) => {
+        if (!String(req.url || '').startsWith('/v1/models')) st.calls++;
+        req.resume(); /* 永不回响应 */
+      });
       srv.listen(0, '127.0.0.1', () => resolve({ srv, st, port: srv.address().port }));
     });
     const ok = await startFakeUpstream({ status: 200 });
@@ -7073,6 +7078,107 @@ let upstreamPort = 0;
       const logText = fs.readFileSync(gw.logPath, 'utf8');
       assert.ok(!/装不下的候选排到最后/.test(logText), '窗口未知时不得调整顺序：' + logText.slice(-600));
     } finally { killGw(gw); closeUp(up1); closeUp(up2); }
+  });
+
+  t('网关（magpie roomy）：窗口只声明在**第二条**同名映射上时，也必须被认到（旧实现取 find 第一条 → 静默失效）', async () => {
+    // 现场依据：同一逻辑名常有多条映射（vision 变体 / 免费档变体）。旧 windowOf 用
+    // `modelEntries(p).find(e => e.as === model)` 取**第一条**，于是"第一条没填、第二条填了"
+    // 会被判成"窗口不可知" → roomy 对这家完全不动作，而且日志里一句提示都没有。
+    // 实测当前运行配置受影响逻辑名 0 个（所以是个潜伏缺陷，不是正在发作的故障），
+    // 但口径必须修对：用户以后加一条带窗口的映射，roomy 就该立刻生效。
+    const upDup = await startFakeOpenAIUpstream({ json: true });
+    const upBig2 = await startFakeOpenAIUpstream({ json: true });
+    const gw = await startGatewayWith([
+      {
+        id: 'dup', baseURL: 'http://127.0.0.1:' + upDup.port + '/v2', apiKey: UPSTREAM_KEY,
+        // 第一条（决定实际发上游 id 的那条）**没有** contextWindow；第二条才有
+        models: [
+          { id: 'test-model', as: 'test-model' },
+          { id: 'test-model-vision', as: 'test-model', contextWindow: 10, vision: true },
+        ],
+        priority: 1, enabled: true, protocol: 'openai-chat',
+      },
+      {
+        id: 'big2', baseURL: 'http://127.0.0.1:' + upBig2.port + '/v2', apiKey: UPSTREAM_KEY,
+        models: [{ id: 'test-model', as: 'test-model', contextWindow: 1000000 }],
+        priority: 2, enabled: true, protocol: 'openai-chat',
+      },
+    ], 'roomy-dup-as');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, body: { model: 'test-model', messages: [{ role: 'user', content: 'x'.repeat(20000) }] } });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(upBig2.st.calls, 1, '窗口 1M 的那家必须先被尝试，实际 ' + upBig2.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/装不下的候选排到最后/.test(logText),
+        '第二条映射声明的窗口也须生效（否则 roomy 静默失效）：' + logText.slice(-600));
+      assert.ok(/dup\(0K\)/.test(logText), '日志须点名 dup 被移动：' + logText.slice(-600));
+    } finally { killGw(gw); closeUp(upDup); closeUp(upBig2); }
+  });
+
+  t('网关（magpie roomy）：上游目录里的 context_length 会被学到并用上（学不到的家保持不可知，绝不猜）', async () => {
+    // 实测（2026-10-25，15 家启用家全扫）：只有 commandcode / commandcode-haiku / sensenova /
+    // amd 四家的 /v1/models 真带 context_length，其余 11 家只回 {id,object,created,owned_by}。
+    // 所以 roomy 的窗口来源两条：① 配置声明 ② 上游目录学（30 分钟缓存，后台、不阻塞启动）。
+    // 学不到就必须保持"不可知"—— 猜数字会让 roomy 把好模型永久排到最后，比不做更糟。
+    const upSmall3 = await startFakeUpstream({ catalog: [{ id: 'test-model', context_length: 10 }] });
+    const upBig3 = await startFakeUpstream({ catalog: [{ id: 'test-model', context_length: 1000000 }] });
+    const gw = await startGatewayWith([
+      // 两家都**没有**声明 contextWindow → 只能靠学
+      providerOf('learn-small', upSmall3, { priority: 1 }),
+      providerOf('learn-big', upBig3, { priority: 2 }),
+    ], 'roomy-learn', { DSH_GATEWAY_ROOMY: '1', DSH_GATEWAY_ROOMY_LEARN: '1', DSH_GATEWAY_ROOMY_LEARN_MS: '0' });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      // 等学习完成（后台任务，启动后 0ms 触发一次 fetch /models）。最多等 10s。
+      let learned = '';
+      for (let i = 0; i < 100; i++) {
+        learned = fs.readFileSync(gw.logPath, 'utf8');
+        if (/\[roomy\] 从上游目录学到 learn-small/.test(learned) && /\[roomy\] 从上游目录学到 learn-big/.test(learned)) break;
+        await sleep(100);
+      }
+      assert.ok(/\[roomy\] 从上游目录学到 learn-small/.test(learned),
+        '须从上游目录学到 learn-small 的窗口：' + learned.slice(-800));
+      assert.ok(/\[roomy\] 从上游目录学到 learn-big/.test(learned),
+        '须从上游目录学到 learn-big 的窗口：' + learned.slice(-800));
+
+      const r = await call({ port: gw.port, body: { model: 'test-model', messages: [{ role: 'user', content: 'x'.repeat(20000) }] } });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(upSmall3.st.calls, 0, '学到的窗口只有 10 tokens → 必须被排到最后，实际打了 ' + upSmall3.st.calls);
+      assert.strictEqual(upBig3.st.calls, 1, '学到的 1M 窗口那家必须先被尝试，实际 ' + upBig3.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/装不下的候选排到最后/.test(logText) && /learn-small\(0K\)/.test(logText),
+        '学到的窗口必须参与排序：' + logText.slice(-600));
+    } finally { killGw(gw); closeUp(upSmall3); closeUp(upBig3); }
+  });
+
+  t('网关（magpie roomy）：上游目录不带 context_length 时保持不可知 —— 绝不猜数字改变路由顺序', async () => {
+    // 这是上面那条的**反例保护**，也是本功能的红线：11/15 家上游目录都没有窗口字段。
+    // 若把"学不到"当成某个默认值（哪怕是很小或很大），这些家的相对顺序就会被动到，
+    // 而用户把某家放 priority 1 是有意的。所以学不到 → windowOf 返回 0 → roomy 不动作。
+    const upNA = await startFakeUpstream();   // 默认 catalog：[{ id: 'test-model' }]，无 context_length
+    const upNB = await startFakeUpstream();
+    const gw = await startGatewayWith([
+      providerOf('na-1', upNA, { priority: 1 }),
+      providerOf('na-2', upNB, { priority: 2 }),
+    ], 'roomy-noctx', { DSH_GATEWAY_ROOMY: '1', DSH_GATEWAY_ROOMY_LEARN: '1', DSH_GATEWAY_ROOMY_LEARN_MS: '0' });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      // 等到"学过了"的证据（学到了 0 条时**不打日志**，所以只能靠 modelsReqs 计数确认探测发生过）
+      let ok = false;
+      for (let i = 0; i < 100; i++) {
+        if (upNA.st.modelsReqs > 0 && upNB.st.modelsReqs > 0) { ok = true; break; }
+        await sleep(100);
+      }
+      assert.ok(ok, '两家都必须被探测过目录，实际 ' + upNA.st.modelsReqs + '/' + upNB.st.modelsReqs);
+      const r = await call({ port: gw.port, body: { model: 'test-model', messages: [{ role: 'user', content: 'x'.repeat(20000) }] } });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      assert.strictEqual(upNA.st.calls, 1, '目录不给窗口 → 顺序不得改变，priority 1 必须优先（实际 ' + upNA.st.calls + '）');
+      assert.strictEqual(upNB.st.calls, 0, 'priority 2 不该被用到（实际 ' + upNB.st.calls + '）');
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(!/装不下的候选排到最后/.test(logText), '窗口不可知时不得调整顺序：' + logText.slice(-600));
+      assert.ok(!/从上游目录学到 na-1/.test(logText), '目录没给窗口就不该声称学到了：' + logText.slice(-600));
+    } finally { killGw(gw); closeUp(upNA); closeUp(upNB); }
   });
 
   for (const { name, fn } of __tests) {
