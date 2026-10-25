@@ -7195,7 +7195,20 @@ function writeBlockedDump(provider, status, body) {
  *   ① **绝不能影响转发**：任何异常都被吞掉（统计是旁路，不是关键路径）；
  *   ② 只记**结构化的数字**，不记请求/响应正文（体积可控，也不碰隐私）。
  */
-const USAGE_KEEP_DAYS = 30;
+// ── 保留天数必须覆盖界面能选的最长期（2026-10-25 审计）──
+//
+// 旧值 30，而 `renderer/js/usage.js:226` 的天数按钮是 `[1, 7, 30, 90]`：
+// 用户点「90 天」，`src/usage.js` 老老实实按 90 天算 cutoff，但磁盘上超过 30 天的
+// 日文件早就被这里删掉了 —— 于是面板显示 90 天的数字，实际只统计到 30 天，
+// 而且**界面上没有任何提示**。这与 R10 修掉的 `dumpWorkbuddy11128` 死代码同族：
+// 功能承诺了一个范围，实现只给了一半。
+//
+// 取 90 对齐界面最长期；想更久就设环境变量（同时会超出现有界面能力，
+// 属"先存着以后用"，不是错误）。**下调要谨慎**：一旦删掉，历史就是真的没了。
+const USAGE_KEEP_DAYS = (() => {
+  const n = Number(process.env.DSH_GATEWAY_USAGE_KEEP_DAYS);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 90;
+})();
 
 function usageDir() {
   return process.env.DSH_GATEWAY_USAGE_DIR || path.join(path.dirname(LOG_PATH), 'usage');

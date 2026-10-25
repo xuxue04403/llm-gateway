@@ -454,6 +454,9 @@ const DECLARED = [
   { name: 'rotateFailed', why: '新增（审计 R8-4）：轮转失败只报一次，避免文件被占用时每 10 秒刷一条 WARN 把日志撑爆' },
   { name: 'dumpWorkbuddy11128', why: '接线（审计 R8-1）：该函数从引入起就没被调用过（git log --all -S 只有引入那一次），但引擎注释、日志与 README 排错表**四处**都在承诺"开 DSH_GATEWAY_DUMP_WB11128=1 就能转储比对" —— 用户照做时一个字节都不会落盘，且没有任何提示，偏偏发生在唯一还在猫鼠游戏里的功能上。现在直通 forward() 与翻译 forwardAnthropicViaOpenAI() 两处 11128 分支各补一行调用（同一判定两处实现的老坑）' },
 
+  // ---- 审计 R11：用量保留天数与界面区间对齐 ----
+  { name: 'USAGE_KEEP_DAYS', why: '改动（审计 R11）：保留期从写死的 30 天改为「默认 90 天 + DSH_GATEWAY_USAGE_KEEP_DAYS 可覆盖」。缺陷形态与 R10 修掉的 dumpWorkbuddy11128 死代码同族、都是"承诺了一个范围，实现只给了一半"：`renderer/js/usage.js:226` 的天数按钮是 [1, 7, 30, 90]，`src/usage.js:157` 老老实实按 90 天算 cutoff，但磁盘上超过 30 天的日文件早被 pruneUsageFiles 删掉了 —— 用户点「90 天」看到的是"最近 90 天"的数字，实际只统计到 30 天，而界面上没有任何提示。取 90 对齐界面最长期；允许调大（属"先存着以后用"），下调要谨慎因为删掉就真没了' },
+
   // ⚠ 待办：本清单在 v1.0.7 之后就没再维护，v1.0.8–v1.0.17 的改动（OpenCode 车道、
   //   出口轮换等）大量未登记，`node scripts/check-engine-parity.mjs`
   //   因此恒报 FAIL（本次改动之前就已经是红的）。这是清单腐烂，不是功能回退，

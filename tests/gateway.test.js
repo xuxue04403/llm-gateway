@@ -7320,6 +7320,103 @@ let upstreamPort = 0;
     }
   });
 
+  t('网关（审计 R11）：用量保留天数必须覆盖界面能选的最长期（90 天）—— 否则「90 天」是个谎', async () => {
+    // 缺陷形态：`renderer/js/usage.js:226` 的天数按钮是 `[1, 7, 30, 90]`，
+    // 而引擎 `USAGE_KEEP_DAYS` 原来是 30 —— 用户点「90 天」，`src/usage.js` 老老实实按
+    // 90 天算 cutoff，但磁盘上超过 30 天的日文件早被 pruneUsageFiles 删掉了。
+    // 于是面板显示"最近 90 天"的数字，实际只统计到 30 天，**界面上没有任何提示**。
+    // 与 R10 修掉的 dumpWorkbuddy11128 死代码同族：承诺了一个范围，实现只给了一半。
+    //
+    // 这条用例的两半都很关键：
+    //   ① 60 天前的文件**必须还在**（旧实现会删掉它）—— 这是缺陷回归钉。
+    //   ② 把 DSH_GATEWAY_USAGE_KEEP_DAYS 显式设成 30 时，60 天前的文件**必须被删** ——
+    //      证明"没删"不是因为它压根没跑（那条清理逻辑每天只跑一次，第一次请求就会跑）。
+    const up = await startFakeUpstream({ status: 200 });
+
+    // 按引擎 usageFileFor 的口径生成日期文件名（本地日期，YYYY-MM-DD）
+    const dayFile = (daysAgo) => {
+      const d = new Date(Date.now() - daysAgo * 86400_000);
+      const day = d.getFullYear() + '-'
+        + String(d.getMonth() + 1).padStart(2, '0') + '-'
+        + String(d.getDate()).padStart(2, '0');
+      return day + '.jsonl';
+    };
+    const row = (model) => JSON.stringify({
+      ts: Date.now(), model, provider: 'x', endpoint: '/v1/chat/completions',
+      status: 'ok', stream: 0, durMs: 1, ttfbMs: 1,
+      inTok: 1, outTok: 1, cacheRead: 0, cacheWrite: 0,
+    }) + '\n';
+
+    // 造一个已经存了 60 天前与 5 天前两份的用量目录
+    const seedUsageDir = () => {
+      const dir = fs.mkdtempSync(path.join(tmp, 'usage-keep-'));
+      fs.writeFileSync(path.join(dir, dayFile(60)), row('old-model'), 'utf8');
+      fs.writeFileSync(path.join(dir, dayFile(5)), row('recent-model'), 'utf8');
+      return dir;
+    };
+
+    // ⚠ 时序：recordUsage 是**在 `res.end()` 之后**才落盘的（记账不能挡在客户端前面），
+    // 而 `call()` 在客户端收完响应体就返回 —— 此时服务端可能还没执行到 appendFileSync。
+    // 第一版没等，断言直接拿到 `["2026-08-26.jsonl","2026-10-20.jsonl"]`（今天那份还没写），
+    // 报错看起来像"记账坏了"，其实是测试把进程杀早了。
+    // 清理（pruneUsageFiles）又发生在 append **之后**，所以两种等待要分开：
+    //   ① 等"今天那份"出现 → 证明 recordUsage 跑过；
+    //   ② 再等 60 天前那份消失 → 证明 prune 跑过（只有 KEEP_DAYS=30 时才等它）。
+    const waitFor = async (fn, ms, msg) => {
+      const until = Date.now() + ms;
+      while (Date.now() < until) {
+        if (fn()) return true;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      if (fn()) return true;
+      throw new Error(msg);
+    };
+
+    try {
+      // ---- ① 默认保留期：60 天前的那份不能被删 ----
+      {
+        const usageDir = seedUsageDir();
+        const gw = await startGatewayWith([providerOf('keep-a', up)], 'usagekeep-default',
+          { DSH_GATEWAY_USAGE_DIR: usageDir }, {});
+        try {
+          const r = await call({
+            port: gw.port, p: '/v1/chat/completions',
+            body: { model: 'test-model', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+          });
+          assert.strictEqual(r.status, 200, '请求应成功（保证 recordUsage 真的跑到了）：' + r.text.slice(0, 200));
+          await waitFor(() => fs.existsSync(path.join(usageDir, dayFile(0))), 3000,
+            '这次调用应写出今天的用量文件，目录里只有：' + JSON.stringify(fs.readdirSync(usageDir)));
+        } finally { killGw(gw); }
+
+        assert.ok(fs.existsSync(path.join(usageDir, dayFile(60))),
+          '默认保留期必须覆盖 90 天（界面能给的最长期），60 天前的用量文件被删了：'
+          + JSON.stringify(fs.readdirSync(usageDir)));
+        assert.ok(fs.existsSync(path.join(usageDir, dayFile(5))), '5 天前的文件当然要留着');
+      }
+
+      // ---- ② 显式设成 30 天时，60 天前的那份必须被删（证明清理逻辑真的会跑）----
+      {
+        const usageDir = seedUsageDir();
+        const gw = await startGatewayWith([providerOf('keep-b', up)], 'usagekeep-30',
+          { DSH_GATEWAY_USAGE_DIR: usageDir, DSH_GATEWAY_USAGE_KEEP_DAYS: '30' }, {});
+        try {
+          const r = await call({
+            port: gw.port, p: '/v1/chat/completions',
+            body: { model: 'test-model', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+          });
+          assert.strictEqual(r.status, 200, '请求应成功：' + r.text.slice(0, 200));
+          await waitFor(() => !fs.existsSync(path.join(usageDir, dayFile(60))), 3000,
+            '设成 30 天时 60 天前的文件必须被清掉（否则①的"还在"证明不了任何事）：'
+            + JSON.stringify(fs.readdirSync(usageDir)));
+        } finally { killGw(gw); }
+
+        assert.ok(fs.existsSync(path.join(usageDir, dayFile(5))), '5 天前的文件不在清理范围内');
+      }
+    } finally {
+      closeUp(up);
+    }
+  });
+
   for (const { name, fn } of __tests) {
     await fn();
     passed++;
