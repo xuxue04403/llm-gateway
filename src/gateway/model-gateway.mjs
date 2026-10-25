@@ -1983,6 +1983,391 @@ function breakerCooldownSecs(providers, model) {
  * 要彻底消除只能后台恢复探测（需额外的上游请求或 /models 探测，后者被不少中转拒绝），属后续可选项。
  */
 
+/* ==================== magpie 吸收（2026-10-25）====================
+ * 参照 `yetone/magpie`（21.1k★，Go，`internal/gateway/`）里按"病人"拆出来的小模块，挑三个搬过来：
+ *   ① loop_guard  —— 答复陷进重复单元时切断（`loop_guard.go`，magpie issue #1359：
+ *      DeepSeek 的 reasoning 反复输出 "Now." "Writing." "Go." 直到 token 上限）。
+ *   ② tool_loop   —— 同一批工具调用连着重复 N 轮 → 网关本地作答、一个上游请求都不发
+ *      （`tool_loop.go`：Codex 在 WorkBuddy 上半小时读同一段代码 308 次，白烧 537 credits）。
+ *   ③ roomy       —— 发送前按候选声明的 `contextWindow` 把"装不下这次请求"的候选排到最后
+ *      （`fallback.go` 的 `roomy`；从前把 200K 的免费档排在 1M 的订阅前面时，第一个必然白拒一次）。
+ *
+ * 两个**评估过但不落地**的，理由写在这里，免得下次从头再评一遍：
+ *   · `probeOne`/`restLast` —— magpie 让"冷却中的候选排到最后，每个请求只问最先复活的那一个"。
+ *     本工程 2026-09-17 明确否掉过同一件事（见上面 `probeFull` 那段注释：备选一直可用时首选家
+ *     恢复后再不被用到 = 静默改变优先级语义），且现有回归用例锁死"熔断期内一次上游请求都不打"
+ *     这条对用户账号的承诺。要上必须先推翻这两条决定，不是加个开关的事。
+ *   · `patience`/`replan` —— 全候选瞬时失败时，在同一请求内暂停 → 重排 → 重试。
+ *     落地必须把 `handleCompletion` 与 `handleMessages` 两个主循环各改成"轮次循环"（本项目
+ *     "同一判定两处实现"的老坑），且暂停期保活要往客户端写 SSE 注释 —— 而写注释就会让
+ *     `headersSent` 变真、彻底堵死 failover。两者都要动主循环骨架，留作独立一轮。
+ */
+/**
+ * 三个开关的缺省值：**全开**。
+ *
+ * 与 `maxTools` 不同（那个默认关，因为它会改变上游可见的工具集），这三项都不改变"发给上游什么"：
+ * loop_guard 只是提前止损、tool_loop 拦下的是"本来必然白烧钱"的请求、roomy 只是调换尝试顺序。
+ * 关掉它们的理由只有"怀疑是它们错了"，所以开关留着但默认开。
+ */
+const DEFAULT_LOOP_GUARD = true;
+const DEFAULT_TOOL_LOOP = true;
+const DEFAULT_ROOMY = true;
+/** 由 startServer 从 cfg 初始化（forward()/handleXxx 拿不到 cfg 时的模块级持有）。 */
+let ACTIVE_LOOP_GUARD = DEFAULT_LOOP_GUARD;
+let ACTIVE_TOOL_LOOP = DEFAULT_TOOL_LOOP;
+let ACTIVE_ROOMY = DEFAULT_ROOMY;
+
+/** 三态布尔：配置里写 true/false/"on"/"off"/1/0 都认；未设 → 用缺省值。 */
+function cfgBool(v, dflt) {
+  if (v === undefined || v === null || v === '') return dflt;
+  if (typeof v === 'boolean') return v;
+  const s = String(v).trim().toLowerCase();
+  if (s === '0' || s === 'off' || s === 'false' || s === 'no' || s === 'disabled') return false;
+  if (s === '1' || s === 'on' || s === 'true' || s === 'yes' || s === 'enabled') return true;
+  return dflt;
+}
+
+const LOOP_WINDOW = 256;       // 滚动窗口里的单元数（magpie loopWindow）
+const LOOP_DISTINCT = 24;      // 窗口内不同单元 ≤ 这个数即判循环（magpie loopDistinct）
+const LOOP_UNIT_MAX = 4096;    // 单个单元最长；超长整段当单元（防"无断行重复"漏判）
+
+/** 这个单元里有没有"词"：magpie 用 `0x00`、`v2`、纯 hash 不算单元 —— 否则表格/日志类正文会误判。 */
+function loopUnitHasWord(s) {
+  for (const t of String(s).split(/[^\p{L}]+/u)) if (t && !/\d/.test(t)) return true;
+  return false;
+}
+
+/** 单元归一：折叠空白、去尾部标点、小写、截断（与 magpie 的 `unitKey` 同口径）。 */
+function loopUnitKey(raw) {
+  const s = String(raw).replace(/\s+/g, ' ').trim().replace(/[\s.,;:!?。！？、,;:]+$/u, '').toLowerCase();
+  return s.length > LOOP_UNIT_MAX ? s.slice(0, LOOP_UNIT_MAX) : s;
+}
+
+/**
+ * 造一个"循环守卫"：把流式增量正文一片片喂进来，判出循环时返回一段可操作的文案，否则 null。
+ *
+ * 为什么是增量而不是等流结束：循环动辄几百个单元、跑到 token 上限才停 —— 等结束再判等于钱已经烧完。
+ * 为什么窗口 256 / 不同单元 ≤24：正常答复（含代码、表格）在 256 个单元里通常有上百种不同单元；
+ * 真的陷进循环时只剩个位数（实测 DeepSeek 那种只有 "Now." "Writing." "Go." 三四种）。
+ */
+function makeLoopGuard() {
+  const counts = new Map();
+  const ring = new Array(LOOP_WINDOW).fill(null);
+  let at = 0;
+  let seen = 0;
+  let cur = '';
+  let justEnded = false;
+
+  const tripMessage = () => {
+    const top = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
+    return '模型陷进了重复（最近 ' + LOOP_WINDOW + ' 个片段里只有 ' + counts.size + ' 种内容，'
+      + '最常见的是：' + top.map(([k, c]) => `"${k.slice(0, 40)}"×${c}`).join('、')
+      + '）。网关已替你切断，避免继续按 token 计费；重试一次通常就正常，'
+      + '反复出现请换模型或换供应商。';
+  };
+
+  const add = (raw) => {
+    if (!loopUnitHasWord(raw)) return null;
+    const key = loopUnitKey(raw);
+    if (!key) return null;
+    const prev = ring[at];
+    if (prev !== null) {
+      const c = counts.get(prev);
+      if (c !== undefined) { if (c <= 1) counts.delete(prev); else counts.set(prev, c - 1); }
+    }
+    ring[at] = key;
+    at = (at + 1) % LOOP_WINDOW;
+    if (seen < LOOP_WINDOW) seen += 1;
+    counts.set(key, (counts.get(key) || 0) + 1);
+    if (seen >= LOOP_WINDOW && counts.size <= LOOP_DISTINCT) return tripMessage();
+    return null;
+  };
+
+  const flushUnit = () => { const u = cur; cur = ''; return add(u); };
+
+  return {
+    /** @returns {string|null} 判出循环返回文案，否则 null。 */
+    feed(delta) {
+      const s = String(delta || '');
+      if (!s) return null;
+      for (const ch of s) {
+        // 上一字符是句末标点、这一字符是空白 → 单元在标点处结束（"Step. 1" 这类不会被切开）
+        if (justEnded && /\s/.test(ch)) { const t = flushUnit(); if (t) return t; }
+        justEnded = (ch === '.' || ch === '!' || ch === '?');
+        if (ch === '\n' || ch === '。' || ch === '！' || ch === '？') {
+          cur += ch;
+          const t = flushUnit();
+          justEnded = false;
+          if (t) return t;
+          continue;
+        }
+        cur += ch;
+        if (cur.length >= LOOP_UNIT_MAX) { const t = flushUnit(); if (t) return t; }
+      }
+      return null;
+    },
+  };
+}
+
+/**
+ * 从一帧 SSE JSON 里取出**正文**增量（不含 reasoning），四协议统一口径。
+ *
+ * 与 `makeStreamDecoder` 的分工：解码器要还原"完整语义"（工具调用槽位、用量、结束原因），
+ * 而这里只关心"有没有重复" —— 因此只认正文，且认不出的形状安静返回空串。
+ * reasoning 一律**不取**：模型反复权衡同一个决定时 reasoning 天然高重复，
+ * 拿它判会切断正常回复（这条边界是 magpie 用 `think`/`text` 两路分开跑验证过的）。
+ */
+function loopGuardWordsOf(json) {
+  if (!json || typeof json !== 'object') return '';
+  // ① Anthropic：content_block_delta 的 text_delta
+  if (json.type === 'content_block_delta') {
+    const d = json.delta;
+    return (d && d.type === 'text_delta' && typeof d.text === 'string') ? d.text : '';
+  }
+  // ② Responses：response.output_text.delta
+  if (json.type === 'response.output_text.delta' && typeof json.delta === 'string') return json.delta;
+  // ③ Chat Completions：choices[].delta.content
+  if (Array.isArray(json.choices)) {
+    let out = '';
+    for (const c of json.choices) {
+      const d = c && c.delta;
+      if (d && typeof d.content === 'string') out += d.content;
+    }
+    return out;
+  }
+  // ④ Gemini：candidates[].content.parts[].text（thought:true 的部件跳过）
+  if (Array.isArray(json.candidates)) {
+    let out = '';
+    for (const c of json.candidates) {
+      const parts = c && c.content && c.content.parts;
+      if (!Array.isArray(parts)) continue;
+      for (const pt of parts) {
+        if (pt && pt.thought) continue;
+        if (pt && typeof pt.text === 'string') out += pt.text;
+      }
+    }
+    return out;
+  }
+  return '';
+}
+
+const TOOL_LOOP_REPEATS = 8;   // 连续 N 轮工具交换完全相同 → 判死循环（magpie toolLoopRepeats）
+const TOOL_LOOP_TAIL = 64;     // 只看对话最后 64 条（magpie tailItems = 8*8）
+
+/** 抹掉"每轮都会变但语义无关"的运行噪声（magpie `steadyResult` 同口径），否则永远判不出重复。 */
+const TOOL_NOISE_RES = [
+  /\bWall time:\s*[0-9.]+\s*seconds?/gi,
+  /\bChunk ID:\s*\S+/gi,
+  /"duration_seconds"\s*:\s*[0-9.]+/gi,
+];
+
+function steadyText(s) {
+  let t = String(s === undefined || s === null ? '' : s);
+  for (const re of TOOL_NOISE_RES) t = t.replace(re, '#');
+  return t.length > 4096 ? t.slice(0, 4096) + '…#(' + t.length + ')' : t;
+}
+
+/** 稳定序列化：JSON 键重排 —— 两轮写法不同（键序不同）也该算"同一个调用"。 */
+function stableJson(v) {
+  if (v === null || v === undefined || typeof v !== 'object') return JSON.stringify(v === undefined ? null : v);
+  if (Array.isArray(v)) return '[' + v.map(stableJson).join(',') + ']';
+  return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + stableJson(v[k])).join(',') + '}';
+}
+
+function maybeJson(s) {
+  if (typeof s !== 'string') return s;
+  try { return JSON.parse(s); } catch { return s; }
+}
+
+function fnv1a(s) {
+  let h = 0x811c9dc5;
+  const t = String(s);
+  for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h >>> 0;
+}
+
+/**
+ * 把三种协议的对话尾部归一成"工具交换序列"：`[{ callsKey, resultsKey, hash }]`。
+ * 归一的重要性：magpie 只用 gjson 取尾部、不解码整体；这里同样只处理尾部切片，
+ * 因为 1.5MB 的轮次每轮解一遍会吃掉几十毫秒（magpie 修过这条）。
+ */
+function toolExchanges(body, wire) {
+  let list = null;
+  if (wire === 'openai-responses') {
+    const input = body && body.input;
+    if (Array.isArray(input)) list = input;
+    else if (typeof input === 'string') list = [{ role: 'user', content: input }];
+  } else {
+    list = (body && Array.isArray(body.messages)) ? body.messages : null;
+  }
+  if (!Array.isArray(list) || list.length === 0) return [];
+  const tail = list.slice(-TOOL_LOOP_TAIL);
+  const out = [];
+  let pending = null;   // 最近一组助手发起的工具调用
+
+  const callsOf = (m) => {
+    const calls = [];
+    if (wire === 'openai-responses') {
+      if (m && m.type === 'function_call') calls.push({ name: m.name || '', args: maybeJson(m.arguments) });
+      return calls;
+    }
+    if (Array.isArray(m && m.tool_calls)) {
+      for (const c of m.tool_calls) calls.push({ name: (c && c.function && c.function.name) || '', args: maybeJson(c && c.function && c.function.arguments) });
+    }
+    if (Array.isArray(m && m.content)) {
+      for (const b of m.content) {
+        if (b && b.type === 'tool_use') calls.push({ name: b.name || '', args: b.input });
+      }
+    }
+    return calls;
+  };
+
+  const resultsOf = (m) => {
+    const res = [];
+    if (wire === 'openai-responses') {
+      if (m && m.type === 'function_call_output') res.push(m.output);
+      return res;
+    }
+    if (m && m.role === 'tool') {
+      const c = m.content;
+      res.push(Array.isArray(c) ? c.map((x) => (x && x.text) || '').join('') : c);
+      return res;
+    }
+    if (Array.isArray(m && m.content)) {
+      for (const b of m.content) {
+        if (b && b.type === 'tool_result') {
+          const c = b.content;
+          res.push(Array.isArray(c) ? c.map((x) => (x && x.text) || '').join('') : c);
+        }
+      }
+    }
+    return res;
+  };
+
+  for (const m of tail) {
+    const calls = callsOf(m);
+    if (calls.length) { pending = calls; continue; }
+    const results = resultsOf(m);
+    if (results.length && pending) {
+      const callsKey = pending.map((c) => (c.name || '') + ':' + stableJson(c.args)).sort().join('|');
+      const resultsKey = results.map((r) => steadyText(typeof r === 'string' ? r : JSON.stringify(r))).sort().join('|');
+      out.push({ callsKey, resultsKey, hash: fnv1a(callsKey + '#' + resultsKey), names: pending.map((c) => c.name || '') });
+      pending = null;
+    }
+  }
+  return out;
+}
+
+/**
+ * 判"工具死循环"：最后 TOOL_LOOP_REPEATS 轮交换完全一样 → 返回详情，否则 null。
+ *
+ * 为什么在请求体上判而不是在流里判：每一轮都把整段对话带上，循环在**请求体里**就看得见 ——
+ * 等到上游回话再判，那一轮的钱已经花了（magpie 现场：半小时 308 次、537 credits）。
+ */
+function detectToolLoop(body, wire) {
+  const ex = toolExchanges(body, wire);
+  if (ex.length < TOOL_LOOP_REPEATS) return null;
+  const last = ex.slice(-TOOL_LOOP_REPEATS);
+  const h = last[0].hash;
+  if (!last.every((e) => e.hash === h)) return null;
+  return { repeats: lenOfRepeats(ex, h), names: last[0].names, callsKey: last[0].callsKey };
+}
+
+/** 往前数到底重复了多少轮（文案里给真实数字，比只说"8 次"更有说服力）。 */
+function lenOfRepeats(ex, hash) {
+  let n = 0;
+  for (let i = ex.length - 1; i >= 0 && ex[i].hash === hash; i--) n += 1;
+  return n;
+}
+
+function toolLoopNotice(info) {
+  return '网关拦下了一个死循环：agent 已经连续 ' + info.repeats + ' 次发起**同一批**工具调用'
+    + '（' + (info.names.filter(Boolean).slice(0, 3).join('、') || '未命名') + '），每次结果也完全一样。'
+    + '这一轮没有再发给模型，也没有消耗任何额度。\n\n'
+    + '通常意味着：① 工具返回的内容没有变化，agent 在等一个不会到来的变化；'
+    + '② 命令行里的超时/分页/等待参数没有生效。请检查这一步的工具输出，换个做法再试。';
+}
+
+/** 本地作答：非流式响应体（三种客户端协议各一份形状）。 */
+function localWholeBody(wire, model, text) {
+  const outTok = estimateTokens(text);
+  const id = 'msg_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
+  if (wire === 'anthropic-messages') {
+    return {
+      id, type: 'message', role: 'assistant', model,
+      content: [{ type: 'text', text }],
+      stop_reason: 'end_turn', stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: outTok },
+    };
+  }
+  if (wire === 'openai-responses') {
+    return {
+      id: 'resp_' + crypto.randomUUID().replace(/-/g, '').slice(0, 20),
+      object: 'response', status: 'completed', model,
+      output: [{ id: 'msg_local', type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text, annotations: [] }] }],
+      usage: { input_tokens: 0, output_tokens: outTok, total_tokens: outTok },
+    };
+  }
+  return {
+    id: 'chatcmpl-' + crypto.randomUUID().replace(/-/g, '').slice(0, 20),
+    object: 'chat.completion', created: Math.floor(Date.now() / 1000), model,
+    choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 0, completion_tokens: outTok, total_tokens: outTok },
+  };
+}
+
+/** 本地作答：走与转发同一套协议编码器（三协议共用一份实现，绝不另写一份 SSE 拼装）。 */
+function serveLocalAnswer(res, wire, model, text) {
+  try {
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      'access-control-allow-origin': '*',
+    });
+  } catch { return false; }
+  const enc = makeStreamEncoder(wire, { res, model, inputTokens: 0 });
+  enc.emit([{ t: 'text', d: text }, { t: 'stop', r: 'stop' }]);
+  enc.finish();
+  try { res.end(); } catch { /* 客户端可能已断开 */ }
+  return true;
+}
+
+/** 该候选声明的上下文窗口（逻辑模型名口径）；不可知返回 0。 */
+function windowOf(provider, model) {
+  const hit = modelEntries(provider).find((e) => e.as === model);
+  return (hit && Number.isFinite(hit.contextWindow) && hit.contextWindow > 0) ? hit.contextWindow : 0;
+}
+
+/**
+ * `roomy`：把"装不下这次请求"的候选排到最后（**不删除**）。
+ *
+ * 与 magpie 的差别，以及为什么这样更好落地：magpie 把装不下的候选**移出候选表**，
+ * 只在"最后一个装得下的候选因额度/余额失败且此前无别的失败"时才回补。那套"回补"要在主循环
+ * 里维护状态。本工程直接把它们**排在最后**：主循环按序尝试，装得下的先跑；全都失败后自然轮到
+ * 它们 —— 语义等价（它们本来就是最后手段），实现上零状态、零回补分支。
+ *
+ * 四条"什么都不做"的边界（与 magpie 一致）：窗口不可知 / 体解析不出 / 只有一个候选 / 没有候选装得下。
+ */
+function roomyOrder(eligible, model, body) {
+  if (!Array.isArray(eligible) || eligible.length < 2) return null;
+  let est = 0;
+  try { est = roughTokens(body); } catch { return null; }
+  if (!(est > 0)) return null;
+  const fits = [];
+  const tooBig = [];
+  for (const p of eligible) {
+    const win = windowOf(p, model);
+    if (win > 0 && win < est) tooBig.push({ p, win });
+    else fits.push(p);
+  }
+  if (tooBig.length === 0) return null;   // 没有装不下的 → 顺序不动（零成本路径）
+  if (fits.length === 0) return null;     // 没有一家装得下 → 照旧，让上游自己报 too long
+  return {
+    order: [...fits, ...tooBig.map((x) => x.p)],
+    est,
+    moved: tooBig.map((x) => `${x.p.id}(${Math.round(x.win / 1000)}K)`),
+  };
+}
 
 // V1 防封：日志脱敏——catalog/上游错误体可能回显 key，统一打码各类凭证片段
 // R25（审计）：补 Bearer/JWT(eyJ)/统一网关 key（dsh-gateway-）与 api-key 头形态
@@ -7585,6 +7970,38 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
   const TAIL_MAX = 8192;
   let tail = '';
   let truncated = false;
+  // ── loop_guard（2026-10-25，吸收自 magpie `loop_guard.go`）──
+  // 直通路径是字节透明的（不解析整条流），所以这里要单独做一件事：从 SSE 帧里
+  // **只取正文增量**喂给守卫。不做通用 JSON 解析，而是按三种协议的固定片段定位，
+  // 理由是这条路径上每帧都要跑一次，能用 indexOf 就不用 JSON.parse
+  //（magpie 也是同口径：没有 `delta`/`candidates` 字节的事件**直接跳过不解析**）。
+  const loopGuard = ACTIVE_LOOP_GUARD ? makeLoopGuard() : null;
+  let loopText = '';
+  let loopSseBuf = '';
+  /** 从一段 SSE 文本里抽取正文增量（三协议），喂给守卫；命中返回文案。 */
+  const feedLoopGuard = (chunk) => {
+    if (!loopGuard) return null;
+    loopSseBuf += chunk;
+    // 只保留最后不完整的一段，避免缓冲无界增长
+    let nl = loopSseBuf.lastIndexOf('\n');
+    if (nl < 0) { if (loopSseBuf.length > 1 << 20) loopSseBuf = ''; return null; }
+    const ready = loopSseBuf.slice(0, nl + 1);
+    loopSseBuf = loopSseBuf.slice(nl + 1);
+    for (const line of ready.split('\n')) {
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === '[DONE]') continue;
+      // 便宜的预筛：这一帧里没有正文关键字就整帧跳过（绝大多数帧是元数据帧）
+      if (payload.indexOf('delta') < 0 && payload.indexOf('"parts"') < 0) continue;
+      let json = null;
+      try { json = JSON.parse(payload); } catch { continue; }
+      const words = loopGuardWordsOf(json);
+      if (!words) continue;
+      const t = loopGuard.feed(words);
+      if (t) return t;
+    }
+    return null;
+  };
   const TERMINAL_RES = [
     // anthropic：`message_stop` 是显式结束帧；但**不少中转省略它**，
     // 只给 `message_delta` 里的 `stop_reason` —— 那也是"上游说完了"。
@@ -7813,6 +8230,20 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     // 截断检测的尾部窗口也要吃进这一口 —— 否则"整个流只有首事件"这种
     // 极短响应（偷看把全部字节都读进 pendingHead）会被误判成截断。
     try { tail = (tail + pendingHead.toString('utf8')).slice(-TAIL_MAX); } catch { /* 忽略 */ }
+    // ── loop_guard 也必须吃这一口（2026-10-25 实测踩到）──
+    // 上游把一个**很短的流**整条塞进一个 TCP 分片时，"偷看首事件"会把**全部字节**读进
+    // pendingHead，紧接着在下面对客户端一次性写出，随后 `reader.read()` 直接 `done` ——
+    // 读循环里的守卫**一次都不会被调用**。实测：300 个 "Now.\n" 的 SSE 整条 21KB 一次到达，
+    // 守卫全程没跑，客户端照样收满 300 帧（"我以为装了守卫"）。
+    // 因此这里必须在写出之前补喂一次；命中时照样把 pendingHead 原样写出去（字节透明），
+    // 只把 loopText 立起来，交给下面的收尾分支补错误事件。
+    if (loopGuard && !loopText) {
+      const t = feedLoopGuard(pendingHead.toString('utf8'));
+      if (t) {
+        loopText = t;
+        log(`[loop] 直通路径（${provider.id}）：答复陷进重复（整条流在首个分片内就已判出）→ 主动切断：${t}`);
+      }
+    }
     if (opts && typeof opts.onSniff === 'function') {
       try { opts.onSniff(pendingHead.toString('utf8')); } catch { /* 忽略 */ }
     }
@@ -7892,6 +8323,17 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
             if (sniff.fn(sniff.text) === true || sniff.text.length >= SNIFF_MAX) sniff = null;
           } catch { sniff = null; }   // 嗅探失败绝不影响转发
         }
+        // loop_guard：必须在下面的 res.write **之前**判 —— 这一片一旦写出去，
+        // "切断"就只能靠客户端重试了，而这一片往往正是第 257 个重复单元。
+        // 命中后先把已读的这一片仍写出去（客户端看到的内容与上游发的完全一致），再跳出循环收尾。
+        if (loopGuard && !loopText) {
+          const t = feedLoopGuard(Buffer.from(value).toString('utf8'));
+          if (t) {
+            loopText = t;
+            log(`[loop] 直通路径（${provider.id}）：答复陷进重复 → 主动切断`
+              + `（已转发 ${tail.length} 字节尾部窗口）：${t}`);
+          }
+        }
         // 客户端可能随时断开（点停止/超时/关页）：write 抛 EPIPE 必须捕获，
         // 否则未处理异常会经 async 回调炸掉整个网关进程（C1）
         try {
@@ -7913,6 +8355,9 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
           clearInterval(idleTimer);
           return false;
         }
+        // 循环守卫已命中：这一片已经照原样写给客户端了，但没必要再读上游 ——
+        // 继续读只会把更多重复内容灌进客户端（还按 token 计费）。取消 reader 让上游尽快放手。
+        if (loopText) { try { await reader.cancel(); } catch { } break; }
       }
     } catch (readErr) {
       // 上游流异常：断开客户端，避免悬挂
@@ -7956,9 +8401,32 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     try { if (opts && typeof opts.onFirstEmpty === 'function') opts.onFirstEmpty(); } catch { /* 忽略 */ }
     return false;
   }
+  // ── loop_guard 命中：我们**主动**切断的，文案必须与"上游腰斩"分开 ──
+  // 两者都让 `truncated = true`（客户端拿到的都是不完整回复），但原因天差地别：
+  // 说成"上游被中断"会让用户去查网络，而真相是模型在重复、重试或换模型才对。
+  // 位置在"零交付"检查**之后**：真的一个字节都没发出去时仍应 failover（那条路更优）。
+  if (loopText) {
+    log(`直通路径：已按循环守卫切断（${provider.id}）→ 明确告知客户端"模型在重复"`);
+    try {
+      if (clientWire === 'anthropic-messages') {
+        res.write('event: error\ndata: ' + JSON.stringify({ type: 'error', error: { type: 'api_error', message: loopText } }) + '\n\n');
+        res.write('event: message_stop\ndata: ' + JSON.stringify({ type: 'message_stop' }) + '\n\n');
+      } else if (clientWire === 'openai-responses') {
+        res.write('event: response.failed\ndata: ' + JSON.stringify({
+          type: 'response.failed',
+          response: { id: 'resp_loop', object: 'response', status: 'failed', error: { code: 'loop_detected', message: loopText } },
+        }) + '\n\n');
+      } else {
+        res.write('data: ' + JSON.stringify({ error: { message: loopText, type: 'loop_detected' } }) + '\n\n');
+        res.write('data: [DONE]\n\n');
+      }
+    } catch { /* 客户端已断开 */ }
+    truncated = true;
+  }
   // ⚠ 上游被干净腰斩 → 明确告知客户端，别让它以为答完了（见上面 tail 的说明）。
   // 响应头与部分内容**已经发出**，所以不能改状态码，只能补一个协议内的错误事件。
-  if (isSseStream() && !tailHasTerminal()) {
+  // `!loopText`：上面已经按"模型在重复"收过尾了，再补一条"上游被中断"会自相矛盾。
+  if (!loopText && isSseStream() && !tailHasTerminal()) {
     log(`直通路径：上游流被截断（${provider.id}）：尾部未出现任何终止标记`
       + `（message_stop / [DONE] / response.completed）—— 已转发 ${tail.length} 字节尾部窗口；`
       + '明确告知客户端"回复不完整"');
@@ -9218,6 +9686,12 @@ async function pumpMatrixStream({ res, upstream, upstreamWire, clientWire, model
   let sawEnd = false;
   // 上游有没有给出"答完了"的语义（见 flush 里的说明）
   let sawStop = false;
+  // loop_guard（见 flush 里的说明）
+  const guard = ACTIVE_LOOP_GUARD ? makeLoopGuard() : null;
+  let loopTripped = false;
+  let loopText = '';
+  // 编码器不对外暴露已发正文长度：这里自己数一份，只用于日志文案
+  let textChars = 0;
 
   // ⚠ 必须做成**可重复调用**的：forward 里的"首事件偷看"会把开头那段（对流式短响应来说
   // 往往就是**全部**）先读进 headBytes，于是下面的 read 循环第一次就拿到 done:true ——
@@ -9252,6 +9726,30 @@ async function pumpMatrixStream({ res, upstream, upstreamWire, clientWire, model
       // 漏掉这个形态会把一条**完全正常**的回复判成"上游被腰斩"
       //（审计实测：非流式还会因此触发 failover，变成 503）。
       if (json && json.usage && !(Array.isArray(json.choices) && json.choices.length)) sawStop = true;
+      // ── loop_guard（2026-10-25，吸收自 magpie `loop_guard.go`）──
+      // 位置在 `encoder.emit` **之前**：emit 之后这一片就已经在客户端屏幕上了，
+      // 再切断只能让用户看到"半句话 + 错误"。这里先判，命中就换成错误事件收尾。
+      // 只喂 canonical 事件里的 `text`（`{t:'text', d}`）—— reasoning 不喂，理由同
+      // translateOpenAIStreamToAnthropic 里那段注释。
+      if (guard) {
+        for (const e of evs) {
+          if (!e || e.t !== 'text' || !e.d) continue;
+          textChars += String(e.d).length;
+          const t = guard.feed(e.d);
+          if (t) { loopText = t; loopTripped = true; break; }
+        }
+      } else {
+        for (const e of evs) if (e && e.t === 'text' && e.d) textChars += String(e.d).length;
+      }
+      if (loopTripped) {
+        // flush() 是同步的（它只解析缓冲区），所以这里只做"收尾 + 立旗子"；
+        // 真正取消上游读取交给下面的读循环 —— 在 flush 里 await 会让整条流卡在这里。
+        log(`[loop] ${upstreamWire} → ${clientWire}：答复陷进重复 → 主动切断并告知客户端`
+          + `（已产出 ${textChars} 字符）：${loopText}`);
+        encoder.error(loopText);
+        encoder.finish();
+        return;
+      }
       encoder.emit(evs);
     }
   };
@@ -9280,6 +9778,9 @@ async function pumpMatrixStream({ res, upstream, upstreamWire, clientWire, model
       if (done) break;
       buf += td.decode(value, { stream: true });
       flush();
+      // 循环守卫命中 → 立刻停止读上游。上面 flush 里已经发过 error + 收尾帧，
+      // 继续读只会把更多重复内容拉下来（上游按 token 计费）。
+      if (loopTripped) { await cancelUpstream(); break; }
       // ⚠ 背压：直通路径 res.write()===false 时会等 drain（否则慢客户端 + 快上游
       // 会把整段响应堆在 Node 缓冲里）。翻译路径一直没等 —— 这里补上。
       if (res.writableNeedDrain && !clientGone) {
@@ -9288,6 +9789,7 @@ async function pumpMatrixStream({ res, upstream, upstreamWire, clientWire, model
       if (res.destroyed || res.writableEnded) { clientGone = true; }
     }
     flush();   // 收尾：偷看过的字节可能整条都在 buf 里（见上面的说明）
+    if (loopTripped) { await cancelUpstream(); }
   } catch (e) {
     // 上游流中途断连：客户端已经收到 200 + 半截 SSE，**不可能**再改状态码了。
     // 唯一诚实的收尾是让连接断掉，客户端据此知道自己拿到的是残帧、可以重试。
@@ -9301,6 +9803,12 @@ async function pumpMatrixStream({ res, upstream, upstreamWire, clientWire, model
   } finally {
     try { res.removeListener('close', onClose); } catch { /* 忽略 */ }
     try { reader.releaseLock(); } catch { /* 忽略 */ }
+  }
+  // 循环守卫命中的收尾在上面 flush 里已经发过 error + message_stop/response.failed；
+  // 这里只把用量与状态如实带回去，**绝不能**再走下面的"上游被腰斩"分支 ——
+  // 那条会补一个"未收到结束信号"的错误，与真相（我们自己切断的）自相矛盾。
+  if (loopTripped) {
+    return { clientGone: false, truncated: true, loop: true, usage: matrixUsage(encoder, upstreamWire) };
   }
   // ⚠ 上游流**被腰斩**时必须报错，不能伪装成正常结束。
   //
@@ -9861,6 +10369,24 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
     }
   };
 
+  // ── loop_guard（2026-10-25，吸收自 magpie `loop_guard.go`）──
+  // 只喂**正文**（reasoning 不喂）：实测那类死循环是模型一直"想"同一句话，
+  // 而 reasoning 里出现高重复是正常的（反复权衡同一个决定），拿它判会误切断正常回复。
+  // 命中后走"已交付内容的错误收尾"分支：`ok: true` 阻止 failover（内容已经发出去了，
+  // 换一家只会把第二个回复续写进同一条响应），同时明确告诉客户端不完整。
+  const guard = ACTIVE_LOOP_GUARD ? makeLoopGuard() : null;
+  let loopTripped = false;
+  let loopText = '';
+  const checkLoop = (chunk) => {
+    if (!guard || loopTripped) return false;
+    const t = guard.feed(chunk);
+    if (!t) return false;
+    loopTripped = true;
+    loopText = t;
+    log(`[loop] 流式答复陷进重复 → 主动切断（已产出 ${outText.length} 字符）：${t}`);
+    return true;
+  };
+
   const handleChunk = (json) => {
     ensureStart();
     if (json && json.usage && (json.usage.prompt_tokens || json.usage.completion_tokens)) usage = json.usage;
@@ -9906,6 +10432,10 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
             + '（流结束时统一补出，与结构化 tool_calls 同一出口），客户端可正常执行。');
         } catch (_) { /* 忽略 */ }
       }
+      // loop_guard 必须在 emitText **之前**判：emitText 一旦把这一片发出去，
+      // 后面的"切断"就只能靠客户端重试，而这片正文往往正是第 257 个重复单元。
+      // handleChunk 是同步的，所以这里只立旗子；真正断开上游由下面的读循环做。
+      if (checkLoop(dsmlOut.text)) return;
       emitText(dsmlOut.text);
     }
     for (const call of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
@@ -9983,6 +10513,9 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
       if (done) break;
       lastRead = Date.now();   // 看门狗口径：只认"真的读到了数据"
       feed(decoder.decode(value, { stream: true }));
+      // loop_guard 已命中 → 立刻停止读上游（继续读只会把更多重复内容写进 outText，
+      // 而它们已经不会再发给客户端了）。取消 reader 让上游尽快释放连接。
+      if (loopTripped) { try { await reader.cancel(); } catch { /* 忽略 */ } break; }
     }
   } catch (e) {
     log(`流翻译读取失败：${e && e.message}`);
@@ -9997,6 +10530,32 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
     // 排查用户报的"调用某模型多次报错终止任务"时，这正是最关键的分歧点。
     log('[matrix] stream-broken：客户端在收尾阶段已断开（不记 ok；上游读取已取消）');
     return { ok: false };
+  }
+  // loop_guard 命中：正文已经发出去几百个单元，**不能** failover（会把第二个回复续写进同一条响应）。
+  // 语义与下面"上游被腰斩"分支一致：`ok: true` 阻止换家，`truncated: true` 保留可观测性，
+  // 但错误文案要说清"是我们主动切断的，因为模型在重复"，否则用户会以为是网络问题。
+  if (loopTripped) {
+    log(`[loop] 流翻译：已按循环守卫切断（已产出 ${outText.length} 字符，客户端会收到明确错误）`);
+    ensureStart();
+    closeBlock();
+    if (!aggregateOnly) {
+      sseWrite(res, 'error', {
+        type: 'error',
+        error: { type: 'api_error', message: loopText || '这条回复陷进了重复，网关已切断' },
+      });
+      sseWrite(res, 'message_stop', { type: 'message_stop' });
+      try { res.end(); } catch { /* 忽略 */ }
+    }
+    return {
+      ok: true,
+      truncated: true,
+      loop: true,
+      usage: anthropicUsage(usage, inputTokens || 0, estimateTokens(outText + outThinking)),
+      stopReason,
+      text: outText,
+      thinking: outThinking,
+      toolCalls: [...toolCalls.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v),
+    };
   }
   // 收尾：把 dsmlStreamFeed 扣住的残余**归还**给客户端。
   // 扣留本身是为了防"标记被切成两片时泄漏"，但流结束时必须吐出来 —— 否则一个正当的尾部 '<'
@@ -11024,6 +11583,42 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
   // 两者不同。报错文案里说"试了 N 家"必须用这个真值，否则会误导用户。
   let triedCount = 0;
 
+  // ── roomy（2026-10-25，吸收自 magpie `fallback.go`）──
+  // 候选里的窗口差距是真实存在的：同一个 deepseek-v4.1-flash，免费档常见 128K~200K，
+  // 订阅/中转常见 1M。请求带 40 万 token 的对话时，按 priority 先问免费档 = 一次必然失败的往返
+  // （白等一次超时、还可能被记一次失败）。这里把"声明窗口装不下"的候选**排到最后**（不删除）。
+  // 位置在亲和之后：亲和表达的是"必须/最好回这家"，语义强于体积，且被移动的候选本来也装不下。
+  if (ACTIVE_ROOMY) {
+    const rm = roomyOrder(tryOrder, model, body);
+    if (rm) {
+      tryOrder = rm.order;
+      log(`[route] ${model}: 约 ${rm.est} tokens，装不下的候选排到最后：${rm.moved.join('、')}`
+        + '（不删除 —— 全都失败时仍会轮到它们）');
+    }
+  }
+
+  // ── tool_loop（2026-10-25，吸收自 magpie `tool_loop.go`）──
+  // 死循环的证据**已经在请求体里**：agent 每一轮都把整段对话重发一遍，
+  // 所以"连续 8 轮一模一样的工具调用 + 一样的输出"在发上游之前就看得见。
+  // 现场（magpie 实测）：Codex 在 WorkBuddy 上半小时读同一段代码 308 次、当晚白烧 537 credits。
+  // 处置是**本地作答**：既不烧钱，也不会让 agent 卡在一个永远不会变化的观察上。
+  if (ACTIVE_TOOL_LOOP) {
+    const wire = responsesMode ? 'openai-responses' : 'openai-chat';
+    const loop = detectToolLoop(body, wire);
+    if (loop) {
+      const text = toolLoopNotice(loop);
+      log(`[loop] ${model}: 工具死循环 —— 连续 ${loop.repeats} 轮相同调用（${loop.names.filter(Boolean).slice(0, 3).join('、')}）`
+        + '→ 本地作答，不发给任何上游');
+      recordUsage({
+        model, provider: '(local)', endpoint: '/v1/' + (responsesMode ? 'responses' : 'chat/completions'),
+        status: 'ok', durMs: Date.now() - reqStart, inTok: 0, outTok: estimateTokens(text),
+      });
+      logCall('local-loop', 'ok');
+      if (stream) return serveLocalAnswer(res, wire, model, text);
+      return json(res, 200, localWholeBody(wire, model, text));
+    }
+  }
+
   for (const p of tryOrder) {
     // 进每个候选**之前**检查总预算。用 >= 而不是 >：刚好用满也不再开新的一家 ——
     // 新开一家最坏还要等它自己的 timeoutMs，那必然超出客户端耐心。
@@ -11415,6 +12010,34 @@ async function handleMessages(cfg, req, res, body) {
   // 实际**开始过**的候选数（不是"轮到第几个"）—— 见 handleCompletion 里同名变量说明。
   let triedCount = 0;
 
+  // ── roomy / tool_loop（2026-10-25，吸收自 magpie）──
+  // 与 handleCompletion 同一套判据，但这里是 **Anthropic 客户端协议**，
+  // 所以本地作答必须写成 Anthropic 的 message 形状（见 localWholeBody）。
+  // ⚠ 本项目老坑：同一判定在两条路径各写一份，改一处必须同时改另一处。
+  if (ACTIVE_ROOMY) {
+    const rm = roomyOrder(tryOrder, model, outBody);
+    if (rm) {
+      tryOrder = rm.order;
+      log(`[route] ${model}: 约 ${rm.est} tokens，装不下的候选排到最后：${rm.moved.join('、')}`
+        + '（不删除 —— 全都失败时仍会轮到它们）');
+    }
+  }
+  if (ACTIVE_TOOL_LOOP) {
+    const loop = detectToolLoop(outBody, 'anthropic-messages');
+    if (loop) {
+      const text = toolLoopNotice(loop);
+      log(`[loop] ${model}: 工具死循环 —— 连续 ${loop.repeats} 轮相同调用（${loop.names.filter(Boolean).slice(0, 3).join('、')}）`
+        + '→ 本地作答，不发给任何上游（anthropic 路径）');
+      recordUsage({
+        model, provider: '(local)', endpoint: '/v1/messages',
+        status: 'ok', durMs: Date.now() - reqStart, inTok: 0, outTok: estimateTokens(text),
+      });
+      logCall('local-loop', 'ok');
+      if (stream) return serveLocalAnswer(res, 'anthropic-messages', model, text);
+      return json(res, 200, localWholeBody('anthropic-messages', model, text));
+    }
+  }
+
   for (const p of tryOrder) {
     if (Date.now() >= deadline) {
       budgetExhausted = true;
@@ -11611,6 +12234,17 @@ function startServer(cfg) {
       log('工具裁剪已关闭（maxTools=0）—— 客户端声明的工具会**全部**发给上游');
     }
   }
+  // magpie 三项（loopGuard / toolLoop / roomy）：默认全开，见 DEFAULT_* 的说明。
+  // 顶层键名与 magpie 的设置项同名（stopLoopingReplies / stopToolLoops / roomy），便于对照。
+  // 配置优先、env 次之、缺省值最后 —— 留 env 是因为 out/data 下的配置会被界面保存整份覆写，
+  // 临时关掉一项不必改配置（与 DSH_GATEWAY_BREAKER_* 等既有开关同一套习惯）。
+  ACTIVE_LOOP_GUARD = cfgBool(cfg && cfg.loopGuard, cfgBool(process.env.DSH_GATEWAY_LOOP_GUARD, DEFAULT_LOOP_GUARD));
+  ACTIVE_TOOL_LOOP = cfgBool(cfg && cfg.toolLoop, cfgBool(process.env.DSH_GATEWAY_TOOL_LOOP, DEFAULT_TOOL_LOOP));
+  ACTIVE_ROOMY = cfgBool(cfg && cfg.roomy, cfgBool(process.env.DSH_GATEWAY_ROOMY, DEFAULT_ROOMY));
+  log(`magpie 三项：循环守卫=${ACTIVE_LOOP_GUARD ? 'on' : 'off'}`
+    + ` 工具死循环拦截=${ACTIVE_TOOL_LOOP ? 'on' : 'off'}`
+    + ` 上下文窗口过滤=${ACTIVE_ROOMY ? 'on' : 'off'}`
+    + '（顶层 loopGuard / toolLoop / roomy 可单独关闭，或 env DSH_GATEWAY_LOOP_GUARD / _TOOL_LOOP / _ROOMY=0）');
   const server = http.createServer((req, res) => {
     // 审计修复（P2）：路由整体兜底。旧版 handler 是 async 但返回的 promise 被丢弃——
     // 任何未预期抛出（畸形 Host 让 new URL 抛错、提供应商条目非法等）只进

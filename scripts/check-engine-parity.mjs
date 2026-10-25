@@ -391,8 +391,40 @@ const DECLARED = [
   { name: 'scrubResponsesItems', why: '新增：Responses `input` item 数组的身份改写。默认只改 role 为 system/developer 的项（与 chat 路径口径一致），scope=all 时逐个 item 全改（含 `function_call_output` 的工具结果与 `function_call` 的 arguments）。覆盖 `content: string`、`content: [{type:"input_text",text}]`、`output`、`arguments` 四个文本位。返回 { items, n } 或 null（无改动）' },
   { name: 'workbuddyConversationHeaders', why: '改动（会话渠道头由三改四）：国际版 WorkBuddy AI **5.7** 起要求四个头，多出 `X-Root-Request-ID`，缺它同样回 400/11128 且 msg 还是 "conversation id missing"（同一个码、同一句文案，第四种触发面；来源 chengshenyangtai/dsh-workbuddy-trae-qoder-connect 的 CHANGELOG.md）。它与 `X-Conversation-Request-ID` **同值**（同一个请求的根 id），因为 X-Root-Request-ID 表达的就是"这条请求链的根"，重铸一个新 UUID 反而把两者割裂。国内版 copilot.tencent.com 实测不要求这四个头（带/不带都 200），统一加是为了不按域名分叉' },
 
+  // ── magpie 三项（2026-10-25 吸收自 yetone/magpie）────────────────────────────
+  { name: 'DEFAULT_LOOP_GUARD', why: '新增：流式循环守卫缺省值 true。与 maxTools（默认关，会改变"发给上游什么"）不同，这一项不改变请求内容、只是提前止损，所以默认开' },
+  { name: 'DEFAULT_TOOL_LOOP', why: '新增：工具死循环拦截缺省值 true。拦下的都是"本来必然白烧钱"的请求（magpie 现场：半小时 308 次同一调用、537 credits），默认开' },
+  { name: 'DEFAULT_ROOMY', why: '新增：上下文窗口过滤缺省值 true。它只调换尝试顺序、不删除候选，默认开无风险' },
+  { name: 'ACTIVE_LOOP_GUARD', why: '新增：模块级生效值，由 startServer 从 cfg.loopGuard 初始化 —— forward() 与各 handler 拿不到 cfg，沿用本项目 ACTIVE_MAX_TOOLS 的既有模式' },
+  { name: 'ACTIVE_TOOL_LOOP', why: '新增：同上，cfg.toolLoop 的模块级生效值' },
+  { name: 'ACTIVE_ROOMY', why: '新增：同上，cfg.roomy 的模块级生效值' },
+  { name: 'cfgBool', why: '新增：三态布尔解析（true/false/"on"/"off"/1/0/yes/no/enabled/disabled 都认，未设 → 缺省值）。三个开关共用，避免各写一份口径' },
+  { name: 'LOOP_WINDOW', why: '新增：滚动窗口 256 个单元（照抄 magpie loopWindow）。为什么是 256：正常答复（含代码/表格）在 256 个单元里通常有上百种不同单元，真的陷进循环时只剩个位数' },
+  { name: 'LOOP_DISTINCT', why: '新增：窗口内不同单元 ≤24 即判循环（magpie loopDistinct）' },
+  { name: 'LOOP_UNIT_MAX', why: '新增：单单元最长 4096 字符，超长整段当单元 —— 防"无断行的重复"（`mcp mcp mcp…`）漏判' },
+  { name: 'loopUnitHasWord', why: '新增：判定单元里有没有"词"（至少一段有字母且无数字）。magpie 同口径：`0x00`、`v2`、纯 hash 不算单元，否则表格/日志类正文会被误判成循环' },
+  { name: 'loopUnitKey', why: '新增：单元归一（折叠空白、去尾部标点、小写、截断），与 magpie `unitKey` 同口径 —— 归一不到位，同一句带不同标点就会被当成不同单元，循环永远判不出来' },
+  { name: 'makeLoopGuard', why: '新增：循环守卫本体（`feed(delta) → 文案 | null`）。256 格 ring + counts Map 精确滑窗（滑出就减），`\\n` 与中文句末标点立即结束单元，`.`/`!`/`?` **后跟空白**才结束（否则 `Step. 1` 会被切开）。边转发边判是关键：等流结束再判等于钱已经烧完' },
+  { name: 'loopGuardWordsOf', why: '新增：四协议统一取**正文**增量（Anthropic text_delta / Responses output_text.delta / Chat delta.content / Gemini parts，thought:true 跳过）。reasoning 一律不取 —— 模型反复权衡同一个决定时 reasoning 天然高重复，拿它判会切断正常回复（magpie 用 think/text 两路分开跑验证过）' },
+  { name: 'TOOL_LOOP_REPEATS', why: '新增：连续 8 轮工具交换完全相同即判死循环（照抄 magpie toolLoopRepeats）' },
+  { name: 'TOOL_LOOP_TAIL', why: '新增：只看对话最后 64 条（magpie tailItems = 8×8）。1.5MB 的轮次每轮整体解码要吃几十毫秒，magpie 修过这条' },
+  { name: 'TOOL_NOISE_RES', why: '新增：抹掉"每轮都会变但语义无关"的运行噪声 —— `Wall time: N seconds`、`Chunk ID: xxx`、`"duration_seconds": N`。不抹的话同一调用两轮永远不相等，死循环判不出来（magpie `steadyResult` 同口径）' },
+  { name: 'steadyText', why: '新增：给一段工具结果抹噪声 + 截断到 4096（超长结果只留前缀，避免 20MB 轮次拖慢判定）' },
+  { name: 'stableJson', why: '新增：JSON 键重排序列化 —— 两轮写法不同（键序不同）也该算"同一个调用"。这是判重复的必要条件' },
+  { name: 'maybeJson', why: '新增：工具参数既可能是 JSON 字符串也可能是对象，统一解成对象再交给 stableJson' },
+  { name: 'fnv1a', why: '新增：FNV-1a 32 位哈希（magpie 用 FNV-64a）。这里只要"相等性"，32 位够用且更快' },
+  { name: 'toolExchanges', why: '新增：把三协议对话尾部归一成 `[{callsKey, resultsKey, hash, names}]`。只处理最后 64 条（性能），callsOf 认 `tool_calls[]`/`tool_use` 块/`function_call`，resultsOf 认 `role:"tool"`/`tool_result` 块/`function_call_output`' },
+  { name: 'detectToolLoop', why: '新增：最后 8 轮 hash 全等 → 返回详情。**为什么在请求体上判**：agent 每轮都携带整段对话，循环在请求体里就看得见 —— 等上游回话再判，那一轮的钱已经花了' },
+  { name: 'lenOfRepeats', why: '新增：往前数真实重复轮数（文案里给"连续 14 次"比"8 次"更有说服力，也便于用户判断严重程度）' },
+  { name: 'toolLoopNotice', why: '新增：给用户看的中文文案 —— 说清"拦了什么、没花额度、通常意味着什么、该怎么办"，并强调这一轮**没有发给模型**' },
+  { name: 'localWholeBody', why: '新增：本地作答的**非流式**响应体，三协议各一份形状（anthropic message / responses output / chat choices），usage 里 inTok 恒 0（真的一个字都没发给上游，不能虚报）' },
+  { name: 'serveLocalAnswer', why: '新增：本地作答的**流式**路径，**复用 makeStreamEncoder** 而不是另写一份 SSE 拼装 —— 三协议编码器只该有一份，否则又是一处"同一语义多份实现"。' },
+  { name: 'windowOf', why: '新增：取某候选对该逻辑模型声明的 contextWindow（不可知返回 0）。注意 modelEntries 里的 contextWindow 此前**只被 write-dsh 用来写 dsh 配置**，请求路径上从未使用 —— 这是它第一次参与路由' },
+  { name: 'roomyOrder', why: '新增：把"装不下这次请求"的候选**排到最后**（不删除）。与 magpie 的差别：magpie 移出候选表再在特定条件下"回补"，那套回补要在主循环维护状态；本工程直接排到最后 —— 主循环按序尝试，装得下的先跑，全都失败后自然轮到它们，语义等价、零状态。四条不做事的边界（窗口不可知/体解析不出/只有一个候选/没有候选装得下）与 magpie 一致' },
+  { name: 'startServer', why: '改动：初始化 magpie 三开关（ACTIVE_LOOP_GUARD / ACTIVE_TOOL_LOOP / ACTIVE_ROOMY）。**配置优先、env 次之、缺省值最后**：`out/data` 下的 gateway.config.json 会被界面保存整份覆写，临时关一项不该逼用户改配置（与 DSH_GATEWAY_BREAKER_* 等既有开关同一套习惯）。沿用 ACTIVE_MAX_TOOLS 的模块级持有模式 —— forward() 与各 handler 拿不到 cfg' },
+
   // ⚠ 待办：本清单在 v1.0.7 之后就没再维护，v1.0.8–v1.0.17 的改动（OpenCode 车道、
-  //   出口轮换、magpie 三项等）大量未登记，`node scripts/check-engine-parity.mjs`
+  //   出口轮换等）大量未登记，`node scripts/check-engine-parity.mjs`
   //   因此恒报 FAIL（本次改动之前就已经是红的）。这是清单腐烂，不是功能回退，
   //   需要单独做一次全量登记；本次只登记自己新增的块，不代填别人的理由。
 ];

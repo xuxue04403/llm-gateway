@@ -6871,6 +6871,210 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up); }
   });
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // magpie 三项能力（2026-10-25 吸收）：工具死循环拦截 / 流式循环守卫 / 上下文窗口过滤
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /** 造 n 轮"完全一样"的工具交换（chat 协议）。 */
+  const mkChatToolRounds = (n) => {
+    const msgs = [{ role: 'user', content: '开始' }];
+    for (let i = 0; i < n; i++) {
+      msgs.push({
+        role: 'assistant', content: '',
+        tool_calls: [{ id: 'call_' + i, type: 'function', function: { name: 'read_file', arguments: '{"path":"a.txt"}' } }],
+      });
+      msgs.push({ role: 'tool', tool_call_id: 'call_' + i, content: 'line1\nline2' });
+    }
+    return msgs;
+  };
+
+  t('网关（magpie tool_loop）：连续 8 轮一模一样的工具调用 → 本地作答，一次上游都不打', async () => {
+    // 现场（magpie 实测）：Codex 在 WorkBuddy 的 deepseek-v4-pro 上半小时读同一段代码 308 次、
+    // 当晚白烧 537 credits。关键洞察：每一轮都把整段对话带上，**循环就在请求体里** ——
+    // 等上游回话再判，那一轮的钱已经花了。
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const gw = await startGatewayWith([openaiProvider('tl', up, { quirks: ['force-stream'] })], 'toolloop');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+
+      // ① 7 轮 —— 差一轮，不得拦（避免误伤正常的重试/轮询式 agent）
+      const r7 = await call({
+        port: gw.port,
+        body: { model: 'test-model', messages: mkChatToolRounds(7) },
+      });
+      assert.strictEqual(r7.status, 200, '实际 ' + r7.status + ' ' + r7.text.slice(0, 200));
+      assert.strictEqual(up.st.calls, 1, '7 轮不满阈值，必须照常发给上游，实际 ' + up.st.calls);
+
+      // ② 8 轮 —— 命中阈值，本地作答
+      const r8 = await call({
+        port: gw.port,
+        body: { model: 'test-model', messages: mkChatToolRounds(8) },
+      });
+      assert.strictEqual(r8.status, 200, '本地作答仍是正常 200，实际 ' + r8.status + ' ' + r8.text.slice(0, 200));
+      assert.strictEqual(up.st.calls, 1, '命中死循环后**不得**再打上游，实际 ' + up.st.calls);
+      const body8 = JSON.parse(r8.text);
+      const text8 = (body8.choices && body8.choices[0] && body8.choices[0].message.content) || '';
+      assert.ok(/死循环/.test(text8), '本地作答须说清拦了什么：' + text8.slice(0, 300));
+      assert.ok(/read_file/.test(text8), '文案里要指出是哪个工具：' + text8.slice(0, 300));
+      assert.strictEqual(body8.usage.prompt_tokens, 0, '没有发给上游 → 输入 token 必须是 0');
+
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/工具死循环/.test(logText), '日志须记录拦截：' + logText.slice(-500));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关（magpie tool_loop）：Anthropic 路径（/v1/messages）同样要拦 —— 同一判定两处实现易漏', async () => {
+    // 本项目老坑：bot 判定在 handleCompletion 与 handleMessages 各写一份，改一处必须改另一处。
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const gw = await startGatewayWith([openaiProvider('tlmsg', up, { quirks: ['force-stream'] })], 'toolloopmsg');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const msgs = [{ role: 'user', content: '开始' }];
+      for (let i = 0; i < 8; i++) {
+        msgs.push({ role: 'assistant', content: [{ type: 'tool_use', id: 'tu_' + i, name: 'read_file', input: { path: 'a.txt' } }] });
+        msgs.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_' + i, content: 'line1\nline2' }] });
+      }
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 64, messages: msgs },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 300));
+      assert.strictEqual(up.st.calls, 0, 'Anthropic 路径命中死循环也不得打上游，实际 ' + up.st.calls);
+      const parsed = JSON.parse(r.text);
+      assert.strictEqual(parsed.type, 'message', '必须是合法的 Anthropic message 形状：' + r.text.slice(0, 200));
+      assert.ok(/死循环/.test(parsed.content[0].text), '文案须说清拦了什么：' + parsed.content[0].text.slice(0, 300));
+      assert.strictEqual(parsed.usage.input_tokens, 0, '没有发给上游 → input_tokens 必须是 0');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // 造一段"陷进重复"的 SSE：每帧一个句子单元，全部相同 → 256 个单元后必判循环。
+  const mkLoopSse = (n) => {
+    let s = '';
+    for (let i = 0; i < n; i++) {
+      s += 'data: ' + JSON.stringify({ id: 'chatcmpl-loop', choices: [{ index: 0, delta: { content: 'Now.\n' } }] }) + '\n\n';
+    }
+    return s + 'data: [DONE]\n\n';
+  };
+
+  t('网关（magpie loop_guard）：直通路径流式答复陷进重复 → 主动切断并告知客户端"模型在重复"', async () => {
+    // 现场（magpie issue #1359）：DeepSeek 的答复反复输出 "Now." "Writing." "Go." 直到 token 上限。
+    // 等流结束再判等于钱已经烧完 —— 必须边转发边判。
+    const up = await startFakeOpenAIUpstream({ sseRaw: mkLoopSse(300) });
+    const gw = await startGatewayWith([openaiProvider('lg', up, { quirks: ['force-stream'] })], 'loopguard');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port,
+        body: { model: 'test-model', stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '流已经开始了，状态码不可能再改，实际 ' + r.status);
+      assert.ok(/loop_detected/.test(r.text), '必须补一个明确的 loop_detected 错误事件：' + r.text.slice(-400));
+      assert.ok(!/upstream_truncated/.test(r.text),
+        '我们主动切断的，**不能**说成"上游被中断"（会让用户去查网络）：' + r.text.slice(-400));
+
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/\[loop\].*直通路径/.test(logText), '日志须记录直通路径的切断：' + logText.slice(-600));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关（magpie loop_guard）：翻译路径（chat 上游 → Anthropic 客户端）也必须切断', async () => {
+    // ⚠ 这条用例另一个作用是锁住一个**真实踩到的坑**：上游把整条流塞进一个 TCP 分片时，
+    // "偷看首事件"会把全部字节读进 pendingHead，随后 `reader.read()` 直接 done ——
+    // 读循环里的守卫一次都不会被调用。修法是 pendingHead 补发前先喂守卫。
+    const up = await startFakeOpenAIUpstream({ sseRaw: mkLoopSse(300) });
+    const gw = await startGatewayWith([openaiProvider('lgmx', up, { quirks: ['force-stream'] })], 'loopguardmx');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.ok(/"type":"error"/.test(r.text), '必须补 Anthropic 形状的 error 事件：' + r.text.slice(-400));
+      assert.ok(/message_stop/.test(r.text), '错误之后仍要有 message_stop，否则客户端会一直等：' + r.text.slice(-400));
+      assert.ok(!/upstream_truncated/.test(r.text), '不得说成"上游被中断"：' + r.text.slice(-400));
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/\[loop\]/.test(logText), '日志须记录切断：' + logText.slice(-600));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关（magpie loop_guard）：正常答复（每帧内容都不同）绝不能被切断', async () => {
+    // 反例保护：循环守卫最容易犯的错就是误伤正常的列表/代码/表格输出。
+    let sse = '';
+    for (let i = 0; i < 300; i++) {
+      sse += 'data: ' + JSON.stringify({ id: 'chatcmpl-ok', choices: [{ index: 0, delta: { content: '第 ' + i + ' 行内容不同。\n' } }] }) + '\n\n';
+    }
+    sse += 'data: [DONE]\n\n';
+    const up = await startFakeOpenAIUpstream({ sseRaw: sse });
+    const gw = await startGatewayWith([openaiProvider('lgok', up, { quirks: ['force-stream'] })], 'loopguardok');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port,
+        body: { model: 'test-model', stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      assert.ok(!/loop_detected/.test(r.text), '内容各不相同，不得判循环：' + r.text.slice(-400));
+      assert.ok(/第 299 行内容不同/.test(r.text), '最后一行必须完整送到客户端');
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(!/\[loop\]/.test(logText), '日志里不该有任何循环判定：' + logText.slice(-600));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关（magpie roomy）：装不下的候选排到最后（不删除）—— 前面的家失败后仍会轮到它', async () => {
+    // 同一个逻辑模型，免费档常见 128K~200K、订阅/中转常见 1M。请求带 40 万 token 的对话时，
+    // 按 priority 先问免费档 = 一次注定失败的往返（白等一次超时、还可能被记一次失败）。
+    const upBig = await startFakeOpenAIUpstream({ behavior: 'boom' });   // 先排到的这家失败
+    const upSmall = await startFakeOpenAIUpstream({ json: true });        // 装不下的那家兜底
+    const gw = await startGatewayWith([
+      {                                           // priority 1 但窗口只有 10 tokens → 装不下
+        id: 'small', baseURL: 'http://127.0.0.1:' + upSmall.port + '/v2', apiKey: UPSTREAM_KEY,
+        models: [{ id: 'test-model', as: 'test-model', contextWindow: 10 }],
+        priority: 1, enabled: true, protocol: 'openai-chat',
+      },
+      {                                           // priority 2 但窗口 1M → 装得下
+        id: 'big', baseURL: 'http://127.0.0.1:' + upBig.port + '/v2', apiKey: UPSTREAM_KEY,
+        models: [{ id: 'test-model', as: 'test-model', contextWindow: 1000000 }],
+        priority: 2, enabled: true, protocol: 'openai-chat',
+      },
+    ], 'roomy');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      // 请求体必须**真的**超过 small 的 10 tokens 窗口，否则 roomy 什么都不做（那是正确行为）。
+      // 用 2 万字符 ≈ 5000 tokens（roughTokens 按 len/4 估）。
+      const big = 'x'.repeat(20000);
+      const r = await call({ port: gw.port, body: { model: 'test-model', messages: [{ role: 'user', content: big }] } });
+      assert.strictEqual(r.status, 200, '装得下的那家失败后，装不下的仍要兜底，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(upBig.st.calls, 1, '窗口够的那家必须先被尝试，实际 ' + upBig.st.calls);
+      assert.strictEqual(upSmall.st.calls, 1, '装不下的候选**不得被删除** —— 全都失败时必须轮到它，实际 ' + upSmall.st.calls);
+
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/装不下的候选排到最后/.test(logText), '日志须说明排序被调整：' + logText.slice(-600));
+      assert.ok(/small\(0K\)/.test(logText), '日志须点名被移动的是谁：' + logText.slice(-600));
+    } finally { killGw(gw); closeUp(upBig); closeUp(upSmall); }
+  });
+
+  t('网关（magpie roomy）：窗口未知/只有一个候选时**什么都不做**（零误动的边界）', async () => {
+    // magpie 的四条边界里最容易被忽略的两条：窗口不可知、只有一个候选。
+    // 前者若按 0 当"装不下"处理，所有没声明窗口的家都会被排到最后 —— 那是灾难性的静默行为改变。
+    const up1 = await startFakeOpenAIUpstream({ json: true });
+    const up2 = await startFakeOpenAIUpstream({ json: true });
+    const gw = await startGatewayWith([
+      // 两家都没声明 contextWindow → 必须按原 priority 走
+      { id: 'p1', baseURL: 'http://127.0.0.1:' + up1.port + '/v2', apiKey: UPSTREAM_KEY, models: ['test-model'], priority: 1, enabled: true, protocol: 'openai-chat' },
+      { id: 'p2', baseURL: 'http://127.0.0.1:' + up2.port + '/v2', apiKey: UPSTREAM_KEY, models: ['test-model'], priority: 2, enabled: true, protocol: 'openai-chat' },
+    ], 'roomy-unknown');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      assert.strictEqual(up1.st.calls, 1, 'priority 1 必须优先（窗口未知不影响顺序），实际 ' + up1.st.calls);
+      assert.strictEqual(up2.st.calls, 0, 'priority 2 不该被用到，实际 ' + up2.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(!/装不下的候选排到最后/.test(logText), '窗口未知时不得调整顺序：' + logText.slice(-600));
+    } finally { killGw(gw); closeUp(up1); closeUp(up2); }
+  });
+
   for (const { name, fn } of __tests) {
     await fn();
     passed++;

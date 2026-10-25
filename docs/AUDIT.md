@@ -1367,6 +1367,144 @@ You are an AI agent powered by DeepSeek Harness.
 - 遗留：`nvidia` 四把 Key 中两把恒 403、两把连不上，会在候选链白打（等用户决定删不删）；
   `opencode` 免费档真实上下文上限未知（配置声明 1048576）。
 
+---
+
+## R. 第八轮：向 yetone/magpie 吸收三项网关防护（2026-10-25）
+
+用户诉求原文：*"查看并分析github项目：https://github.com/yetone/magpie 吸收并优化llm-gateway"*。
+
+### R.1 结论先行
+
+magpie（21k★，Go）里有**六项** llm-gateway 完全没有的能力。评估后落地**三项**，
+另三项给出「不落地」的具体理由（不是"没时间"，而是与本工程既有决定冲突）：
+
+| magpie 能力 | 落地 | 理由 |
+|---|---|---|
+| `loop_guard`（流式答复循环检测） | ✅ | 与本工程无冲突，纯止损 |
+| `tool_loop`（跨轮工具死循环拦截） | ✅ | 与本工程无冲突，且直接省钱 |
+| `roomy`（发送前上下文窗口过滤） | ✅ | 改为"排到最后"而非"排除"，零状态 |
+| `probeOne` / `restLast`（冷却中只探最先复活的一个） | ❌ | 见 R.5 |
+| `patience` / `replan`（同请求内暂停重排重试） | ❌ | 见 R.5 |
+| `turndone` / `ttft`（轮次结束通知 / 首字统计） | ❌ | 前者是 magpie 自有 GUI 的协议扩展，本工程无对应面；后者已有 `ttfbMs` 记账 |
+
+### R.2 三项落地的实现要点
+
+**循环守卫**：边转发边把答复切成"单元"（行 + 句子），最近 `LOOP_WINDOW = 256` 个单元里
+不同者 ≤ `LOOP_DISTINCT = 24` 就判循环，主动切断并明确告知客户端（`loop_detected`），
+而不是让客户端干等到 token 上限。三条流式路径全接：
+
+| 路径 | 接入点 | 切断方式 |
+|---|---|---|
+| 直通 SSE | `forward()` 读循环 + `pendingHead` 分支 | 按 `clientWire` 补协议内错误事件 |
+| Anthropic 翻译 | `translateOpenAIStreamToAnthropic` 的 `emitText` 前 | `sseWrite(res,'error',…)` + `message_stop` |
+| 协议矩阵 | `pumpMatrixStream` 的 `flush()` 内 `encoder.emit` 之前 | `encoder.error()` + `encoder.finish()` |
+
+两处刻意的取舍：
+- **reasoning 不参与判定**。模型反复权衡同一个决定时 reasoning 天然高重复，拿它判会把正常回复切断。
+- **`.`/`!`/`?` 后跟空白才结束句子**（`justEnded` 标志），否则 `Step. 1` 会被切成两个单元。
+
+**工具死循环拦截**：最后 `TOOL_LOOP_REPEATS = 8` 轮工具交换（调用 + 参数 + 结果，归一后）
+完全相等 → 网关本地作答、**一次上游都不发**。三个归一化是判得出循环的前提：
+`stableJson`（JSON 键重排，两轮键序不同也算同一调用）、`steadyText` 抹运行噪声
+（`Wall time: N seconds` / `Chunk ID: xxx` / `"duration_seconds": N`）、`fnv1a` 哈希。
+判在**请求体**上 —— agent 每轮携带整段对话，等上游回话再判，那一轮的钱已经花了。
+
+**上下文窗口过滤**：对声明了 `contextWindow` 的候选，装不下这次请求（`roughTokens` 按字节/4 估）
+就**排到最后而不是删掉**。magpie 的做法是移出候选表、再在"最后一个装得下的候选因额度/余额失败
+且此前无别的失败"时回补 —— 那套回补要在主循环里维护状态。本工程直接排到最后：主循环按序尝试，
+装得下的先跑，全都失败后自然轮到它们，**语义等价、零状态**。
+四条"什么都不做"的边界与 magpie 一致：窗口不可知 / 请求体估不出 / 只有一个候选 / 没有候选装得下。
+
+⚠ 注意 `contextWindow` 在本工程里此前**只被 `write-dsh` 用来写 dsh 配置**，请求路径上从未使用。
+这是它第一次参与路由。也因此**刻意不猜窗口值**：猜错会让好模型被永久排到最后。
+
+### R.3 🔑 本轮抓到的真实缺陷（最有价值的一条）
+
+**直通路径的循环守卫最初完全不会触发。** 上游把一条很短的流整条塞进一个 TCP 分片时，
+"偷看首个 SSE 事件"的逻辑会把**全部字节**读进 `pendingHead`，紧接着一次性 `res.write(pendingHead)`
+写出，随后 `reader.read()` 直接 `done` —— 读循环里的守卫一次都不会被调用。
+
+实测：300 个 `Now.\n` 的 SSE 整条 21KB 一次到达，客户端照样收满 300 帧，日志里一个 `[loop]` 都没有。
+**"以为装了守卫"比没装更危险**：它会让后续所有"循环还在烧钱"的现象被归因到别处。
+
+修法是在 `pendingHead` 分支内、`writeHeadOnce()` 之前补一次喂守卫。修后日志：
+
+```
+[loop] 直通路径（lg）：答复陷进重复（整条流在首个分片内就已判出）→ 主动切断：
+  模型陷进了重复（最近 256 个片段里只有 1 种内容，最常见的是："now"×256）
+```
+
+**教训**：给流式路径装"边读边判"的逻辑时，必须同时检查**不经过读循环**的那条近路
+（首分片预读、惰性写头、零交付捷径）。这条与项目既有的「同一判定两处实现漏一处」是同族问题，
+但更隐蔽 —— 不是"忘了写第二份"，而是"写了但永远不会被走到"。
+
+### R.4 测试
+
+新增 7 条（`tests/gateway.test.js`），每条都对应一个"如果写错就会静默失效"的点：
+
+1. 8 轮一模一样的工具调用 → 本地作答；**7 轮必须放行**（阈值不能被写成 ≥7）
+2. Anthropic 路径（`/v1/messages`）同样要拦 —— 同一判定两处实现易漏
+3. 直通路径循环 → 切断且**不得**报 `upstream_truncated`（否则用户会以为是网络问题）
+4. 翻译路径循环 → 必须切断（这条同时锁住 R.3 的 `pendingHead` 缺陷）
+5. **正常答复（300 帧各不同）绝不能被切断** + 最后一行必须完整到达
+6. roomy：装不下的排到最后，前面的家失败后**仍会轮到它**
+7. roomy 零误动边界：窗口未知/只有一个候选时，priority 1 必须优先
+
+⚠ 用例 6 有个坑值得记：最初用默认小请求体，`roughTokens` 只有几十，装得下 → roomy 什么都不做
+（那是**正确**行为），断言 `upBig.st.calls === 1` 直接报 0。必须让请求体真的超过那个窗口
+（`'x'.repeat(20000)` ≈ 5000 tokens）才测得到。**边界用例和主用例要一起写，只写主用例会把
+"实现的正确省略"误报成 bug。**
+
+### R.5 两项不落地（附推翻条件）
+
+**`probeOne` / `restLast`** —— 本工程 2026-09-17 就明确否掉过同一件事（`src/gateway/model-gateway.mjs`
+的 `breakerCooldownSecs` 上方长注释）："只要备选一直可用，首选家恢复后也不会再被用到，等于静默改变
+优先级语义（用户把 x666 放第一是有意的）"。且现有回归用例锁死"熔断期内一次上游请求都不打"
+这条对用户账号的承诺。要上必须先推翻这两条决定，不是加个开关的事。
+
+**`patience` / `replan`** —— 落地必须把 `handleCompletion` 与 `handleMessages` 两个主循环
+各改成"轮次循环"（本项目"同一判定两处实现"的老坑），且暂停期保活要往客户端写 SSE 注释，
+而写注释就会让 `headersSent` 变真、**彻底堵死 failover**。收益（短限流不再整单失败）
+不抵这个代价。
+
+### R.6 供应商与账号（顺手读 magpie 得到的旁证）
+
+- magpie 也踩过 WorkBuddy 11128，`LESSONS.md` 原文：*"5353ed54 counted WorkBuddy's
+  'unapproved channel' (**an agent's system prompt**) as an account fault. It rested every
+  WorkBuddy AI account for 5 days"* —— 与本轮第七轮的结论完全一致（是 system prompt，不是账号）。
+  这条是外部独立验证，值得记下来。
+- magpie 的 WorkBuddy 专有码：`11140 request illegal` → `restrictedRest`（2 小时、`failRestricted`）；
+  **11128 记为 `promptRefused`，不冷却任何人** —— 与本工程现在的处置一致。
+- **架构对照**：magpie 已把 `workbuddy`/`workbuddy-ai`/`commandcode`/`cursor`/`devin`/`factory`/
+  `grok`/`kiro`/`mimo-app`/`qoder`/`zcode`/`zed` 这 11 家"内置订阅"**全部退役**，搬进社区插件
+  `@magpie-community/opencode-<name>-auth`，公开理由是"Reaching them can break their vendors'
+  terms, so they moved out of magpie into community plugins, **which keeps magpie itself from
+  being banned**"。
+  → 对 llm-gateway 的直接含义：**有封号风险的订阅车道（WorkBuddy / commandcode / cline / opencode）
+  与"通用网关"的边界值得显式化**。这不是今天的任务，但应记进路线图：一旦腾讯收紧到改写也挡不住，
+  把这些车道做成独立可选模块，主程序只保留通用 OpenAI/Anthropic 兼容转发，风险面会小一个数量级。
+
+### R.7 验收
+
+```
+node --check src\gateway\model-gateway.mjs        → SYNTAX OK
+node --test tests\gateway.test.js                 → 215 passed, 0 failed（原 208，+7）
+其余五文件                                         → unit 98 / writers 42 / edge 29 / security 19 / renderer 15
+合计                                              → 418 项 0 失败
+parity：未声明 45 条（全是 v1.0.8–v1.0.17 历史债，本次新增 30 个块已全部登记）
+真网关直播：/health ok，egress http://127.0.0.1:7890；一次真实补全经 commandcode 成功
+启动日志：magpie 三项：循环守卫=on 工具死循环拦截=on 上下文窗口过滤=on
+```
+
+### R.8 未解决 / 需要用户决定
+
+- 三项开关默认全开。关闭方式：顶层 `loopGuard` / `toolLoop` / `roomy` 设 false，
+  或 env `DSH_GATEWAY_LOOP_GUARD` / `_TOOL_LOOP` / `_ROOMY`=0。
+- roomy 只对**声明过** `contextWindow` 的模型生效（当前 30 家配置里 39 条 models 有声明）。
+  要让它真正起作用，需要给常用模型补 `contextWindow` —— 但**不要编数字**（见 README「参数拿不到就留空」）。
+- 发布仍未完成：本地 main 领先 origin 9 个提交（缺 `GITHUB_TOKEN`）。
+
+
 
 
 
