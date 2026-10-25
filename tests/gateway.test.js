@@ -7231,6 +7231,95 @@ let upstreamPort = 0;
     }
   });
 
+  t('网关（审计 R10）：DSH_GATEWAY_DUMP_WB11128=1 时 11128 现场必须真的落盘，且错误体里的密钥要打码', async () => {
+    // 审计发现：dumpWorkbuddy11128 自 a661323 引入起**从未被调用过**（全文只有定义 1 处），
+    // 而注释、日志、README 排错表四处都在承诺"开 DSH_GATEWAY_DUMP_WB11128=1 就能转储比对"。
+    // 用户 11128 复发时照做 → 一个字节都不会落盘，且没有任何提示，排错路径直接断掉。
+    //
+    // 这条用例钉两件事：
+    //   ① 开关打开时**真的有文件**（看文件系统，不看日志自述）；关着时**什么都不写**。
+    //   ② 转储里的上游错误体与本文件其它 30 处落日志的写法一致 —— 要过 maskSecrets。
+    //      上游回显凭据是实测过的形态（2026-10-08 审计：401 时把收到的凭据裸回显）。
+    const SECRET = 'sk-' + 'LIVE'.repeat(10);   // 40 字符，会被 maskSecrets 命中
+    const upBlocked = http.createServer((q, s) => {
+      q.resume();
+      q.on('end', () => {
+        s.writeHead(400, { 'content-type': 'application/json' });
+        s.end(JSON.stringify({
+          code: 11128,
+          msg: 'Illegal API invocation from an unapproved channel',
+          detail: 'Authorization failed for key ' + SECRET,   // ← 模拟上游回显
+        }));
+      });
+    });
+    await new Promise((r) => upBlocked.listen(0, '127.0.0.1', r));
+
+    const mk = (id) => ({
+      id, baseURL: 'http://127.0.0.1:' + upBlocked.address().port + '/v2',
+      protocol: 'openai-chat', models: ['test-model'],
+      apiKey: 'sk-' + 'a'.repeat(15), priority: 1, enabled: true,
+    });
+    const askBody = (extra) => Object.assign({
+      model: 'test-model', max_tokens: 8,
+      messages: [{ role: 'user', content: 'hi' }],
+    }, extra || {});
+
+    try {
+      // ---- 开关关着：不许产生任何文件 ----
+      {
+        const gw = await startGatewayWith([mk('wb-nodump')], 'wbdump-off', {}, {});
+        try {
+          const r = await call({ port: gw.port, p: '/v1/chat/completions', body: askBody() });
+          // 11128 的处置是「继续 failover，不终止客户端任务」—— 只有这一家候选，
+          // 于是走到收口分支的 503（all providers unavailable），不是 400。
+          // 断言 503 而不是 400，是因为 400 会意味着"确定性 4xx 终止了任务"。
+          assert.strictEqual(r.status, 503,
+            '单家候选且命中 11128 时应以 503 收口（继续 failover 的语义），实际 ' + r.status
+            + ' ' + r.text.slice(0, 200));
+        } finally { killGw(gw); }
+        const dumpDir = path.join(gw.dir, 'dump');
+        assert.ok(!fs.existsSync(dumpDir),
+          '开关关着时不该创建 dump 目录（说明函数被无条件调用了）：' + dumpDir);
+      }
+
+      // ---- 开关打开：必须落盘，且密钥打码 ----
+      {
+        const gw = await startGatewayWith(
+          [mk('wb-dump')], 'wbdump-on', { DSH_GATEWAY_DUMP_WB11128: '1' }, {});
+        try {
+          const r = await call({
+            port: gw.port, p: '/v1/chat/completions',
+            body: askBody({ messages: [{ role: 'system', content: 'be nice' }, { role: 'user', content: 'hi' }] }),
+          });
+          assert.strictEqual(r.status, 503,
+            '单家候选且命中 11128 时应以 503 收口（继续 failover 的语义），实际 ' + r.status
+            + ' ' + r.text.slice(0, 200));
+        } finally { killGw(gw); }
+
+        const dumpDir = path.join(gw.dir, 'dump');
+        assert.ok(fs.existsSync(dumpDir), '开关打开时必须创建 dump 目录，实际不存在：' + dumpDir);
+        const files = fs.readdirSync(dumpDir).filter((f) => /^wb11128-.*\.json$/.test(f));
+        assert.strictEqual(files.length, 1,
+          '必须正好落一份现场转储（不是零份，也不是份数不定）：' + JSON.stringify(fs.readdirSync(dumpDir)));
+
+        const raw = fs.readFileSync(path.join(dumpDir, files[0]), 'utf8');
+        // ⚠ 这条是关键：旧实现 String(detail).slice(0,600) 未脱敏，上游回显的凭据会明文落盘
+        assert.ok(!raw.includes(SECRET),
+          '转储里的上游错误体必须打码（上游会把收到的凭据回显回来）：' + raw.slice(0, 400));
+
+        const meta = JSON.parse(raw);
+        assert.strictEqual(meta.upstreamStatus, '11128');
+        assert.strictEqual(meta.provider, 'wb-dump');
+        assert.ok(meta.bytes > 0, '应记下请求体字节数');
+        assert.strictEqual(meta.meta.model, 'test-model');
+        assert.strictEqual(meta.meta.messageCount, 2, '应记下消息条数');
+        assert.deepStrictEqual(meta.meta.roles, ['system', 'user'], '应记下角色序列');
+      }
+    } finally {
+      try { upBlocked.close(); } catch { /* 忽略 */ }
+    }
+  });
+
   for (const { name, fn } of __tests) {
     await fn();
     passed++;

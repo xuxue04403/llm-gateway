@@ -4121,7 +4121,10 @@ function dumpWorkbuddy11128(provider, bodyText, detail) {
       bytes: Buffer.byteLength(bodyText || ''),
       nodes: (() => { try { return jsonNodeFootprint(JSON.parse(bodyText || '{}')); } catch { return null; } })(),
       upstreamStatus: '11128',
-      upstreamDetail: String(detail || '').slice(0, 600),
+      // 审计 R10：这里与全文件其它 30 处落日志的写法保持一致 —— 上游错误体可能是
+      // 把我们发出去的 Authorization 回显回来的那种（"Invalid key sk-…"），转储文件
+      // 同样落在用户数据目录里，没有理由比日志更宽松。
+      upstreamDetail: maskSecrets(String(detail || '')).slice(0, 600),
       meta,
     };
     const file = path.join(dir, 'wb11128-' + Date.now() + '.json');
