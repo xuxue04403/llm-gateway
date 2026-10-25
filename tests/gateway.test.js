@@ -7181,6 +7181,56 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(upNA); closeUp(upNB); }
   });
 
+  t('网关（审计 R8-4）：日志超过上限是**轮转**成 .1 而不是清空 —— 排障取证不能被抹掉', async () => {
+    // 旧实现 `fs.writeFileSync(LOG_PATH, '')`：5MB 一到就把历史直接抹掉。
+    // 而出问题之后想回看的恰恰就是那段被抹掉的日志 —— "防磁盘膨胀"不能以删掉唯一证据为代价。
+    // 现在与宿主 src/logger.js 同口径：rename 成 .1，旧 .1→.2、.2→.3，只留 3 份。
+    //
+    // 这里锁四件事：① 满了之后旧内容还在（在 .1 里）② 当前文件重新开始且非空
+    // ③ 确实产生了 .1（清空实现永远不会产生 .1）④ 历史内容一字不少。
+    const up = await startFakeUpstream();
+    const dir = fs.mkdtempSync(path.join(tmp, 'logrot-'));
+    const logPath = path.join(dir, 'gateway.log');
+    const cfgPath = path.join(dir, 'gateway.config.json');
+    const port = await freePort();
+    // 先把日志撑到上限之上（网关还没起，所以不存在"10 秒节流看不到"的问题）
+    const filler = 'X'.repeat(1023) + '\n';
+    const need = Math.ceil((6 * 1024 * 1024) / filler.length);
+    const fd = fs.openSync(logPath, 'a');
+    for (let i = 0; i < need; i++) fs.writeSync(fd, filler);
+    fs.closeSync(fd);
+    const beforeSize = fs.statSync(logPath).size;
+    assert.ok(beforeSize > 5 * 1024 * 1024, '前提：日志必须已超过上限（实际 ' + beforeSize + '）');
+
+    fs.writeFileSync(cfgPath, JSON.stringify({
+      port, apiKey: GATEWAY_KEY, providers: [providerOf('rot-1', up)],
+    }, null, 2), 'utf8');
+    const proc = spawn(process.execPath, [MJS, '--config', cfgPath, '--log', logPath, '--port', String(port)], {
+      stdio: 'ignore', windowsHide: true,
+    });
+    try {
+      const ready = await waitHealth(port, 20000);
+      assert.ok(ready, '独立网关实例应就绪');
+      const r = await call({ port, body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+
+      assert.ok(fs.existsSync(logPath + '.1'),
+        '轮转后必须存在 gateway.log.1 —— 旧实现是把当前文件清空，永远不会产生 .1');
+      const rolled = fs.readFileSync(logPath + '.1', 'utf8');
+      assert.ok(rolled.length > 5 * 1024 * 1024,
+        '历史日志必须完整保留在 .1 里（实际 ' + rolled.length + ' 字节）');
+      assert.ok(rolled.indexOf('X'.repeat(1023)) >= 0, '历史内容必须一字不少');
+      const fresh = fs.readFileSync(logPath, 'utf8');
+      assert.ok(fresh.length < 5 * 1024 * 1024, '当前日志必须从新开始（实际 ' + fresh.length + '）');
+      assert.ok(fresh.length > 0, '当前日志不能是空的 —— 轮转之后必须继续写');
+      assert.ok(!/X{1023}/.test(fresh), '当前日志里不该再出现历史填充内容');
+    } finally {
+      try { proc.kill(); } catch { }
+      closeUp(up);
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { }
+    }
+  });
+
   for (const { name, fn } of __tests) {
     await fn();
     passed++;

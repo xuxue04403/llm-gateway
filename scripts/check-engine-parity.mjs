@@ -183,7 +183,11 @@ const DECLARED = [
   // 用户要求："不论上游模型是什么协议，对外需要同时提供 openai 和 Anthropic，openai 还得支持 responses"。
   // 实测（out/_matrix.cjs / _smatrix.cjs）：改之前 9 格里 5 格坏，而且是**200 + 错的响应体形状**。
   { name: 'wireOfName', why: '新增：线协议名归一化（含别名），矩阵的地基' },
-  { name: 'wireOfClientPath', why: '新增：客户端请求路径 → 线协议' },
+  // ⚠ 2026-10-25 第八轮审计：原条目 `wireOfClientPath`（"新增：客户端请求路径 → 线协议"）**已删除**。
+  //   那个函数从来没有被调用过（全文件 0 调用点）—— 真正的 clientWire 由两处调用方各自显式决定：
+  //   handleCompletion 的 `responsesMode ? 'openai-responses' : 'openai-chat'`、handleMessages 的常量
+  //   `'anthropic-messages'`，分派依据是 routeRequest 按路径的 if 分支。把死映射登记成"功能"，
+  //   等于在账本上给一段没人跑的代码记了一笔。函数已删，这里只留说明。
   { name: 'resolveUpstreamWire', why: '新增：逐模型 api → 供应商 protocol → 跟随客户端。**逐模型这一层是矩阵的前提**（实测 opencode-go 37 个模型分属三种协议）' },
   { name: 'upstreamEntryFor', why: '新增：返回整个模型条目（调用方要读 api）；upstreamIdFor 改为走它 —— 选择规则只留一份，避免"两处各写一遍然后漂移"' },
   { name: 'upstreamIdFor', why: '改为委托 upstreamEntryFor（行为不变）' },
@@ -200,7 +204,10 @@ const DECLARED = [
   { name: 'anthropicMessageToChatCompletion', why: '新增：Anthropic message → canonical(chat)' },
   { name: 'responsesToChatCompletion', why: '新增：Responses 响应 → canonical(chat)。含 status/incomplete_details → finish_reason 的映射（Responses 没有 finish_reason 字段）' },
   { name: 'chatToResponsesResponse', why: '新增：canonical(chat) → Responses 响应' },
-  { name: 'translateMatrixResponse', why: '新增：响应侧矩阵（upstream→chat→client），非流式' },
+  // ⚠ 2026-10-25 第八轮审计：原条目 `translateMatrixResponse`（"新增：响应侧矩阵，非流式"）**已删除**。
+  //   该函数同样 0 调用点 —— 非流式响应翻译实际由 forwardMatrixResponse 的 ② 分支完成
+  //   （先把上游读成 canon(chat)，再按 mx.clientWire 用 openaiToAnthropicMessage / chatToResponsesResponse
+  //   成形，见该函数 :10308-10312）。那里的映射与本函数是同一套的两份实现，函数已删，只留说明。
   { name: 'upstreamPathOfWire', why: '新增：线协议 → 上游请求路径' },
   { name: 'makeStreamDecoder', why: '新增：上游 SSE 帧 → canonical 事件（三种协议各一个分支）。缺 index 的上游按 id 兜底落槽，否则工具参数会串到别的调用上' },
   { name: 'makeStreamEncoder', why: '新增：canonical 事件 → 客户端 SSE 帧（三种协议各一个分支）+ 幂等 finish()' },
@@ -430,6 +437,22 @@ const DECLARED = [
   { name: 'windowOf', why: '新增：取某候选对该逻辑模型声明的 contextWindow（不可知返回 0）。注意 modelEntries 里的 contextWindow 此前**只被 write-dsh 用来写 dsh 配置**，请求路径上从未使用 —— 这是它第一次参与路由' },
   { name: 'roomyOrder', why: '新增：把"装不下这次请求"的候选**排到最后**（不删除）。与 magpie 的差别：magpie 移出候选表再在特定条件下"回补"，那套回补要在主循环维护状态；本工程直接排到最后 —— 主循环按序尝试，装得下的先跑，全都失败后自然轮到它们，语义等价、零状态。四条不做事的边界（窗口不可知/体解析不出/只有一个候选/没有候选装得下）与 magpie 一致' },
   { name: 'startServer', why: '改动：初始化 magpie 三开关（ACTIVE_LOOP_GUARD / ACTIVE_TOOL_LOOP / ACTIVE_ROOMY）。**配置优先、env 次之、缺省值最后**：`out/data` 下的 gateway.config.json 会被界面保存整份覆写，临时关一项不该逼用户改配置（与 DSH_GATEWAY_BREAKER_* 等既有开关同一套习惯）。沿用 ACTIVE_MAX_TOOLS 的模块级持有模式 —— forward() 与各 handler 拿不到 cfg' },
+
+  // —— 2026-10-25 第八轮审计（引擎内核）：三个缺陷修复 ——
+  { name: 'MODEL_BREAKER_MAX', why: '新增（审计 R8-3）：模型级冷却表的**硬上界**（默认 512，DSH_GW_MODEL_BREAKER_MAX 可调）。旧实现 `modelBreaker` 是只增不减的 Map —— 全文 0 处 `.delete(` / `.clear(`、无任何容量判断，而键的右半边是 `model`，即**客户端可控的请求体字段**。这与本文件自己写下的三条口径直接矛盾：`:839` responseAffinity「容量有界（LRU 淘汰），避免客户端可控 id 造成无界增长」、`:940` sessionAffinity（SESSION_AFFINITY_MAX=512）、`ACCOUNT_POOL_MAX=512 + 按 until 升序淘汰`。属"同一类问题只修了三处、漏了第四处"' },
+  { name: 'MODEL_BREAKER_MODEL_MAX', why: '新增（审计 R8-3）：键里 model 部分的截断长度（128，与 ACCOUNT_MODEL_KEY_MAX 同值）。该键会被拼进 `[${model}]` 日志与 noteModelCooled 的升级护栏，超长 model 名既浪费内存又把日志行撑爆' },
+  { name: 'trimModelBreaker', why: '新增（审计 R8-3）：把 modelBreaker 收口到硬上界，**只在 modelBreakerRecordFail 写表时调用**（读路径 slotIsOpen 等保持零副作用 —— 这是本文件熔断状态机的既定契约）。两轮淘汰：① 先删已过冷却且无在途探测的条目（state==="closed"）；② 仍超上界则按最近活动时间升序淘汰。刻意不直接 clear —— 那会让所有正在冷却的模型立刻复活、又去撞刚把它们限流的上游（与 accountPool 同一理由）' },
+  { name: 'modelBreakerKey', why: '改动（审计 R8-3）：model 部分截断到 MODEL_BREAKER_MODEL_MAX(128)。旧实现原样拼接客户端可控的 model 字段；三个调用点传同一个 model 值，截断后仍自洽（与 accountModelKey 在 2026-10-09 V3 审计里做的同一件事）' },
+  { name: 'modelBreakerRecordFail', why: '改动（审计 R8-3）：末尾加 trimModelBreaker()，让表有硬上界' },
+  { name: 'accountFailureRule', why: '改动（审计 R8-2）：这个函数此前是**死代码**（全文件 0 调用点，注释却写着"日志/诊断用"），而它与 classifyAccountFailure 各持一份**逐字相同**的规则遍历循环 —— 典型的"同一判定两处实现"，两份迟早漂移。现在反过来：遍历只有 accountFailureRule 一份（含"规则抛异常不影响主流程"的保护），classifyAccountFailure 委托它取 kind。两处日志（直通 :7879、翻译 :11302 一带）改为读 rule 对象，并把**命中的规则 id** 写进日志 —— 同一个 kind 可能来自三条规则（裸 401/403、session 措辞、内容拦截排除后），只说 kind 排障时分不清是哪条' },
+  { name: 'classifyAccountFailure', why: '改动（审计 R8-2）：函数体改为委托 accountFailureRule 再取 kind，消除两份重复的遍历循环。**判定顺序与语义完全不变**（ACCOUNT_FAILURE_RULES 数组顺序即契约，未动）' },
+
+  // ---- 审计 R8-4：日志轮转 ----
+  { name: 'LOG_KEEP_FILES', why: '新增（审计 R8-4）：保留几份历史日志，与宿主 src/logger.js 的 KEEP_FILES=3 同口径。旧实现的"轮转"其实是 fs.writeFileSync(LOG_PATH, "")，超过 5MB 直接把历史抹掉 —— 而出问题后想回看的恰恰是那段，排障取证是日志存在的第一理由' },
+  { name: 'rotateLogIfNeeded', why: '新增（审计 R8-4）：真轮转（gateway.log → .1 → .2 → .3，超出的丢弃），10 秒节流对齐 logger.js:131，失败只记一次 WARN 并用 appendFileSync 避免递归。log() 改调它 —— 旧实现是**每条日志**都 statSync（全文件 259 个 log() 调用点都在热路径上）' },
+  { name: 'lastRotateCheck', why: '新增（审计 R8-4）：节流状态，配合 rotateLogIfNeeded' },
+  { name: 'rotateFailed', why: '新增（审计 R8-4）：轮转失败只报一次，避免文件被占用时每 10 秒刷一条 WARN 把日志撑爆' },
+  { name: 'dumpWorkbuddy11128', why: '接线（审计 R8-1）：该函数从引入起就没被调用过（git log --all -S 只有引入那一次），但引擎注释、日志与 README 排错表**四处**都在承诺"开 DSH_GATEWAY_DUMP_WB11128=1 就能转储比对" —— 用户照做时一个字节都不会落盘，且没有任何提示，偏偏发生在唯一还在猫鼠游戏里的功能上。现在直通 forward() 与翻译 forwardAnthropicViaOpenAI() 两处 11128 分支各补一行调用（同一判定两处实现的老坑）' },
 
   // ⚠ 待办：本清单在 v1.0.7 之后就没再维护，v1.0.8–v1.0.17 的改动（OpenCode 车道、
   //   出口轮换等）大量未登记，`node scripts/check-engine-parity.mjs`

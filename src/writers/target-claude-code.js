@@ -124,7 +124,9 @@ function preview(ctx) {
     if (p) guard.push(label + '：' + p);
   }
 
-  const after = buildSettings(cfg, patch, setDefaultModel ? main : '');
+  // 预览也要按原文件的行尾 / BOM 序列化 —— 否则预览与实际写入的文本不一致，
+  // 用户看到的 diff 里全是"整份换行符变了"的噪声。
+  const after = util.stringifyJson(buildSettings(cfg, patch, setDefaultModel ? main : ''), before);
   const envBefore = (cfg.env && typeof cfg.env === 'object') ? cfg.env : {};
   const changedKeys = MANAGED_KEYS.filter((k) => String(envBefore[k] || '') !== String(patch[k] || ''));
 
@@ -167,7 +169,7 @@ function buildSettings(cfg, patch, defaultModel) {
   // 顶层 `model` 是**独立于** env.ANTHROPIC_MODEL 的另一个设置，用户本来可能写着
   // "opus[1m]" 这类厂商别名 —— 指向本网关时它解析不到任何模型，必须一起改写。
   if (defaultModel) out.model = defaultModel;
-  return JSON.stringify(out, null, 2) + '\n';
+  return out;
 }
 
 function apply(ctx) {
@@ -189,7 +191,7 @@ function apply(ctx) {
   }
   const cfg = parsed.value;
   const { patch, main, setDefaultModel } = envPatch(ctx);
-  const after = buildSettings(cfg, patch, setDefaultModel ? main : '');
+  const after = util.stringifyJson(buildSettings(cfg, patch, setDefaultModel ? main : ''), cur.text, cur.bom);
   const w = util.writeAtomic(file, after);
   // 失败时也要带上 backup：写入失败通常发生在 rename 阶段，而备份**那时已经生成**了。
   // 界面若拿不到这个路径，用户会在"写入失败"的困惑里把旁边那份唯一的原始备份当垃圾删掉。

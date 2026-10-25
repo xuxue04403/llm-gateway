@@ -681,6 +681,12 @@ let LOG_PATH = process.env.DSH_GATEWAY_LOG || path.join(APP_DIR, 'logs', 'gatewa
 
 /* ---------------- logging ---------------- */
 const LOG_MAX_BYTES = 5 * 1024 * 1024; // 日志轮转上限 5MB（修复 G3：防止长期运行磁盘膨胀）
+/**
+ * 轮转时保留几份历史文件（`gateway.log.1` / `.2` / `.3`）。
+ * 与宿主 `src/logger.js` 的 `KEEP_FILES = 3` 同口径 —— 同一个产品里两套日志
+ * 用两种轮转策略，用户找日志时会被搞糊涂。
+ */
+const LOG_KEEP_FILES = 3;
 
 /* 日志时间口径（时区可移植性修复，2026-09-11）：
  * 旧版 localStamp 用 getHours() 等**系统时区**字段；把绿色目录复制到一台时区为 UTC 的
@@ -713,21 +719,59 @@ function localStamp(d) {
   return Y + '-' + p(Mo, 2) + '-' + p(D, 2) + ' ' + p(H, 2) + ':' + p(Mi, 2) + ':' + p(S, 2) + '.' + p(Ms, 3);
 }
 
+/**
+ * 日志写入。
+ *
+ * 两条纪律（都有过事故）：
+ *  ① 换行必须转义 —— 消息里带**客户端可控**的内容（model 名、URL 路径、上游错误体…），
+ *     不转义的话一条请求就能**伪造出完整的日志行**（含伪造时间戳与级别）。
+ *     实测（2026-10-09 安全审计 V5）：`model: "nope\n[2026-10-09 00:00:00.000] breaker OPEN: ALL 失败（401）"`
+ *     → 一次请求写出 3 行日志，中间那行看起来完全像网关自己记的。
+ *     宿主侧的 logger.js:161 早就有这条转义并写明了理由，引擎这份一直漏着。
+ *     顺带也挡住"超长单行日志"的磁盘写放大（16MB 的 model 名会变成一条 16MB 的日志行）。
+ *  ② 轮转必须是**轮转**，不是清空（2026-10-25 第八轮审计 R8-4）。
+ *     旧实现 `fs.writeFileSync(LOG_PATH, '')` 把 5MB 历史直接抹掉 —— 而出问题之后
+ *     想回看的恰恰就是那段被抹掉的日志。排障取证是日志存在的第一理由，
+ *     "防磁盘膨胀"不能以删掉唯一证据为代价。现在与宿主 `src/logger.js` 同口径：
+ *     rename 成 `.1`，旧 `.1`→`.2`、`.2`→`.3`，只留 3 份。
+ *     另外原来**每条日志**都跑一次 `statSync`（全文件 259 个 log() 调用点，
+ *     转发热路径上每次都要一次 syscall）；现在按 10 秒节流，与宿主同一套做法。
+ */
+let lastRotateCheck = 0;
+let rotateFailed = false;
+function rotateLogIfNeeded() {
+  const now = Date.now();
+  if (now - lastRotateCheck < 10_000) return;   // 每 10 秒最多查一次（与宿主 logger.js:131 同口径）
+  lastRotateCheck = now;
+  let size = 0;
+  try { size = fs.statSync(LOG_PATH).size; } catch { return; }   // 文件还不存在
+  if (size < LOG_MAX_BYTES) return;
+  try {
+    for (let i = LOG_KEEP_FILES - 1; i >= 1; i--) {
+      const from = `${LOG_PATH}.${i}`;
+      const to = `${LOG_PATH}.${i + 1}`;
+      try { if (fs.existsSync(from)) fs.renameSync(from, to); } catch { /* 单个历史文件挪不动不该挡住主轮转 */ }
+    }
+    fs.renameSync(LOG_PATH, `${LOG_PATH}.1`);
+    rotateFailed = false;
+  } catch (e) {
+    // ⚠ 轮转失败**必须说出来**。静默失败会让上限形同失效、日志无上限增长，
+    // 而用户完全不知道 —— 通常原因是文件被杀软/索引器/网盘客户端锁住。
+    // 只在第一次失败时记一条（避免刷屏），且直接写文件而不是走 log()（否则递归）。
+    if (!rotateFailed) {
+      rotateFailed = true;
+      try {
+        fs.appendFileSync(LOG_PATH, `[${localStamp()}] [WARN] 日志轮转失败（${e && e.message ? e.message : e}）：`
+          + 'gateway.log 可能持续增长，请检查该文件是否被其它程序占用。\n');
+      } catch { /* 连这条都写不进去就只能放弃了 */ }
+    }
+  }
+}
+
 function log(msg) {
-  // ⚠ 必须转义换行 —— 日志消息里带**客户端可控**的内容（model 名、URL 路径、上游错误体…），
-  // 不转义的话一条请求就能**伪造出完整的日志行**（含伪造时间戳与级别）。
-  // 实测（2026-10-09 安全审计 V5）：`model: "nope\n[2026-10-09 00:00:00.000] breaker OPEN: ALL 失败（401）"`
-  // → 一次请求写出 3 行日志，中间那行看起来完全像网关自己记的。
-  // 宿主侧的 logger.js:161 早就有这条转义并写明了理由（"否则能伪造出完整的日志行"），
-  // 引擎这份一直漏着。
-  // 顺带也挡住"超长单行日志"的磁盘写放大（16MB 的 model 名会变成一条 16MB 的日志行）。
   const line = `[${localStamp()}] ${String(msg).replace(/[\r\n\u2028\u2029]+/g, '\\n')}`;
   try {
-    // 轮转：超过上限时重置文件
-    try {
-      const st = fs.statSync(LOG_PATH);
-      if (st.size > LOG_MAX_BYTES) fs.writeFileSync(LOG_PATH, '');
-    } catch { /* 日志文件可能还不存在 */ }
+    rotateLogIfNeeded();
     fs.appendFileSync(LOG_PATH, line + '\n');
   } catch { /* ignore */ }
   if (process.env.DSH_GATEWAY_VERBOSE === '1') process.stdout.write(line + '\n');
@@ -1234,11 +1278,65 @@ const breaker = new Map();                      // providerId -> { state, fails,
 const modelBreaker = new Map();
 const MODEL_BREAKER_SEP = '\u0000';
 
+/**
+ * 模型级冷却表的**硬上界**（2026-10-25 第八轮审计修复）。
+ *
+ * 旧实现 `modelBreaker` 是**只增不减**的 Map：全文 0 处 `.delete(` / `.clear(`，
+ * 也没有任何容量判断 —— 而键的右半边是 `model`，也就是**客户端可控的请求体字段**。
+ * 客户端每报一个没见过的模型名，失败 3 次就在表里永久留下一条。
+ *
+ * 这与本文件自己反复写下的三条口径直接矛盾，属于"同一类问题只修了三处、漏了第四处"：
+ *   · `:839`  responseAffinity —— "容量有界（LRU 淘汰），避免客户端可控 id 造成无界增长"
+ *   · `:940`  sessionAffinity  —— 同上（SESSION_AFFINITY_MAX = 512）
+ *   · `:3298` accountPool       —— ACCOUNT_POOL_MAX = 512 + 按 until 升序淘汰
+ * 所以这里照抄同一套做法，不发明新口径。
+ */
+const MODEL_BREAKER_MAX = envInt('DSH_GW_MODEL_BREAKER_MAX', 512);
+/**
+ * 键里 model 的截断长度（与 accountPool 的 ACCOUNT_MODEL_KEY_MAX 同值）。
+ * 键会被拼进 `[${model}]` 日志与 `noteModelCooled` 的升级护栏，超长 model 名
+ * 既浪费内存又会把日志行撑爆（日志单行有写放大限制）。
+ */
+const MODEL_BREAKER_MODEL_MAX = 128;
+
 /** 模型级冷却键。没有模型信息时返回 ''（调用方退回"只走供应商级"的旧行为）。 */
 function modelBreakerKey(providerId, model) {
   const m = String(model || '').trim();
   if (!m || !providerId) return '';
-  return String(providerId) + MODEL_BREAKER_SEP + m;
+  return String(providerId) + MODEL_BREAKER_SEP + m.slice(0, MODEL_BREAKER_MODEL_MAX);
+}
+
+/**
+ * 给 `modelBreaker` 收口到硬上界。**只在记录失败时调用**（那条路径本来就在写表）。
+ *
+ * 淘汰顺序刻意分两轮，理由与 accountPool 一致 —— 直接清空会让所有正在冷却的模型
+ * 立刻复活、又去撞刚把它们限流的上游：
+ *   ① 先删"已经无用"的：已过冷却、且没有在途探测名额的条目（`state === 'closed'`）。
+ *   ② 仍超上界 → 按**最近活动时间**升序淘汰（最该忘记的先走）。
+ *
+ * ⚠ 淘汰会丢掉条目的 `opens`（连续开闸次数），等于把该模型的退避阶梯打回第一档。
+ *   这是有意取舍：`opens` 只影响"冷却多久"，而上界失效会让整张表无界增长 ——
+ *   两害相权。而且只有超过 512 个不同模型键时才会发生，正常配置（15 家 / 54 条映射）
+ *   离上界很远。
+ */
+function trimModelBreaker() {
+  if (modelBreaker.size <= MODEL_BREAKER_MAX) return;
+  const now = Date.now();
+  for (const [k, b] of [...modelBreaker.entries()]) {
+    if (!b || (b.state === 'closed' && now >= (b.openUntil || 0))) modelBreaker.delete(k);
+  }
+  if (modelBreaker.size <= MODEL_BREAKER_MAX) return;
+  const recency = (b) => (b && (b.lastOkAt || b.lastNetFailAt || b.openUntil || 0)) || 0;
+  const byAge = [...modelBreaker.entries()].sort((a, b) => recency(a[1]) - recency(b[1]));
+  let dropped = 0;
+  for (let i = 0; i < byAge.length && modelBreaker.size > MODEL_BREAKER_MAX; i++) {
+    modelBreaker.delete(byAge[i][0]);
+    dropped += 1;
+  }
+  if (dropped > 0) {
+    log(`modelBreaker 超过上界 ${MODEL_BREAKER_MAX}，已按最近活动时间淘汰 ${dropped} 条`
+      + '（键里的 model 是客户端可控字段，不设上界会无界增长）');
+  }
 }
 
 /**
@@ -1575,6 +1673,9 @@ function modelBreakerRecordFail(providerId, model, key, httpStatus, serverRetryM
     noteModelCooled(providerId, model);   // 护栏：多模型相继冷却 → 升级为整家
   }
   modelBreaker.set(key, b);
+  // 硬上界收口（2026-10-25 审计）：只在**写表**的这条路径上做，读路径（slotIsOpen 等）
+  // 保持零副作用 —— 这是本文件熔断状态机的既定契约，不能为了清理而在读路径上删条目。
+  trimModelBreaker();
 }
 
 /**
@@ -4982,20 +5083,26 @@ const ACCOUNT_FAILURE_RULES = [
  * @returns {'rate'|'credit'|'session'|null}
  */
 function classifyAccountFailure(status, detail) {
-  const d = String(detail || '');
-  for (const rule of ACCOUNT_FAILURE_RULES) {
-    let hit = false;
-    try { hit = rule.test(status, d); } catch (_) { hit = false; }   // 规则异常绝不影响分类主流程
-    if (hit) return rule.kind;
-  }
-  return null;
+  // ⚠ 2026-10-25 第八轮审计：本函数与 accountFailureRule **曾各写一份同样的循环**，
+  // 于是 accountFailureRule（注释写着"日志/诊断用"）从来没有被调用过 —— 全文只有定义本身
+  // 一次出现，是个死函数。而它的判定逻辑必须与这里**逐字一致**，两份实现迟早漂移
+  // （本项目"同一判定两处实现"的老坑已踩过多次）。
+  // 现在改成委托：遍历只有一份，classifyAccountFailure 只负责取 kind。
+  // 规则里抛异常绝不影响分类主流程 —— 这层保护留在 accountFailureRule 里。
+  const rule = accountFailureRule(status, detail);
+  return rule ? rule.kind : null;
 }
 
-/** 命中的账户级判定规则（日志/诊断用；未命中返回 null）。 */
+/**
+ * 命中的账户级判定规则（未命中返回 null）。
+ *
+ * `classifyAccountFailure` 与日志/诊断都走这里，**遍历只有这一份**；
+ * 需要知道"到底是哪条规则命中的"时用返回的 rule 对象，而不是只看 kind。
+ */
 function accountFailureRule(status, detail) {
   const d = String(detail || '');
   for (const rule of ACCOUNT_FAILURE_RULES) {
-    try { if (rule.test(status, d)) return rule; } catch (_) { /* 忽略 */ }
+    try { if (rule.test(status, d)) return rule; } catch (_) { /* 规则异常绝不影响分类主流程 */ }
   }
   return null;
 }
@@ -7812,9 +7919,14 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         breakerReleaseSlot(provider.id, bModel);
         return rawMode ? { retryable: upstream.status } : false;
       }
-      const acctKind = classifyAccountFailure(upstream.status, detail);
+      const acctRule = accountFailureRule(upstream.status, detail);
+      const acctKind = acctRule ? acctRule.kind : null;
       if (acctKind) {
-        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为账户级失败（${acctKind}）→ 交回账户池处理（但**仍计该模型一次失败**）`);
+        // 日志带上**命中的规则 id**：只说"账户级失败（session）"时，同一个 kind 可能来自
+        // 三条规则（裸 401/403、session 措辞、内容拦截排除后），排障时分不清是哪一条。
+        // ⚠ 格式刻意保持 `（kind）` 这个完整括号 —— 既有回归用例按 `判定为账户级失败（rate）`
+        // 匹配日志，往里塞东西就等于悄悄改了别人的契约。
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为账户级失败（${acctKind}）｜命中规则 ${acctRule.id} → 交回账户池处理（但**仍计该模型一次失败**）`);
         // D1（审计修复）：账户级失败说明"这家上游是健康的、只是这个账户不行"，因此必须把刚占用的
         // 半开探测名额交还。旧实现直接 return 不释放 → 该家永久卡在 half-open
         //（breakerIsOpen 恒真）再也不会被选中，直到进程重启。
@@ -8042,6 +8154,13 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       //   按供应商粒度记失败会连坐整家。半开名额已在上方交还。
       // ⚠ 也不记账户级冷却：多账户轮换时会把所有 Key 逐个拖黑，反而更糟。
       if (WORKBUDDY_CHANNEL_BLOCK_RE.test(detail)) {
+        // 现场转储（2026-10-25 审计修复）：这一行原先**不存在** ——
+        // `dumpWorkbuddy11128` 自 a661323 引入起从未被调用过，是死代码，
+        // 而注释/日志/README 三处都在承诺"开 DSH_GATEWAY_DUMP_WB11128=1 就能转储比对"。
+        // 后果：11128 复发时用户照 README 打开开关，一个字节都不会落盘，
+        // 排错路径直接断掉 —— 偏偏这是本项目唯一还在"猫鼠游戏"里的功能。
+        // 函数自己判 env，未开启时立即 return，无额外开销。
+        dumpWorkbuddy11128(provider, lastSentBody, detail);
         const missingConv = /conversation\s+id\s+missing/i.test(String(detail || ''));
         const dropped = String(provider.auth || '').toLowerCase() === 'workbuddy'
           ? invalidateWorkBuddyCredential(provider.id) : 0;
@@ -8880,14 +8999,17 @@ function wireOfName(v) {
   return null;
 }
 
-/** 客户端请求路径 → 线协议。 */
-function wireOfClientPath(pathname) {
-  const p = String(pathname || '');
-  if (p === '/v1/messages') return 'anthropic-messages';
-  if (p === '/v1/responses') return 'openai-responses';
-  if (p === '/v1/chat/completions') return 'openai-chat';
-  return null;
-}
+/**
+ * 客户端请求路径 → 线协议。
+ *
+ * ⚠ 2026-10-25 第八轮审计：本函数**曾是一段死代码**（全文件只有定义、0 调用点）——
+ * 真正决定 clientWire 的是两处调用方各自显式写的表达式：
+ *   · `handleCompletion` (`:11857`)：`responsesMode ? 'openai-responses' : 'openai-chat'`
+ *   · `handleMessages`   (`:12300`)：常量 `'anthropic-messages'`
+ * 而它们的分派依据是 `routeRequest` 里按**路径**做的 if 分支，不是这个函数。
+ * 留着一个"看起来该被调用、实际没人调用"的映射，只会让人误以为改这里能改路由
+ * —— 那正是最坏的一种误导。**已删除**，路由语义直接看上面两处调用点。
+ */
 
 /**
  * 该模型这次该用哪条上游线协议。
@@ -9354,23 +9476,15 @@ function chatToResponsesResponse(json, model) {
 
 /**
  * 把上游响应翻译成客户端要的形状（**矩阵的响应侧，非流式**）。
- * 与 `translateMatrixRequest` 对称：上游 → canonical(chat) → 客户端。
+ *
+ * ⚠ 2026-10-25 第八轮审计：本函数**曾是一段死代码**（全文件 0 调用点）。
+ * 非流式响应翻译实际由 `forwardMatrixResponse` 的 ② 分支完成：它先把上游读成
+ * `canon`（chat 形状），再按 `mx.clientWire` 用 `openaiToAnthropicMessage` /
+ * `chatToResponsesResponse` 成形（见 `:10308-10312`）。也就是说这里的**同一套映射
+ * 在那段里又写了一遍** —— 典型的"同一判定两处实现"，两份迟早漂移，
+ * 而漂移发生时只有一份在跑，另一份是纯误导。**已删除**，要改响应翻译去改
+ * `forwardMatrixResponse` 的 ② 分支。
  */
-function translateMatrixResponse(json, upstreamWire, clientWire, model, inputTokens) {
-  if (!upstreamWire || upstreamWire === clientWire) return json;
-  let canon;
-  if (upstreamWire === 'openai-chat') canon = json;
-  else if (upstreamWire === 'anthropic-messages') canon = anthropicMessageToChatCompletion(json, model);
-  else if (upstreamWire === 'openai-responses') canon = responsesToChatCompletion(json, model);
-  else return json;
-
-  if (clientWire === 'openai-chat') return canon;
-  if (clientWire === 'anthropic-messages') {
-    return openaiToAnthropicMessage(canon, model, inputTokens);
-  }
-  if (clientWire === 'openai-responses') return chatToResponsesResponse(canon, model);
-  return canon;
-}
 
 /* ==================================================================================
  * 流式矩阵：canonical 事件管线
@@ -11203,6 +11317,16 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       // 但**必须作废凭据缓存** —— 见 forward() 里同一条分支的详细说明
       // （11128 的真实成因多为 accessToken 已不认，而不是随机风控）。
       if (WORKBUDDY_CHANNEL_BLOCK_RE.test(String(lastDetail || ''))) {
+        // 现场转储（2026-10-25 审计修复）：与直通路径同一条分支 —— 这是第 N 处
+        // "同一判定两处实现"，直通路径补了这里必须补，否则 DSH / Claude Code 这条
+        // （走得最多的）翻译路径上开关依然是死的。
+        // 只在开关真的开着时才序列化（这家已判失败，但没必要为一次转储多跑一遍
+        // JSON.stringify：1.5MB 的请求体在本机也要几毫秒）。
+        dumpWorkbuddy11128(
+          provider,
+          process.env.DSH_GATEWAY_DUMP_WB11128 === '1' ? JSON.stringify(finalBody) : null,
+          lastDetail,
+        );
         const missingConv = /conversation\s+id\s+missing/i.test(String(lastDetail || ''));
         const dropped = String(provider.auth || '').toLowerCase() === 'workbuddy'
           ? invalidateWorkBuddyCredential(provider.id) : 0;
@@ -11215,7 +11339,8 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         breakerReleaseSlot(provider.id, bModel);   // 上游连接性是健康的 → 交还半开名额（不清失败计数）
         return false;
       }
-      const acctKind = acct ? classifyAccountFailure(upstream.status, lastDetail) : null;
+      const acctRule = acct ? accountFailureRule(upstream.status, lastDetail) : null;
+      const acctKind = acctRule ? acctRule.kind : null;
       if (acctKind) {
         // F11：把 Retry-After 一并传下去。直通路径早就传了（见 forward 里的 failureSink.retryMs），
         // 翻译路径一直漏着 —— 上游明确说"600 秒后再来"时，这里只按指数退避冷却（90s 起）。
@@ -12771,11 +12896,30 @@ function writeFileAtomicDsh(file, text, backupSuffix) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   if (backupSuffix && fs.existsSync(file)) {
     const bak = file + backupSuffix;
-    try { if (!fs.existsSync(bak)) fs.copyFileSync(file, bak); } catch { /* 备份失败不阻断主流程 */ }
+    // 铁律①（对齐 src/writers/util.js）：**备份失败就中止写入**。
+    // 旧实现 `catch { /* 备份失败不阻断主流程 */ }` 会在一份"备份没建成"的文件上继续覆写 ——
+    // 而这份备份恰恰是用户唯一的回退路径（settings.yaml 会被 dsh 自己改名成 .imported）。
+    if (!fs.existsSync(bak)) {
+      try {
+        fs.copyFileSync(file, bak);
+      } catch (e) {
+        throw new Error('备份失败，已中止写入（' + (e && e.message ? e.message : e) + '）：' + bak);
+      }
+    }
   }
-  const tmp = file + '.tmp-write-dsh';
-  fs.writeFileSync(tmp, text, 'utf8');
-  fs.renameSync(tmp, file);
+  // 铁律②：临时名必须带 pid + 随机后缀。旧实现固定 `.tmp-write-dsh`，
+  // 两个 --write-dsh 并发（界面连点保存、或 GUI 与脚本同时写）会互相覆盖临时文件，
+  // rename 之后的可能是"另一份内容"，而两边都报成功。
+  const tmp = file + '.tmp-write-dsh-' + process.pid + '-' + Math.random().toString(36).slice(2, 10);
+  try {
+    fs.writeFileSync(tmp, text, 'utf8');
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    // 铁律③：rename 失败时**必须清掉临时文件**。它里面是刚合成的完整配置
+    //（含明文 apiKey），留在用户目录里既是垃圾也是泄漏面。
+    try { fs.unlinkSync(tmp); } catch (_) { /* 忽略 */ }
+    throw e;
+  }
 }
 
 /**
@@ -13078,6 +13222,12 @@ ${modelLines}`;
     ? path.join(envProfileDir, 'cordis.patch.yml')
     : path.join(profilesRoot, profileName, 'cordis.patch.yml'));
   const profileDir = path.dirname(patchPath);
+  // 审计 R9-M2：profile patch 是 **dsh 0.1.7+ 真正加载的载体**（settings.yaml 已退化成
+  // 一次性导入源）。旧实现 patch 失败时只打 stderr 就继续，函数正常返回 →
+  // 退出码 0 → target-dsh.js 只看 settings/credentials 是否落盘 → 界面弹"写入成功"，
+  // 而 dsh 的模型选择器里根本没有 gateway，stderr 文案还被塞进成功弹窗的日志块里。
+  // 现在记下失败原因，等三份文件都尝试过之后**统一抛错**（走到最外层 exit 2）。
+  let patchFailure = '';
   if (fs.existsSync(profileDir)) {
     let patch = fs.existsSync(patchPath) ? fs.readFileSync(patchPath, 'utf8') : '';
     const patchBefore = patch;
@@ -13085,16 +13235,23 @@ ${modelLines}`;
       // patch 比 settings.yaml 多一层（`- id:` 数组项 → config → providers），整体 +2 缩进
       patch = upsertGatewayInPatch(patch, reindentBlock(block, 2));
     } catch (e) {
-      // 改不了就**如实说**，绝不静默跳过 —— 否则用户以为网关已经注册好了。
-      // settings.yaml 那边已经写成功（老版本仍可用），所以这里不整体失败。
+      patchFailure = (e && e.message ? e.message : String(e)) + '（文件：' + patchPath + '）';
       console.error(`[write-dsh] ⚠ profile patch 未写入：${e && e.message ? e.message : e}`);
       console.error(`[write-dsh]   文件：${patchPath}`);
-      console.error('[write-dsh]   settings.yaml 已写入；新版 dsh 还需你手工把 gateway 加进 profile patch。');
+      console.error('[write-dsh]   settings.yaml 已写入；新版 dsh 还需把 gateway 加进 profile patch。');
       patch = patchBefore;
     }
     if (patch !== patchBefore) {
-      writeFileAtomicDsh(patchPath, patch, '.bak-gateway');
-      console.log(`[write-dsh] profile patch (${profileName}): llm-pi-ai.config.providers.gateway upserted → ${patchPath}`);
+      // 写入本身也可能抛（备份失败 / rename 失败），同样记为 patch 失败 ——
+      // 它在 settings.yaml 之后、credentials 之前，不能让它中断后两份的写入，
+      // 但必须让最终退出码非零，否则界面依然报"成功"。
+      try {
+        writeFileAtomicDsh(patchPath, patch, '.bak-gateway');
+        console.log(`[write-dsh] profile patch (${profileName}): llm-pi-ai.config.providers.gateway upserted → ${patchPath}`);
+      } catch (e) {
+        patchFailure = (e && e.message ? e.message : String(e)) + '（文件：' + patchPath + '）';
+        console.error(`[write-dsh] ⚠ profile patch 写入失败：${e && e.message ? e.message : e}`);
+      }
     } else {
       console.log(`[write-dsh] profile patch (${profileName}): no change needed`);
     }
@@ -13120,6 +13277,12 @@ ${modelLines}`;
   // 而它装着用户全部供应商密钥）
   writeFileAtomicDsh(credsPath, creds, '.bak-gateway');
   console.log(`[write-dsh] credentials.yaml: DSH_GATEWAY_API_KEY set`);
+  // 三份都尝试过之后再决定成败：patch 失败 = 新版 dsh 里看不到网关，必须非零退出，
+  // 否则 target-dsh 的"只看 settings/credentials"判定会把它当成成功。见上面 patchFailure 的说明。
+  if (patchFailure) {
+    throw new Error('profile patch 写入失败，dsh 0.1.7+ 不会加载网关配置：' + patchFailure
+      + '。settings.yaml / credentials.yaml 已写入，可先用老版本 dsh，或按上面提示手工补 patch。');
+  }
   console.log(`[write-dsh] OK — gateway registered at ${baseURL} with ${models.length} models`);
 }
 

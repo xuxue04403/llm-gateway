@@ -218,8 +218,19 @@ function validateConfigText(text) {
   }
   // 统一 Key 必须能通过运行期鉴权门槛（trim 后 ≥16 字符，fail-closed）。
   // 否则会出现"网关运行中、/health 返回 200、但每个模型请求都 401"。
-  if (cfg.apiKey !== undefined && cfg.apiKey !== null && String(cfg.apiKey).trim() !== '') {
+  //
+  // ⚠ 三态要分清（审计 R9-M4）：
+  //   · 字段**缺失**（undefined / null）→ 放行。这是有意的：老配置与"只想先跑起来"的场景，
+  //     引擎 authorized() 本来就 fail-closed，不算配置错误（edge.test.js 有钉子）。
+  //   · 字段**存在但为空串/全空白** → 拦。用户是"试图设一个 Key"却留空了，
+  //     旧实现把它和"缺失"一起跳过，于是保存成功、网关起来、每个请求 401，且界面没有任何提示。
+  //   · 字段存在且有内容 → 走占位值/长度检查。
+  const keyPresent = cfg.apiKey !== undefined && cfg.apiKey !== null;
+  if (keyPresent) {
     const k = String(cfg.apiKey).trim();
+    if (k === '') {
+      return { ok: false, error: 'apiKey 被显式设成了空值：网关能启动、/health 返回 200，但每个模型请求都会 401。请填一个 ≥16 字符的随机 Key，或直接删掉这个字段（=不启用网关鉴权）。' };
+    }
     if (k === 'dsh-gateway-change-me') {
       return { ok: false, error: 'apiKey 仍是示例占位值（dsh-gateway-change-me）：本机任何进程都能白用你的上游额度，请改成自己的随机 Key' };
     }
@@ -497,6 +508,9 @@ class GatewayManager extends EventEmitter {
     this.port = 3091;
     this.lastActivityAt = 0;
     this._starting = null;
+    // restart 自身的串行标记（审计 R9-M7）。必须是 start 之外**独立**的一个：
+    // start 的互斥防不住 killStaleGatewayProcesses 把对方刚 spawn 的引擎杀掉。
+    this._restarting = null;
     this._healTimes = [];
 
     this.ensureRuntime();
@@ -588,9 +602,19 @@ class GatewayManager extends EventEmitter {
       // 单靠"改构建脚本"只是堵住了那一条路径；配置本身没有历史，
       // 任何一次误删/误写都不可逆。这里补上历史。
       try { this._backupConfig(); } catch (e) { this.log('配置备份失败（不影响保存）：' + (e && e.message)); }
-      const tmp = this.configPath + '.tmp-' + process.pid;
-      fs.writeFileSync(tmp, text, 'utf8');
-      fs.renameSync(tmp, this.configPath);      // 原子写：半截 JSON 会让网关下次起不来
+      // 临时名必须带**随机**后缀，不能只带 pid（审计 R9-M8）。
+      // 同进程内两次保存（界面连点、或保存与导入并发）会共用同一个临时路径：
+      // 第二次 rename 可能 ENOENT（界面报"配置写入失败"，其实已写成功），
+      // 也可能把"后写的那份内容"当成第一次的结果返回。writers/util.js 早就是这么做的。
+      const tmp = this.configPath + '.tmp-' + process.pid + '-' + Math.random().toString(36).slice(2, 10);
+      try {
+        fs.writeFileSync(tmp, text, 'utf8');
+        fs.renameSync(tmp, this.configPath);    // 原子写：半截 JSON 会让网关下次起不来
+      } catch (e) {
+        // rename 失败时清掉临时文件：它可能含明文供应商密钥，留在数据目录里既是垃圾也是泄漏面。
+        try { fs.unlinkSync(tmp); } catch (_) { /* 忽略 */ }
+        throw e;
+      }
       this.log('网关配置已保存。');
       if (this.running && !(opts && opts.noRestart)) await this.restart();
       return { ok: true, error: null };
@@ -1073,11 +1097,34 @@ class GatewayManager extends EventEmitter {
     this.emit('state');
   }
 
-  async restart() {
-    await this.stop();
-    await this.killStaleGatewayProcesses();     // 其他实例/旧版本的残留也会占端口、延续旧熔断状态
-    await this.waitPortFree(this.port, 4000);
-    await this.start();
+  /**
+   * 重启网关。**刻意不是 `async`**：`async` 方法每次调用都会把返回值再包一层新 promise，
+   * 于是"并发调用拿到同一个 promise"这件事永远做不到（`restart() === restart()` 恒 false），
+   * 调用方也无法共享同一次重启的结果与错误。这里直接返回在飞的那个 promise，
+   * 语义上对 `await gateway.restart()` 的调用方完全等价。
+   */
+  restart() {
+    // 审计 R9-M7：restart 自身必须串行。
+    //
+    // 旧实现没有任何在飞标记，只靠 `start()` 里的 `if (this._starting)` 防并发 start。
+    // 但 killStaleGatewayProcesses() 是**按 configPath 标记去杀进程**的 ——
+    // 两次 restart 交叠时，后一次会把前一次刚 spawn 的引擎杀掉，被杀的进程
+    // `stopping === false` 于是被当成"异常退出"触发 _scheduleHeal，
+    // 日志里凭空多出"网关异常退出"，端口还会短暂不可用。
+    // 用户侧的表现就是：连点几次"保存"之后网关莫名其妙重启了两轮。
+    if (this._restarting) return this._restarting;
+    const p = (async () => {
+      try {
+        await this.stop();
+        await this.killStaleGatewayProcesses();   // 其他实例/旧版本的残留也会占端口、延续旧熔断状态
+        await this.waitPortFree(this.port, 4000);
+        await this.start();
+      } finally {
+        this._restarting = null;
+      }
+    })();
+    this._restarting = p;
+    return p;
   }
 
   /* ---------------- 健康 ---------------- */

@@ -22,10 +22,57 @@ function readText(p) {
   try { return fs.readFileSync(p, 'utf8'); } catch (_) { return ''; }
 }
 
+/**
+ * UTF-8 BOM（U+FEFF）处理。
+ *
+ * 为什么必须有（审计实测，2026-10-25）：
+ * Windows 上的编辑器（记事本、部分 VS Code 配置、PowerShell `Set-Content -Encoding utf8BOM`）
+ * 会往文件开头写一个 BOM。TOML / JSON 的解析器大多**不认**它当成内容之外的记号，
+ * 而我们的 upsert 逻辑（`tomlUpsertTopKey` 把新键插到首个表头之前）会把这个 BOM
+ * 从第 0 位**推到文件中段** —— 于是写出一个"开头干净、中段藏着 \uFEFF"的文件：
+ *
+ *   写前：`\uFEFF[mcp_servers.x]\ncommand = "node"\n`   ← Codex 本来就读这个文件（也读不顺，但至少没更坏）
+ *   写后：`cli_auth_credentials_store = "file"\n\n...\n\uFEFF[mcp_servers.x]`  ← 中段 BOM，铁定解析失败
+ *
+ * 而 `tomlValidate` 同样不看 BOM，于是"写前自检 + 写后复核"两道闸门**全部放行**，
+ * 界面报"写入成功"。用户的 Codex 从此读不了自己的配置，且没有任何提示。
+ *
+ * 处置：入口剥、出口按原样补。`stripBom` 用于所有"内容解析/合成"路径；
+ * `withBom` 只在写回时用，保持用户文件原来的字节形态不被我们擅自改变。
+ */
+const BOM = '\uFEFF';
+
+function stripBom(text) {
+  const t = String(text == null ? '' : text);
+  return t.charCodeAt(0) === 0xFEFF ? t.slice(1) : t;
+}
+
+function hasBom(text) {
+  return String(text == null ? '' : text).charCodeAt(0) === 0xFEFF;
+}
+
+/**
+ * 写回时按"原文件是否带 BOM"决定补不补。
+ *
+ * @param {string} text 已剥 BOM 的新内容
+ * @param {string} [originalText] 原文件内容（RAW，含 BOM 才能判出来）
+ * @param {boolean} [bomAtStart] 已知原文件是否带 BOM 时直接给（`readTarget` 的 `bom` 字段），
+ *                              省掉一次猜测 —— 当 `text` 来自已剥 BOM 的 `readTarget().text` 时，
+ *                              `originalText` 已经不含 BOM，靠它推断会判错。
+ */
+function withBom(text, originalText, bomAtStart) {
+  const body = stripBom(text);
+  const bom = bomAtStart === undefined ? hasBom(originalText) : !!bomAtStart;
+  return bom ? BOM + body : body;
+}
+
 /** 读 JSON；文件不存在返回 fallback；解析失败返回 { __parseError }。 */
 function readJson(p, fallback) {
   if (!exists(p)) return fallback === undefined ? {} : fallback;
-  const t = readText(p);
+  // 剥 BOM 再 parse：JSON.parse 对 `\uFEFF` 开头会直接抛
+  // `Unexpected token '\uFEFF'`，于是一份"只是带 BOM"的合法 JSON 会被判成
+  // __parseError，preview 报警、apply 中止 —— 用户看到的却是"我的文件明明是对的"。
+  const t = stripBom(readText(p));
   if (!t.trim()) return fallback === undefined ? {} : fallback;
   try {
     const v = JSON.parse(t);
@@ -113,7 +160,10 @@ function writeAtomic(file, text) {
 function readTarget(file) {
   try {
     if (!exists(file)) return { ok: true, exists: false, text: '' };
-    return { ok: true, exists: true, text: fs.readFileSync(file, 'utf8') };
+    const raw = fs.readFileSync(file, 'utf8');
+    // 剥 BOM 再交给调用方解析：TOML/JSON 解析器都不认它，留着只会让"合法文件"被判成坏文件，
+    // 或者（更糟）让 upsert 把它推到文件中段。写回时由 writeAtomic 的调用方按 hasBom 补回。
+    return { ok: true, exists: true, text: stripBom(raw), bom: hasBom(raw) };
   } catch (e) {
     return { ok: false, exists: true, text: '', error: e && e.message ? e.message : String(e) };
   }
@@ -137,10 +187,29 @@ function parseJsonObject(text) {
 function restore(file, suffixes) {
   const info = backupInfo(file, suffixes);
   if (!info) return { ok: false, error: '没有可用的备份：' + file + '（找过 ' + candidateSuffixes(suffixes).join(' / ') + '）' };
-  // 恢复前先把"当前内容"留一份 —— 用户可能想反悔（恢复错了备份）
+  // 恢复前先把"当前内容"留一份 —— 用户可能想反悔（恢复错了备份）。
+  //
+  // ⚠ 审计 R9-L4：**已经存在就换一个名字，绝不覆盖**。
+  // 旧实现用固定名 `.bak-llmgateway-before-restore`，第二次点「恢复」会把你第一次恢复前
+  // 那份内容直接盖掉 —— 于是"连点两次恢复"之后，能回溯的只剩一层，
+  // 而这恰恰是用户最需要多层历史的时刻（第一次恢复错了，想找回原样）。
   let before = '';
   if (exists(file)) {
     before = file + '.bak-llmgateway-before-restore';
+    if (exists(before)) {
+      // 找到第一个没被占用的编号（上限 100，避免异常情况下无限试探）
+      let n = 1;
+      for (; n <= 100; n++) {
+        const cand = before + '.' + n;
+        if (!exists(cand)) { before = cand; break; }
+      }
+      if (n > 100) {
+        return {
+          ok: false,
+          error: '恢复前无法备份当前内容，已中止（不动原文件）：.bak-llmgateway-before-restore 及其 .1~.100 都已存在，请先清理',
+        };
+      }
+    }
     try {
       fs.copyFileSync(file, before);
     } catch (e) {
@@ -581,6 +650,27 @@ function keepEol(result, originalText) {
 }
 
 /**
+ * 把对象序列化成"与原文件同风格"的 JSON 文本（行尾 + BOM 两项都跟着原文走）。
+ *
+ * 为什么需要（审计实测，2026-10-25）：三个 JSON writer 原来都硬编码
+ * `JSON.stringify(x, null, 2) + '\n'`，而 `keepEol` 只被两条 TOML 路径调用。结果是
+ * 一个 CRLF 的 `~/.claude/settings.json` 被整份翻成 LF（实测 `CR 5 → 0`），
+ * git diff 全红 —— 正是历史上 TOML 那条缺陷的翻版，只是换了个文件格式。
+ *
+ * @param {*} value
+ * @param {string} originalText 目标文件改写前的原始内容（没见过这个文件时传 ''）。
+ *                              **应当是 raw**（含 BOM）；若来自 readTarget（已剥 BOM），
+ *                              请显式传第三个参数。
+ * @param {boolean} [bomAtStart] 原文件是否带 BOM；缺省从 originalText 首字符推断。
+ */
+function stringifyJson(value, originalText, bomAtStart) {
+  const json = JSON.stringify(value, null, 2) + '\n';
+  const body = keepEol(json, stripBom(originalText));
+  const bom = bomAtStart === undefined ? hasBom(originalText) : !!bomAtStart;
+  return bom ? BOM + body : body;
+}
+
+/**
  * 在 TOML 文本里 upsert 整张表（如 `[model_providers.llmgateway]`）。
  * 表已存在 → 整段替换；不存在 → 追加到文件末尾。
  *
@@ -714,9 +804,30 @@ function endsInsideQuote(code) {
  * @returns {string} 空串 = 通过；否则是给人看的错误说明
  */
 function tomlValidate(text) {
-  const src = String(text == null ? '' : text);
+  // 剥 BOM：TOML 规范不认 U+FEFF，但 Windows 编辑器会写。若不剥，
+  // 一份"只是带 BOM"的合法文件会被判成坏文件（过度拦截），而带 BOM 的**坏**文件
+  // 又会因为行形状检查被 BOM 前缀搅乱而给出误导性错误。统一剥掉再验。
+  const src = stripBom(String(text == null ? '' : text));
   const lines = src.split(/\r?\n/);
   const lex = tomlLexMemo(lines);
+
+  // 0) 中段 BOM：这是"文件被写坏"的确定信号，必须报错而不是放行。
+  //
+  //    现场（审计实测，2026-10-25）：`tomlUpsertTopKey` 把新键插到首个表头之前，
+  //    原文件开头的 `\uFEFF` 就被推到文件中段，写出：
+  //      cli_auth_credentials_store = "file"\n\n...\n\uFEFF[mcp_servers.x]
+  //    Codex 的解析器直接 `TOMLDecodeError: Invalid statement`，而旧版 tomlValidate
+  //    只看行形状（`\uFEFF[mcp...]` trim 后仍以 `[` 开头、有右括号）→ 判为合法，
+  //    写前自检与写后复核两道闸门全放行，界面报"写入成功"。
+  //    头部的 BOM 已经在上面的 stripBom 里剥掉了，这里剩下的任何 `\uFEFF`
+  //    都是"不该在这儿"的。
+  {
+    const idx = src.indexOf(BOM);
+    if (idx >= 0) {
+      const line = src.slice(0, idx).split(/\r?\n/).length;
+      return '第 ' + line + ' 行出现多余的 BOM（U+FEFF）—— 文件开头之外不允许 BOM，Codex 的 TOML 解析器会拒绝整份文件';
+    }
+  }
 
   // 0) 行形状：代码行必须是"键 = 值"、表头或注释之一。
   //
@@ -875,4 +986,5 @@ module.exports = {
   tomlScanHeaders, tomlSectionRange, tomlTopKeyLine, tomlString, tomlUpsertTopKey, tomlUpsertTable, tomlReadTable, tomlUnquote,
   tomlHeaderKey,
   tomlValidate,
+  BOM, stripBom, hasBom, withBom, stringifyJson,
 };

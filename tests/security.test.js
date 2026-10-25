@@ -379,18 +379,42 @@ t('生成的 shell 脚本：恶意模型名与 Key 都不得跳出引号', () =>
  * 收尾：确认没碰真实用户目录
  * ================================================================ */
 
+/**
+ * 守卫自证（审计 R9-L1）：这台机器上真实目录不存在时，上面的断言会**空转通过** ——
+ * 一条永远为真的守卫等于没有守卫。这里先用一份合成的"脏文件"证明检测逻辑本身是活的，
+ * 再把实际巡检到的文件数报出来，让"什么都没检查"看得见。
+ *
+ * @param {(text: string) => void} check 接受文件内容、不干净就 throw 的检测函数
+ * @returns {number} 实际巡检的文件数
+ */
+function guardSelfTest(check) {
+  // 活体样本：把测试 Key 塞进去，检测函数必须报错。若它不报错，说明守卫是死的。
+  let caught = false;
+  try { check('some = "value"\nkey = "' + KEY + '"\n'); } catch (_) { caught = true; }
+  assert.ok(caught, '守卫自证失败：把测试 Key 写进样本后检测函数竟然没有报错 —— 这条守卫是空转的');
+  return 0;   // 计数由调用方累加
+}
+
 t('测试自身：所有写入都落在临时目录里（绝不碰真实用户目录）', () => {
   for (const d of fs.readdirSync(tmp)) {
     assert.ok(path.join(tmp, d).startsWith(os.tmpdir()), '测试产物必须在临时目录：' + d);
   }
+  guardSelfTest((text) => {
+    assert.ok(!text.includes(KEY), '真实用户文件里不得出现测试 Key');
+    assert.ok(!text.includes('sk-user-OTHER-CLIENT-SECRET'), '真实用户文件里不得出现测试密钥');
+  });
+  let inspected = 0;
   for (const real of ['.claude/settings.json', '.codex/config.toml', '.dsh/settings.yaml', '.iflow/settings.json']) {
     const p = path.join(os.homedir(), ...real.split('/'));
     if (fs.existsSync(p)) {
+      inspected++;
       const text = fs.readFileSync(p, 'utf8');
       assert.ok(!text.includes(KEY), '真实用户文件里不得出现测试 Key：' + p);
       assert.ok(!text.includes('sk-user-OTHER-CLIENT-SECRET'), '真实用户文件里不得出现测试密钥：' + p);
     }
   }
+  // 不让"一个文件都没巡检"悄悄通过：这是"什么都没验证"的合法但需要被看见的状态。
+  console.log('        （本轮巡检真实用户文件 ' + inspected + ' 个；0 个时上面的断言没有实际检查任何东西）');
 });
 
 t('测试自身：绝不写进真实的 dsh profile（DSH_PROFILE_DIR 陷阱）', () => {
@@ -401,27 +425,34 @@ t('测试自身：绝不写进真实的 dsh profile（DSH_PROFILE_DIR 陷阱）'
   //
   // 这条守卫直接检查真实 profile：要么不存在，要么不得含测试夹具的痕迹。
   // （只做"是否被测试污染"的判定，不改动任何真实文件。）
-  const profilesRoot = path.join(os.homedir(), '.dsh', 'profiles');
-  if (!fs.existsSync(profilesRoot)) return;
   const marks = ['alpha-model', 'beta-model', 'zeta-model', 'sk-user-OTHER-CLIENT-SECRET'];
-  const walk = (dir, depth) => {
-    if (depth > 2) return;
-    let entries = [];
-    try { entries = fs.readdirSync(dir); } catch (_) { return; }
-    for (const n of entries) {
-      const p = path.join(dir, n);
-      let st;
-      try { st = fs.statSync(p); } catch (_) { continue; }
-      if (st.isDirectory()) { walk(p, depth + 1); continue; }
-      if (!/\.(yml|yaml|json)$/.test(n)) continue;
-      const text = fs.readFileSync(p, 'utf8');
-      for (const m of marks) {
-        assert.ok(!text.includes(m), '真实 dsh profile 被测试污染了（含 ' + m + '）：' + p);
-      }
-      assert.ok(!text.includes(KEY), '真实 dsh profile 里出现了测试统一 Key：' + p);
+  const check = (text) => {
+    for (const m of marks) {
+      assert.ok(!text.includes(m), '真实 dsh profile 被测试污染了（含 ' + m + '）');
     }
+    assert.ok(!text.includes(KEY), '真实 dsh profile 里出现了测试统一 Key');
   };
-  walk(profilesRoot, 0);
+  guardSelfTest(check);
+  const profilesRoot = path.join(os.homedir(), '.dsh', 'profiles');
+  let inspected = 0;
+  if (fs.existsSync(profilesRoot)) {
+    const walk = (dir, depth) => {
+      if (depth > 2) return;
+      let entries = [];
+      try { entries = fs.readdirSync(dir); } catch (_) { return; }
+      for (const n of entries) {
+        const p = path.join(dir, n);
+        let st;
+        try { st = fs.statSync(p); } catch (_) { continue; }
+        if (st.isDirectory()) { walk(p, depth + 1); continue; }
+        if (!/\.(yml|yaml|json)$/.test(n)) continue;
+        inspected++;
+        check(fs.readFileSync(p, 'utf8'));
+      }
+    };
+    walk(profilesRoot, 0);
+  }
+  console.log('        （本轮巡检真实 profile 文件 ' + inspected + ' 个；0 个时上面的断言没有实际检查任何东西）');
 });
 
 run();

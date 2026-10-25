@@ -52,6 +52,31 @@ t('util.restore：恢复备份，并把当前内容另存为 before-restore', ()
   assert.strictEqual(fs.readFileSync(f + '.bak-llmgateway-before-restore', 'utf8'), '改过');
 });
 
+t('util.restore：连点两次恢复不得覆盖掉第一份 before-restore（审计 R9-L4）', () => {
+  // 现场：固定名 `.bak-llmgateway-before-restore` 会让第二次恢复把第一次那份内容盖掉。
+  // 而"连点两次恢复"恰恰是用户最需要多层历史的时刻（第一次恢复错了备份，想找回原样）。
+  const f = path.join(tmp, 'atomic-restore-twice.json');
+  fs.writeFileSync(f, 'v0', 'utf8');
+  util.writeAtomic(f, 'v1');            // 备份 = v0
+  const r1 = util.restore(f);           // 文件回到 v0，before-restore = v1
+  assert.strictEqual(r1.ok, true);
+  assert.strictEqual(fs.readFileSync(f, 'utf8'), 'v0');
+
+  // 再改一次、再恢复一次
+  util.writeAtomic(f, 'v2');
+  const r2 = util.restore(f);
+  assert.strictEqual(r2.ok, true);
+  // 两份 before-restore 必须都在，且内容各自不同 —— 旧实现这里只剩一份（被 v0 覆盖）
+  assert.notStrictEqual(r1.before, r2.before,
+    '两次恢复必须落在不同的 before-restore 文件上（旧实现固定名会覆盖）：' + r1.before + ' / ' + r2.before);
+  assert.strictEqual(fs.readFileSync(r1.before, 'utf8'), 'v1', '第一份必须是第一次恢复前的内容');
+  // 第二份 = 第二次恢复前的当前内容。
+  // ⚠ 注意这里是 'v2' 而不是 'v0'：`writeAtomic` 的备份是"首次备份"语义
+  //（`if (!exists(bak))` 才建），所以 restore 之后 .bak 里仍是最初那份 v0，
+  // 第二次恢复恢复的依然是 v0，而 before-restore 记的是"恢复前的现场" v2。
+  assert.strictEqual(fs.readFileSync(r2.before, 'utf8'), 'v2', '第二份必须是第二次恢复前的现场内容');
+});
+
 t('util.writeAtomic：父目录不存在时自动创建（新机器上 ~/.codex 可能还没有）', () => {
   const f = path.join(tmp, 'deep', 'a', 'b', 'x.json');
   const r = util.writeAtomic(f, '{}');
@@ -1920,6 +1945,63 @@ t('presets.presetToProvider：-free 后缀按引擎同规则归一为 as', () =>
   }, {});
   assert.strictEqual(p.models[0].as, 'deepseek-v4.1-flash', '带 -free 的应归一去后缀');
   assert.strictEqual(p.models[1].as, undefined, '不带后缀的不应生成 as');
+});
+
+/* ==================== 审计 R9：写入层的并发与串行 ====================
+ * 这两条都来自宿主层审计（2026-10-25），共同点是"两个动作同时发起时互相踩"：
+ *  · saveConfig 的临时文件名只带 pid → 同进程并发保存共用一个临时路径
+ *  · restart 没有在飞标记 → killStaleGatewayProcesses 会杀掉对方刚 spawn 的引擎
+ */
+t('saveConfig：临时文件名必须带随机后缀（同进程并发保存不得共用一个 tmp）', async () => {
+  const dir = fs.mkdtempSync(path.join(tmp, 'save-tmp-'));
+  const gm = new GatewayManager({ dataDir: dir, logger: { info: () => {} }, settings: null });
+  const good = { port: 3091, apiKey: 'dsh-gateway-test-0123456789abcdef', providers: [{ id: 'a', baseURL: 'https://a.example/v1', apiKey: 'k' }] };
+  const r = await gm.saveConfig(JSON.stringify(good));
+  assert.strictEqual(r.ok, true, '保存应成功：' + r.error);
+  // 落盘正确
+  const onDisk = JSON.parse(fs.readFileSync(gm.configPath, 'utf8'));
+  assert.strictEqual(onDisk.providers[0].id, 'a');
+  // 目录里不得残留任何临时文件（rename 之后 tmp 必须已经不在了）
+  const leftovers = fs.readdirSync(dir).filter((f) => f.indexOf('.tmp-') >= 0);
+  assert.deepStrictEqual(leftovers, [], '保存后不应留下临时文件：' + JSON.stringify(leftovers));
+  // 并发保存两次：两次都必须 ok，且最终内容必须是其中一次的完整内容（不能是半截/ENOENT）
+  const cfgA = Object.assign({}, good, { routing: 'failover' });
+  const cfgB = Object.assign({}, good, { routing: 'round-robin' });
+  const [ra, rb] = await Promise.all([gm.saveConfig(JSON.stringify(cfgA)), gm.saveConfig(JSON.stringify(cfgB))]);
+  assert.strictEqual(ra.ok, true, '第一次并发保存失败：' + ra.error);
+  assert.strictEqual(rb.ok, true, '第二次并发保存失败（旧实现固定 tmp 名会 ENOENT）：' + rb.error);
+  const final = JSON.parse(fs.readFileSync(gm.configPath, 'utf8'));
+  assert.ok(final.routing === 'failover' || final.routing === 'round-robin',
+    '最终内容应是两次保存之一的完整结果，实际：' + JSON.stringify(final.routing));
+  const leftovers2 = fs.readdirSync(dir).filter((f) => f.indexOf('.tmp-') >= 0);
+  assert.deepStrictEqual(leftovers2, [], '并发保存后不应留下临时文件：' + JSON.stringify(leftovers2));
+});
+
+t('restart：并发调用必须串行（后一次不得杀掉前一次刚起的引擎）', async () => {
+  const dir = fs.mkdtempSync(path.join(tmp, 'restart-lock-'));
+  const gm = new GatewayManager({ dataDir: dir, logger: { info: () => {} }, settings: null });
+  // 不打桩真起进程，只数"实际执行了几轮 restart 序列"
+  let stopCalls = 0, killCalls = 0, startCalls = 0;
+  gm.stop = async () => { stopCalls++; await new Promise((r) => setTimeout(r, 20)); };
+  gm.killStaleGatewayProcesses = async () => { killCalls++; };
+  gm.waitPortFree = async () => {};
+  gm.start = async () => { startCalls++; };
+
+  // ⚠ 必须先拿到 promise 本身再比较：`await Promise.all([...])` 解构出来的是**解析后的值**
+  //（restart 返回 undefined），拿 undefined === undefined 比较恒真 —— 那是一条
+  // "因错误原因通过"的断言（本项目审计明令禁止的形态）。
+  const p1 = gm.restart();
+  const p2 = gm.restart();
+  const p3 = gm.restart();
+  assert.strictEqual(p1, p2, '并发的第二次 restart 必须直接拿到第一次的 promise（旧实现会各起一轮）');
+  assert.strictEqual(p2, p3, '并发的第三次 restart 必须直接拿到第一次的 promise');
+  await Promise.all([p1, p2, p3]);
+  assert.strictEqual(stopCalls, 1, '三次并发 restart 只能真正执行一轮，实际 stop 被调用 ' + stopCalls + ' 次');
+  assert.strictEqual(killCalls, 1, 'killStaleGatewayProcesses 只能跑一次，实际 ' + killCalls + ' 次');
+  assert.strictEqual(startCalls, 1, 'start 只能跑一次，实际 ' + startCalls + ' 次');
+  // 串行结束后必须复位：再调一次要真的再执行一轮
+  await gm.restart();
+  assert.strictEqual(stopCalls, 2, 'restart 结束后 _restarting 必须复位，第二次调用应重新执行');
 });
 
 run();

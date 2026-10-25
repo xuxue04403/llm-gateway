@@ -1627,3 +1627,116 @@ magpie 三项：循环守卫=on 工具死循环拦截=on 上下文窗口过滤=o
   `roomyLearn` 常态开着来兜。
 - `workbuddy` 的 `space-bunny`、`windhub` 的 `gpt-6-luna`（上游目录里都没有这个 ID）、
   `aihubmix.com` 的 6 条免费档 —— 三处**没有任何来源**，只能留空（roomy 对它们不动作）。
+
+## T. 第十轮：引擎内核 + 宿主层 18 条缺陷（2026-10-25）
+
+### T.1 结论先行
+
+用户要求"审计 dsh-app 并规划新功能"。`D:\IDE\dsh\dsh-app` 是 9/29 的陈旧副本，真实工程是
+`D:\IDE\dsh\llm-gateway`（v1.0.19）。本轮用**两个独立子代理**（安全面 / 宿主层与写入层）加我自己
+的内核自查，共修掉 **18 条**：引擎内核 4 条（含 1 条"文档承诺的功能从来没接上线"），宿主层
+1 严重 + 8 中等 + 5 轻微。
+
+最值得记的三条：
+
+1. **`dumpWorkbuddy11128` 从写下的那天起就没被调用过**，而引擎注释、日志和 README 排错表
+   **四处**都在承诺"开 `DSH_GATEWAY_DUMP_WB11128=1` 就能转储比对"。用户 11128 复发时照做，
+   一个字节都不会落盘 —— 排错路径直接断掉，且偏偏发生在唯一还在猫鼠游戏里的功能上。
+2. **日志"轮转"其实是清空**（`fs.writeFileSync(LOG_PATH, '')`）。超 5MB 直接抹掉历史，
+   而出问题后想回看的恰恰是那段 —— 排障取证是日志存在的第一理由。
+3. **`config.toml` 带 BOM 会被写坏，且自带的 TOML 校验器看不见**：`tomlUpsertTopKey` 把新键插到
+   文件最前面，把开头的 BOM 推到中段，Codex 的解析器就拒绝整份文件，而 `apply` 返回 `ok=true`。
+
+### T.2 引擎内核四条（`src/gateway/model-gateway.mjs`）
+
+| # | 缺陷 | 性质 | 修法 |
+|---|---|---|---|
+| 1 | `dumpWorkbuddy11128` 是死代码（全文仅 1 次＝定义本身，`git log --all -S` 只有引入那一次） | **文档承诺 ≠ 实现** | 直通 `forward()` 与翻译 `forwardAnthropicViaOpenAI()` 两处 11128 分支各补一行调用 |
+| 2 | `accountFailureRule` / `translateMatrixResponse` / `wireOfClientPath` 三个顶层函数各只有定义、0 调用点，却在 parity 里被当作功能记在账上 | 死代码 + 误导账本 | 前者**救活**（见下），后两者**删除**并在原位留注释说明真正路径 |
+| 3 | `modelBreaker` 无容量上限、键里 model 不截断（`model` 是客户端可控字段） | 违反本项目自己写下的三条口径 | 加 `MODEL_BREAKER_MAX=512` + 键截断 128 + `trimModelBreaker()` 两轮淘汰 |
+| 4 | 日志超过 5MB 是**清空**不是轮转 | 排障取证被抹掉 | `rotateLogIfNeeded()` 真轮转（`.1`/`.2`/`.3`）+ 10 秒节流 |
+
+缺陷 2 的「救活」值得单说：`accountFailureRule` 与 `classifyAccountFailure` 各持一份**逐字相同**的
+规则遍历循环 —— 典型的"同一判定两处实现"，两份迟早漂移。现在遍历只有前一份（含"规则抛异常不影响
+主流程"的保护），后者委托它取 kind。顺带把**命中的规则 id** 写进日志：同一个 kind 可能来自三条规则
+（裸 401/403、session 措辞、"内容拦截排除后"），只说 kind 排障时分不清是哪条。
+
+### T.3 宿主层：严重 1 条
+
+**BOM 被写坏，且自带校验器看不见**（`src/writers/util.js`）
+- `tomlValidate` 无 BOM 处理；`tomlUpsertTopKey` 把新键插到文件最前面，把 `\uFEFF` 推到中段。
+- 实测：原文件 `\uFEFF[mcp_servers.x]\ncommand = "node"\n` → `apply` 返回 `ok=true errors=[]`，
+  落盘后 Python `tomllib` 报 `TOMLDecodeError: Invalid statement (at line 7, column 1)`。
+- 修：`stripBom` / `hasBom` / `withBom` 三个原语 + `readTarget` 返回 `bom` 标记 + `stringifyJson`
+  统一序列化；`tomlValidate` 新增**中段 BOM 检查**（说不出哪一行就没法修）。
+
+### T.4 宿主层：中等 8 条
+
+| # | 缺陷 | 修法 |
+|---|---|---|
+| M1 | JSON writer 不保行尾（`keepEol` 只被 TOML 路径用过） | 三个 writer 全改走 `util.stringifyJson(value, originalText, bomAtStart)`；实测 claude-code `CR 6 → 0` |
+| M2 | dsh profile patch 没写成却返 `ok:true`（只 `console.error` 后继续） | `patchFailure` 累积 + 写完 credentials 后 `throw` → 走到 `process.exit(2)` |
+| M3 | Codex 先写 config.toml 再写 auth.json，失败不回滚 → "指向网关但没 Key"的半成品 | `rollbackConfig(file, cur)` 用 `cur.text` 写回（不用备份：`writeAtomic` 的备份是首次备份语义，可能是很久以前那份） |
+| M4 | `validateConfigText` 放行空 apiKey，与运行期 fail-closed（`expect.length < 16`）矛盾 | 三态分清：**缺失**放行（`edge.test.js:85` 有钉子）、**存在但空**拦下并说明后果 |
+| M5 | dsh 失败时 `backups` 恒为空（`errs.length === 0` 才填） | 去掉该条件，并把 profile patch 也纳入备份目标 |
+| M6 | 引擎 `writeFileAtomicDsh` 违反 util 三条铁律（备份失败照写、tmp 固定名、rename 失败不清理） | 三条全改，与 `util.writeAtomic` 同口径 |
+| M7 | `restart()` 无互斥（并发会杀掉对方刚 spawn 的引擎 → 触发自愈循环） | 改**非 async** + `_restarting` 在飞标记共享同一次结果。用 `async` 时每次调用都包一层新 promise，`restart() === restart()` 恒 false |
+| M8 | `saveConfig` 临时名固定（`.tmp-<pid>`，同进程两次保存撞车） | 加随机后缀 + 失败清理 |
+
+### T.5 宿主层：轻微 5 条
+
+- **L1 两条安全守卫是空转的**：`tests/security.test.js` 里 `if (fs.existsSync(...))` 包着断言，
+  目录不存在就恒过。改为 `guardSelfTest(check)` —— 把测试 KEY 塞进合成样本，检测函数**必须** throw。
+  实测每轮巡检真实用户文件 3 个、真实 profile 文件 61 个，并把这个数字打进输出
+  （0 个时上面的断言没有实际检查任何东西）。
+- **L2 CRLF 断言偏松**：只要求"还有至少一个 CR"，挡不住"第一行 CRLF、其余全 LF"。
+  改为 `strayLf === 0`。
+- **L3 未知目标只断 `ok===false`**，断不出原因是否对；补 `errors` 内容断言。
+- **L4 `restore` 的 before-restore 文件名固定**，连点两次会覆盖第一份；改为找 `.1`…`.100` 第一个空位。
+- **L5 `main.js` 导入临时名固定**，同上加随机后缀。
+
+### T.6 教训（这一轮最该记住的）
+
+1. **文档承诺的功能必须有一条测试证明它真的接上了。** 缺陷 1 是靠"对每个顶层函数数全文出现次数，
+   等于 1 即死代码"这个笨办法抓到的 —— 305 个函数跑一遍，三个死函数全浮出来。
+2. **校验器要能说出"哪里不对"。** BOM 那条之所以长期存在，是因为 `apply` 报 `ok=true`；
+   而修好之后 `tomlValidate` 直接说"第 N 行出现多余的 BOM"。
+3. **改日志文案前先 grep 断言。** 把 `判定为账户级失败（rate）` 改成 `（rate，规则 …）`，
+   `tests/gateway.test.js:6240` 的正则立刻失败。最终改成 `（rate）｜命中规则 …` 才既加信息又不破约。
+4. **写测试时要问"这条断言会不会因为错误的原因通过"。** `restart` 那条第一版写
+   `const [a,b,c] = await Promise.all([...])` 再比 `a === b` —— 解构出的是解析后的值（undefined），
+   `undefined === undefined` 恒真。必须先拿到 promise 本身再比。
+5. **失败路径的备份也要带回来。** dsh 那条测试第一版没造已存在的目标文件，拿到空数组就以为发现了
+   缺陷 —— 备份只在目标已存在时才生成，那不是 bug。
+
+### T.7 验收
+
+```
+node --check（每次编辑后都跑）        → SYNTAX OK（引擎 + 4 个 writer + 2 个 manager/main）
+node --test tests\unit.js             → 101 passed（原 98，+3）
+node --test tests\writers.test.js     → 50 passed（原 42，+8）
+node --test tests\edge.test.js        → 29 passed
+node --test tests\security.test.js    → 19 passed（新增自证断言，条数不变）
+node --test tests\renderer.test.js    → 15 passed
+node --test tests\gateway.test.js     → 219 passed（原 218，+1）
+合计                                   → 433 项 0 失败
+npm run parity                        → 未声明 45 条（回到 v1.0.8–v1.0.17 历史债水位，本轮未新增）
+```
+
+引擎 `src/gateway/model-gateway.mjs` 13328 行。
+
+### T.8 未解决
+
+- **安全面子代理仍在跑**（`9f179f17-1d57-4842-bdf8-dc82c5793a57`），覆盖鉴权 / 密钥脱敏 /
+  路径与文件 / 渲染层 IPC / SSRF 出站 / 依赖供应链六面。已自查确认无问题的：`authorized()` 用
+  `sha256` + `timingSafeEqual` 定长比较且 `expect.length < 16` fail-closed；三道 DNS rebinding 门
+  全在鉴权之前；`server.listen` 硬编码 `127.0.0.1`；`MAX_BODY_BYTES=16MB` 且 413 后 `connection: close`。
+- **parity 清单仍恒红 45 条**：v1.0.7 之后就没再维护，v1.0.8–v1.0.19 的改动大量未登记。
+  这是清单腐烂，不是功能回退（已用 `git show <tag>:src/gateway/model-gateway.mjs` 做基线快照
+  逐块复核过）。要恢复绿色必须单独做一次全量登记，不能靠脚本放水。
+- **`WB_BRAND_RE` 的边界**：负向断言只跳过紧邻 `\` 或 `/`，所以 `"C:\\…\\DeepSeek Harness\\…"`
+  不改（正确），但 `"见 C: 盘 DeepSeek Harness 目录"`（两侧是空格/中文）**会被改**。
+  这是有意取舍（宁可改掉也不肯漏过指纹），已在 README 已知边界里写明。
+- **`amd` 4 条能学到窗口的模型仍未写进配置**（MiMo-V2.6-Flash / DeepSeek-V4.1-Flash 各 1048576，
+  GLM-5.3-Flash / Qwen3.8-Flash-Next 各 262144）。原因见 S.7：配置文件会被 GUI 整份覆写。
+- **按用户指示（m01578）不发布 git**：本地 main 领先 origin 10 个提交，未推送、未打标签、未发 Release。

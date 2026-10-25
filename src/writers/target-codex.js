@@ -24,6 +24,7 @@
 'use strict';
 
 const os = require('os');
+const fs = require('fs');
 const path = require('path');
 
 const util = require('./util');
@@ -132,7 +133,9 @@ function plan(ctx) {
 /** 生成新的 config.toml 文本。 */
 function buildConfig(ctx, before) {
   const { model, mode, tableBody } = plan(ctx);
-  let text = before || '';
+  // 剥 BOM 再动结构：BOM 若留在开头，tomlUpsertTopKey 会把新键插到它**前面**，
+  // 于是 `\uFEFF` 被推到文件中段（见 apply 里的长注释）。
+  let text = util.stripBom(before || '');
   // 顺序有讲究：TOML 要求**顶层键写在任何表头之前**。先插表再插顶层键的话，
   // tomlUpsertTopKey 只能把键挤到表头前面并留一个空行（对空白文件尤其难看，实测踩到）。
   // 先写顶层键、再追加表，得到的就是最自然的形式。
@@ -175,7 +178,13 @@ function preview(ctx) {
   const chosenProblem = models.chosenModelProblem(ctx.config || {}, model);
   if (chosenProblem) guard.push(chosenProblem);
 
-  const after = buildConfig(ctx, before);
+  // BOM 必须由这里统一处理（审计实测）：`tomlUpsertTopKey` 把新键插到首个表头之前，
+  // 若原文件以 `\uFEFF` 开头，那个 BOM 会被从第 0 位推到文件中段 —— 写出一个
+  // "开头干净、中段藏着 \uFEFF" 的 config.toml，Codex 解析器直接失败，
+  // 而 tomlValidate 不认 BOM，两道闸门全放行、界面报"写入成功"。
+  // 处置：吃进去先剥，吐出来按原样补回。
+  // 预览与 apply 走同一条序列化路径（含 BOM 复原），否则预览里看不到 BOM 造成的差异。
+  const after = util.withBom(buildConfig(ctx, before), before);
   // 自检：改完的 TOML 必须仍是合法 TOML。不合法就拦下 —— 我们改的是用户**已有的**
   // config.toml，写坏了会把他自己的 provider / mcp_servers / projects 一起废掉。
   const tomlError = util.tomlValidate(after);
@@ -239,6 +248,30 @@ function preview(ctx) {
   };
 }
 
+/**
+ * 把 config.toml 回滚成 `cur`（写入前读到的内容）—— 审计 R9-M3 的事务补偿。
+ *
+ * 为什么不用"拷备份回来"：`writeAtomic` 的备份是**首次备份**语义（`if (!exists(bak))` 才建），
+ * 所以 `.bak-llmgateway` 里存的可能是很久以前那份，而不是"这次写入前"的样子。
+ * 本次写入前的原文就在调用方手里（`cur`），直接写回它才是精确回滚。
+ *
+ * 原文件本来**不存在**时（cur.exists === false），回滚 = 把这个新造的文件删掉。
+ *
+ * @returns {{ok: boolean, error?: string}}
+ */
+function rollbackConfig(file, cur) {
+  try {
+    if (!cur.exists) {
+      if (util.exists(file)) fs.unlinkSync(file);
+      return { ok: true };
+    }
+    const r = util.writeAtomic(file, util.withBom(cur.text, cur.text, cur.bom));
+    return r.ok ? { ok: true } : { ok: false, error: r.error };
+  } catch (e) {
+    return { ok: false, error: e && e.message ? e.message : String(e) };
+  }
+}
+
 function apply(ctx) {
   // 写前前置检查（与 preview 的 guard 同源；main.js 的 write:apply 也会统一跑一遍，
   // 这里是纵深防御 —— apply 被单独调用时同样不能把用户原有凭据写成空串）。
@@ -256,7 +289,9 @@ function apply(ctx) {
     return { ok: false, errors: ['现有 config.toml 存在但读不出来（' + cur.error + '），已中止以免覆盖你的原有内容'], files: [] };
   }
 
-  const text = buildConfig(ctx, cur.text);
+  // buildConfig 内部已剥 BOM；这里按原文件是否带 BOM 补回。
+  // cur.bom 来自 readTarget（它在读的时候就记下来了，因为 cur.text 已剥掉 BOM）。
+  const text = util.withBom(buildConfig(ctx, cur.text), cur.text, cur.bom);
 
   // 原文件本身不合法 → 中止（与 preview 的 guard 同源，纵深防御）。
   // 不拦的话我们会往一份 Codex 读不了的文件里继续写，还报"成功"。
@@ -312,7 +347,7 @@ function apply(ctx) {
     }
     const authObj = parsed.value;
     authObj.OPENAI_API_KEY = String(ctx.apiKey || '');
-    const wa = util.writeAtomic(authFile, JSON.stringify(authObj, null, 2) + '\n');
+    const wa = util.writeAtomic(authFile, util.stringifyJson(authObj, curAuth.text, curAuth.bom));
     if (!wa.ok) {
       // ⚠ 失败时也必须带上 auth.json 自己的备份路径。
       // writeAtomic 是"先备份再写"，走到这里它的备份**已经在磁盘上了** ——
@@ -320,7 +355,21 @@ function apply(ctx) {
       // 实测（审计脚本 audit-restore-atomic）：`auth.json.bak-llmgateway` 确实生成且内容正确，
       // 但界面拿不到它，用户只能自己去目录里翻。
       const withAuthBak = wa.backup ? backups.concat([wa.backup]) : backups;
-      return { ok: false, errors: ['config.toml 已写入，但 auth.json 写入失败：' + wa.error], files: done, backups: withAuthBak };
+      // 审计 R9-M3：**回滚 config.toml**。
+      //
+      // 两个文件是同一件事的两半：config.toml 指向网关、auth.json 提供 Key。
+      // 只写进前者的结果是 Codex 被指向网关却拿不到 Key —— 每次请求 401，
+      // 而用户看到的错误跟"写入失败"毫无关系，极难归因；
+      // 他原本能用的配置（可能是自己的 OpenAI Key）也已经被换掉了。
+      // 宁可不写，也不要留下一个"能启动但不能用"的半成品。
+      const rb = rollbackConfig(file, cur);
+      return {
+        ok: false,
+        errors: ['auth.json 写入失败：' + wa.error
+          + (rb.ok ? '；config.toml 已回滚到写入前的内容（两个文件要么一起生效、要么都不动）。' : '；且 config.toml 回滚失败（' + rb.error + '），请用 ' + (w.backup || '备份文件') + ' 手工恢复。')],
+        files: rb.ok ? [] : done,
+        backups: withAuthBak,
+      };
     }
     done.push(authFile);
     if (wa.backup) backups.push(wa.backup);

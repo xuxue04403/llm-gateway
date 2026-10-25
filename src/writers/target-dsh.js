@@ -404,12 +404,18 @@ function apply(ctx) {
       // 界面上**看不到备份在哪** —— 而 .bak-gateway 其实真的生成了
       //（实测 `~/.dsh/settings.yaml.bak-gateway`、`.credentials.yaml.bak-gateway` 都在）。
       // 用户想回退时找不到文件，只能靠猜。
-      const backups = errs.length === 0
-        ? [p.settings, p.credentials]
-          .map((f) => util.backupInfo(f))
-          .filter(Boolean)
-          .map((b) => b.path)
-        : [];
+      // ⚠ 备份路径**无论成败都要带回**（审计 R9-M5）。
+      // 旧实现只在 `errs.length === 0` 时收集，失败分支给空数组 ——
+      // 而 `.bak-gateway` 在失败时**恰恰已经生成了**（writeFileAtomicDsh 是先备份再写），
+      // 界面 `renderer/js/clients.js` 的"写入失败"弹窗因此不显示任何备份，
+      // 用户很可能把那份唯一的原始备份当垃圾删掉。
+      // 三份都要收集：profile patch 也是本程序改写的文件，同样需要能回退。
+      const backupTargets = [p.settings, p.credentials];
+      if (prof.patch) backupTargets.push(prof.patch);
+      const backups = backupTargets
+        .map((f) => util.backupInfo(f))
+        .filter(Boolean)
+        .map((b) => b.path);
       resolve({
         ok: errs.length === 0,
         output: out.trim(),

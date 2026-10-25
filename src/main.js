@@ -1040,8 +1040,18 @@ function registerIpc() {
         const bak = gateway.configPath + '.bak-import';
         if (!fs.existsSync(bak)) fs.copyFileSync(gateway.configPath, bak);
       }
-      fs.writeFileSync(gateway.configPath + '.tmp-import', text, 'utf8');
-      fs.renameSync(gateway.configPath + '.tmp-import', gateway.configPath);
+      // 临时名带 pid + 随机后缀（审计 R9-L5）：固定 `.tmp-import` 在"导入与保存并发"
+      // 时会互相踩 —— 后一次 rename 可能 ENOENT（界面报导入失败，其实已写成功），
+      // 也可能把另一份内容当成这次的结果。saveConfig 与 writers/util.js 都是这个口径。
+      const tmp = gateway.configPath + '.tmp-import-' + process.pid + '-' + Math.random().toString(36).slice(2, 10);
+      try {
+        fs.writeFileSync(tmp, text, 'utf8');
+        fs.renameSync(tmp, gateway.configPath);
+      } catch (e) {
+        // 失败清掉临时文件：它含明文供应商密钥
+        try { fs.unlinkSync(tmp); } catch (_) { /* 忽略 */ }
+        throw e;
+      }
       logger.info('网关配置已从指定文件导入：' + src);
       registerGatewaySecret();
       // 运行中则重启，让新配置立即生效

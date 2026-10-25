@@ -112,7 +112,7 @@ function preview(ctx) {
       action: util.exists(file) ? 'modify' : 'create',
       exists: util.exists(file),
       before,
-      after: JSON.stringify(util.redact(after), null, 2) + '\n',
+      after: util.stringifyJson(util.redact(after), before),
       note: `只新增/替换 provider.${PROVIDER_ID}，顶层 model 指向它；其它 provider 原样保留`,
     }],
   };
@@ -134,7 +134,7 @@ function apply(ctx) {
   const cfg = parsed.value;
   const { list, model } = plan(ctx);
   const after = buildConfig(cfg, ctx, model, list);
-  const w = util.writeAtomic(file, JSON.stringify(after, null, 2) + '\n');
+  const w = util.writeAtomic(file, util.stringifyJson(after, cur.text, cur.bom));
   // 失败时也带上 backup，理由同 claude-code（备份先于 rename 生成）
   if (!w.ok) return { ok: false, errors: [w.error], files: [], backup: w.backup || null };
   return {

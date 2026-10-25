@@ -628,7 +628,13 @@ t('注册表：每个目标都能 detect / preview 而不抛', () => {
 
 t('注册表：未知目标返回错误而不是抛', () => {
   const r = writers.preview('nope', ctxFor(newHome('unk')));
+  // 审计 R9-L3：只断 `ok === false` 断不出"为什么失败"—— 将来任何一处失败（配置读坏、
+  // 路径解析异常…）都会让这条用例继续通过，它就再也证明不了"未知目标是错的"。
+  // 必须断言错误里点名了那个未知目标。
   assert.strictEqual(r.ok, false);
+  assert.ok(Array.isArray(r.errors) && r.errors.length > 0, '必须带出错误原因：' + JSON.stringify(r));
+  assert.ok(r.errors.some((e) => /nope/.test(String(e))),
+    '错误信息应点名未知目标 "nope"，否则这条用例挡不住"别的原因导致的失败"：' + JSON.stringify(r.errors));
 });
 
 /* ================================================================
@@ -1017,7 +1023,12 @@ t('TOML 写入保持原文行尾（CRLF 文件不得被整份改成 LF）', () =
   fs.writeFileSync(path.join(dir, 'config.toml'), crlf, 'utf8');
   writers.get('codex').apply(ctxFor(home));
   const after = fs.readFileSync(path.join(dir, 'config.toml'), 'utf8');
-  assert.ok(after.indexOf(CRc) >= 0, 'CRLF 文件写后一个 CR 都没有了（整份被改成 LF）：' + JSON.stringify(after.slice(0, 200)));
+  // 审计 R9-L2：旧断言只要求"还有至少一个 CR"—— 那挡不住"第一行保留 CRLF、其余全翻成 LF"
+  // 这种半翻状态（它在 git diff 里同样是全红，而且 TOML 混行尾在某些解析器上有坑）。
+  // 改成逐行必须是 CRLF：裸 LF（前面不是 CR 的 \n）一个都不许有。
+  const strayLf = (after.match(/(^|[^\r])\n/g) || []).length;
+  assert.strictEqual(strayLf, 0,
+    'CRLF 文件写后出现 ' + strayLf + ' 处裸 LF（行尾风格没统一到 CRLF）：' + JSON.stringify(after.slice(0, 300)));
   const home2 = newHome('lf');
   const dir2 = path.join(home2, '.codex');
   fs.mkdirSync(dir2, { recursive: true });
@@ -1026,4 +1037,185 @@ t('TOML 写入保持原文行尾（CRLF 文件不得被整份改成 LF）', () =
   const after2 = fs.readFileSync(path.join(dir2, 'config.toml'), 'utf8');
   assert.ok(after2.indexOf(CRc) < 0, 'LF 文件写后混进了 CR：' + JSON.stringify(after2.slice(0, 200)));
 });
+/* ================================================================
+ * 审计 R9：BOM 与行尾 —— 两种"写坏了还报成功"的形态
+ * ================================================================ */
+
+t('Codex：原 config.toml 带 BOM 时，BOM 必须仍在文件开头（不得被推到中段）', () => {
+  // 现场（审计实测，2026-10-25）：`tomlUpsertTopKey` 把新键插到首个表头之前，
+  // 原文件开头的 `\uFEFF` 就被推到文件中段，写出：
+  //   cli_auth_credentials_store = "file"\n\n...\n\uFEFF[mcp_servers.x]
+  // Codex 的解析器报 TOMLDecodeError，而旧版 tomlValidate 只看行形状 →
+  // 写前自检 + 写后复核两道闸门全放行，界面报"写入成功"。
+  const BOM = String.fromCharCode(0xFEFF);
+  const home = newHome('bom-codex');
+  const dir = path.join(home, '.codex');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'config.toml');
+  fs.writeFileSync(file, BOM + '[mcp_servers.x]' + String.fromCharCode(10) + 'command = "node"' + String.fromCharCode(10), 'utf8');
+
+  const r = writers.get('codex').apply(ctxFor(home));
+  assert.strictEqual(r.ok, true, '写入应成功：' + JSON.stringify(r.errors));
+
+  const after = fs.readFileSync(file, 'utf8');
+  assert.strictEqual(after.indexOf(BOM), 0,
+    'BOM 必须仍在文件第 0 位；实际位置 ' + after.indexOf(BOM) + '，全文：' + JSON.stringify(after));
+  // 中段不得再有第二个 BOM
+  assert.strictEqual(after.slice(1).indexOf(BOM), -1, '文件里出现了不止一个 BOM：' + JSON.stringify(after));
+  // 用户原有的 mcp_servers 必须还在
+  assert.ok(after.indexOf('[mcp_servers.x]') >= 0, '用户原有的 mcp_servers 表被弄丢了：' + JSON.stringify(after));
+});
+
+t('Codex：tomlValidate 必须把"中段 BOM"判为不合法（否则两道闸门全放行）', () => {
+  const BOM = String.fromCharCode(0xFEFF);
+  const bad = 'a = 1' + String.fromCharCode(10) + BOM + '[b]' + String.fromCharCode(10) + 'c = 2' + String.fromCharCode(10);
+  const err = util.tomlValidate(bad);
+  assert.ok(!!err, '中段 BOM 必须被判为不合法，实际返回：' + JSON.stringify(err));
+  assert.ok(err.indexOf('BOM') >= 0, '错误信息里应说明是 BOM 问题：' + JSON.stringify(err));
+  // 开头的 BOM 是合法输入（Windows 编辑器会写），必须放行
+  assert.strictEqual(util.tomlValidate(BOM + 'a = 1' + String.fromCharCode(10)), '', '开头的 BOM 不该被判为不合法');
+});
+
+t('JSON 目标：CRLF 的 settings.json 写回后必须仍是 CRLF（不得整份翻成 LF）', () => {
+  // 现场（审计实测）：keepEol 只被两条 TOML 路径调用，三个 JSON writer 都硬编码
+  // `JSON.stringify(x, null, 2) + '\n'` —— 实测 CR 5 → 0，git diff 全红。
+  const CRc = String.fromCharCode(13);
+  const LFc = String.fromCharCode(10);
+  const eol = CRc + LFc;
+  const home = newHome('crlf-json');
+  const dir = path.join(home, '.claude');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'settings.json');
+  const before = '{' + eol + '  "env": {' + eol + '    "KEEP": "1"' + eol + '  }' + eol + '}' + eol;
+  fs.writeFileSync(file, before, 'utf8');
+
+  const r = writers.get('claude-code').apply(ctxFor(home));
+  assert.strictEqual(r.ok, true, '写入应成功：' + JSON.stringify(r.errors));
+
+  const after = fs.readFileSync(file, 'utf8');
+  const cr = (after.match(/\r/g) || []).length;
+  assert.ok(cr > 0, 'CRLF 文件写后一个 CR 都没有了（整份被改成 LF）：' + JSON.stringify(after.slice(0, 200)));
+  // 逐行都要是 CRLF：不能"只第一行保留 CRLF，其余全 LF"（那也算翻掉了）
+  const strayLf = (after.match(/(^|[^\r])\n/g) || []).length;
+  assert.strictEqual(strayLf, 0, '写后仍有裸 LF 行（行尾风格没统一到 CRLF）：' + JSON.stringify(after));
+  // 用户原有的键必须保留
+  assert.ok(after.indexOf('"KEEP"') >= 0, '原有的 KEEP 键被弄丢了：' + JSON.stringify(after));
+});
+
+t('JSON 目标：带 BOM 的 settings.json 写回后 BOM 必须还在开头', () => {
+  const BOM = String.fromCharCode(0xFEFF);
+  const home = newHome('bom-json');
+  const dir = path.join(home, '.claude');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'settings.json');
+  fs.writeFileSync(file, BOM + '{"env":{"KEEP":"1"}}', 'utf8');
+
+  const r = writers.get('claude-code').apply(ctxFor(home));
+  assert.strictEqual(r.ok, true, '带 BOM 的 JSON 也应当能写入（旧实现在 readJson 处就会 __parseError 中止）：' + JSON.stringify(r.errors));
+
+  const after = fs.readFileSync(file, 'utf8');
+  assert.strictEqual(after.indexOf(BOM), 0, 'BOM 必须仍在开头；实际 ' + after.indexOf(BOM));
+  assert.strictEqual(after.slice(1).indexOf(BOM), -1, '出现了不止一个 BOM');
+});
+
+/* ================================================================
+ * 审计 R9：dsh 写入的三条"报成功但其实没做到"
+ * ================================================================ */
+
+t('dsh：profile patch 写不进去时必须**报失败**（旧实现只打 stderr 就报 ok:true）', async () => {
+  // 现场（审计实测）：patch 是 dsh 0.1.7+ 真正加载的载体，settings.yaml 已退化成一次性导入源。
+  // 旧实现 patch 抛错时只 console.error 就继续，引擎退出码 0；
+  // target-dsh 只看 settings/credentials 是否落盘 → 界面弹"写入成功"，
+  // 而 dsh 的模型选择器里根本没有 gateway。
+  const home = newHome('dsh-patchfail');
+  fs.mkdirSync(path.join(home, '.dsh'), { recursive: true });
+  // 造一个 profile 目录，但把 cordis.patch.yml 做成**目录**——
+  // 于是 fs.readFileSync 抛 EISDIR，upsert 必然失败，且失败点就在 patch 这一份上。
+  const profDir = path.join(home, '.dsh', 'profiles', 'desktop');
+  fs.mkdirSync(profDir, { recursive: true });
+  fs.mkdirSync(path.join(profDir, 'cordis.patch.yml'), { recursive: true });
+
+  const r = await dshTarget.apply(ctxFor(home));
+  assert.strictEqual(r.ok, false,
+    'patch 写不进去时必须报失败，否则用户以为网关注册好了。实际：ok=' + r.ok + ' output=' + r.output);
+  assert.ok(r.errors.some((e) => /patch/i.test(e)),
+    '错误里必须点名是 profile patch 出的问题：' + JSON.stringify(r.errors));
+  // settings.yaml 那份仍然应该有（这是"部分成功"，要如实说清而不是假装全成功）
+  assert.ok(fs.existsSync(path.join(home, '.dsh', 'settings.yaml')),
+    'settings.yaml 仍应写入（老版本 dsh 还能用），失败只针对 patch');
+});
+
+t('dsh：写入失败时也必须把备份路径带回来（否则用户会删掉唯一能回退的那份）', async () => {
+  const home = newHome('dsh-bakfail');
+  fs.mkdirSync(path.join(home, '.dsh'), { recursive: true });
+  // ⚠ 必须先造一份**已存在**的 settings.yaml：备份只在目标文件已存在时才生成
+  //（不存在就没有可备份的原始内容）。第一版用例没造，断言拿到空数组 —— 那不是缺陷，
+  // 是"这一轮根本没有备份产生"。测试要构造出"真有备份、但写入失败"那个场景。
+  fs.writeFileSync(path.join(home, '.dsh', 'settings.yaml'),
+    'llm-pi-ai:\n  providers:\n    other:\n      api: openai-chat\n', 'utf8');
+  const profDir = path.join(home, '.dsh', 'profiles', 'desktop');
+  fs.mkdirSync(profDir, { recursive: true });
+  fs.mkdirSync(path.join(profDir, 'cordis.patch.yml'), { recursive: true });
+
+  const r = await dshTarget.apply(ctxFor(home));
+  assert.strictEqual(r.ok, false, '这一轮就是要它失败（patch 是目录，写不进去）');
+  assert.ok(Array.isArray(r.backups), 'backups 必须是数组');
+  const hasSettingsBak = r.backups.some((b) => /settings\.yaml/.test(b));
+  assert.ok(hasSettingsBak,
+    '失败时 settings.yaml 的备份路径必须带回来（writeFileAtomicDsh 是先备份再写，备份这时候已经在了）：'
+    + JSON.stringify(r.backups));
+  // 备份文件本身必须真的存在，否则界面上给用户一个路径、点开却是空的
+  const bak = r.backups.find((b) => /settings\.yaml/.test(b));
+  assert.ok(fs.existsSync(bak), '返回的备份路径必须真实存在：' + bak);
+  // 原文件里的其它供应商不得丢
+  const settings = fs.readFileSync(path.join(home, '.dsh', 'settings.yaml'), 'utf8');
+  assert.ok(settings.includes('other:'), '用户原有的 other 供应商被弄丢了：' + JSON.stringify(settings.slice(0, 400)));
+});
+
+t('dsh：引擎的临时文件名不得固定（并发写会互踩），且失败要清理', () => {
+  // 直接读引擎源码验形态：这是"改成带 pid+random"这件事唯一可靠的自动化钉子，
+  // 因为真起两个 --write-dsh 进程去撞 rename 窗口在测试里不可复现。
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'gateway', 'model-gateway.mjs'), 'utf8');
+  const fnAt = src.indexOf('function writeFileAtomicDsh');
+  assert.ok(fnAt > 0, '找不到 writeFileAtomicDsh');
+  const body = src.slice(fnAt, fnAt + 1600);
+  assert.ok(/\.tmp-write-dsh-'\s*\+\s*process\.pid/.test(body),
+    '临时名必须带 process.pid（固定名会让并发写互相覆盖）：' + body.slice(0, 600));
+  assert.ok(/Math\.random\(\)/.test(body), '临时名必须带随机后缀（同进程并发写会共用同一个 tmp）');
+  assert.ok(/unlinkSync\(tmp\)/.test(body), 'rename 失败必须清理临时文件（它含明文 apiKey）');
+  assert.ok(/备份失败，已中止写入/.test(body),
+    '备份失败必须中止写入（旧实现 `catch {}` 继续写，等于把用户唯一的回退路径弄丢了）');
+});
+
+t('Codex：auth.json 写不进去时必须回滚 config.toml（不留"指向网关但没 Key"的半成品）', () => {
+  // 审计 R9-M3：两个文件是同一件事的两半 —— config.toml 指向网关、auth.json 提供 Key。
+  // 只写进前者的结果是 Codex 被指向网关却拿不到 Key，每次请求 401，
+  // 而用户看到的错误跟"写入失败"毫无关系；他原本能用的配置也已经被换掉了。
+  const home = newHome('cx-rb');
+  const dir = setupCodex(home);
+  const cfgFile = path.join(dir, 'config.toml');
+  const authFile = path.join(dir, 'auth.json');
+  const cfgBefore = fs.readFileSync(cfgFile, 'utf8');
+  const authBefore = fs.readFileSync(authFile, 'utf8');
+
+  // 让 auth.json 写入失败：把它设成只读（Windows 上 chmod 0o444 会让 rename 失败）
+  fs.chmodSync(authFile, 0o444);
+
+  const r = codex.apply(ctxFor(home, { model: 'glm-5.2' }));
+  fs.chmodSync(authFile, 0o666);   // 复原，免得影响后续清理
+
+  assert.strictEqual(r.ok, false, 'auth.json 写不进去时整体必须报失败');
+  assert.ok(r.errors.some((e) => /auth\.json/.test(e)), '错误里要点名 auth.json：' + JSON.stringify(r.errors));
+
+  const cfgAfter = fs.readFileSync(cfgFile, 'utf8');
+  assert.strictEqual(cfgAfter, cfgBefore,
+    'config.toml 必须被回滚成写入前的内容（否则 Codex 被指向网关却拿不到 Key）：'
+    + JSON.stringify(cfgAfter.slice(0, 300)));
+  // auth.json 原内容也不能被动过（它压根没写成功）
+  assert.strictEqual(fs.readFileSync(authFile, 'utf8'), authBefore, 'auth.json 应保持原样');
+  // 失败路径必须带上备份路径
+  assert.ok(Array.isArray(r.backups) && r.backups.length > 0,
+    '失败时也必须把已生成的备份路径带回来：' + JSON.stringify(r.backups));
+});
+
 run();
