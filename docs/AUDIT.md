@@ -1500,14 +1500,130 @@ parity：未声明 45 条（全是 v1.0.8–v1.0.17 历史债，本次新增 30 
 
 - 三项开关默认全开。关闭方式：顶层 `loopGuard` / `toolLoop` / `roomy` 设 false，
   或 env `DSH_GATEWAY_LOOP_GUARD` / `_TOOL_LOOP` / `_ROOMY`=0。
-- roomy 只对**声明过** `contextWindow` 的模型生效（当前 30 家配置里 39 条 models 有声明）。
+- roomy 只对**知道**窗口的模型生效（见下面 S 节：来源定了两条路，`roomyLearn` 默认关）。
   要让它真正起作用，需要给常用模型补 `contextWindow` —— 但**不要编数字**（见 README「参数拿不到就留空」）。
-- 发布仍未完成：本地 main 领先 origin 9 个提交（缺 `GITHUB_TOKEN`）。
+- 发布仍未完成：本地 main 领先 origin 9 个提交（缺 `GITHUB_TOKEN`）。用户 2026-10-25 明确
+  「暂不发布 git，其余事项按建议继续推进」，故本轮只做本地提交。
 
+---
 
+## S. 第九轮：roomy 的窗口来源定案 + `windowOf` 静默失效修复（2026-10-25）
 
+用户指令原文（m01578）：*"暂不发布git，其余事项按建议继续推进！！"*
+→ 推进第八轮遗留的两件事：① 给 roomy 补 `contextWindow` 的可信来源 ② 三项开关默认全开的取舍。
 
+### S.1 结论先行
 
+**「给那 12 家补 `contextWindow`」这个方向是错的，因为没有可信来源。**
+实测 15 个启用家（`_scratch/scan-context.cjs`，经 7890 代理直打各家 `/models`）：
 
+| 家 | models 数 | 带上下文窗口 | 说明 |
+|---|---|---|---|
+| `commandcode` | 93 | **93** | 字段 `context_length`，另有 `name`/`supported_endpoints` |
+| `commandcode-haiku` | 93 | **93** | 同上 |
+| `sensenova` | 7 | **7** | 含 `context_length` / `max_output_length` / `pricing` |
+| `amd` | 15 | **10** | 含 `context_length` / `top_provider` / `architecture` |
+| `opencode` | 85 | 0 | 只回 `{id,object,created,owned_by}` |
+| `cline` | 472 | 0 | 同上 |
+| `nvidia` | 85 | 0 | 同上 |
+| `x666` / `windhub` / `h-e.top` / `muyuan.do` / `agnes` / `aihubmix.com` | 18/11/17/23/9/673 | 0 | 同上 |
+| `agentrouter` | — | — | 目录 HTTP **401** |
+| `workbuddy` | — | — | 目录 HTTP **404**（该端点没有 `/models`） |
 
+→ **11 家的目录里根本没有窗口字段。** 于是只剩两条路，且都不是"补数字"：
+- ① 用户自己在模型条目里填（最权威，已有来源）；
+- ② 让网关去上游**学**（`roomyLearn`，**默认关闭**，见 S.3）。
 
+另一条独立核对（`_scratch/audit-ctx.cjs`）：现有 39 条已声明的 `contextWindow` 与上游值
+**不一致 0 条** —— 不需要订正任何一个数字。
+
+### S.2 🔑 抓到一个静默失效的缺陷：`windowOf` 只看同名映射的第一条
+
+第九轮开工时先做的只读审计（`_scratch/audit-windowof.cjs`）发现：旧实现是
+
+```js
+const hit = modelEntries(provider).find((e) => e.as === model);
+return (hit && Number.isFinite(hit.contextWindow) && hit.contextWindow > 0) ? hit.contextWindow : 0;
+```
+
+同一逻辑名（`as`）常有多条映射（vision 变体、免费档变体、`claude-haiku-5-5` 这类别名）。
+**第一条没填、第二条填了 → 判成"窗口不可知" → roomy 对这家完全不动作，而且日志里一句话都没有。**
+这与本轮 R.3 的 `pendingHead` 缺陷是同族：不是"没写"，而是"写了但永远不会生效"。
+
+实测当前运行配置受影响逻辑名 **0 个**、窗口值冲突 **0 个** —— 所以这是**潜伏缺陷**，
+不是正在发作的故障。但口径必须修对：用户以后加一条带窗口的映射，roomy 就该立刻生效。
+
+修法：遍历所有同名映射，返回**第一个有值的**（同一逻辑名的窗口本就该一致，实测 0 处冲突）。
+
+### S.3 `roomyLearn`：从上游目录学窗口，**默认关闭**
+
+新增 `learnCatalogMeta()` + `catalogMetaCache`（`Map<providerId, {ctx: Map<上游ID,窗口>, ts}>`）
++ `ctxWindowFromCatalogEntry()` + `catalogMetaInflight`。
+
+为什么不复用 `catalogCache`：**刷新节奏完全不同**。模型列表是路由正确性的一部分（60s TTL）；
+窗口只是排序提示，学到一次可长期用（`CATALOG_META_TTL_MS = 30 * 60_000`）。
+按 60s 刷等于每 60 秒打一次慢家（实测 x666 2.7s / muyuan.do 3.0s / aihubmix 3.2s）。
+
+**为什么默认关**（三条，都有实测依据）：
+1. 见 S.1 —— 15 家里只有 4 家给字段，对多数家是白跑一趟**真实上游请求**。
+2. 与本工程一条既有承诺冲突：「配置齐全时请求路径上零探测」（`needsCatalog` = 一条模型都没配
+   才探目录；`gateway.test.js` 里有 4 条用例断言 `modelsReqs === 0`）。启动时对所有"缺窗口"的家
+   探一遍，等于把 2026-09-15 那次事故（探测把"目录里有但不能服务"的家拉进候选）的方向反过来再走一遍。
+3. 探测会撞上 401/404 的家（agentrouter / workbuddy），纯噪音。
+
+纪律：熔断期不探测（与 `fetchCatalog` 同一条）／10s 超时／任何失败只打一行日志、绝不影响路由。
+开关：顶层 `roomyLearn`，或 env `DSH_GATEWAY_ROOMY_LEARN=1`；
+`DSH_GATEWAY_ROOMY_LEARN_MS` 可调后台延迟（默认 1500ms，测试里设 0）。
+
+### S.4 默认全开的取舍（第八轮遗留问题，本轮定案）
+
+保持**全开**，理由：三项都**不改变"发给上游什么"**（`maxTools` 之所以默认关，正因为它会改变上游
+可见的工具集）。loop_guard 是提前止损、tool_loop 拦的是"本来必然白烧钱"的请求、roomy 只是调换
+尝试顺序且不删除候选。关掉它们的唯一理由是"怀疑是它们错了"，所以开关留着、默认开。
+**唯一例外是 `roomyLearn`** —— 它会替用户额外打上游，属于"改变行为"，因此默认关。
+
+### S.5 新增 3 条测试（`tests/gateway.test.js`，215 → 218）
+
+1. `窗口只声明在**第二条**同名映射上时，也必须被认到` —— 锁住 S.2 那个静默失效。
+2. `上游目录里的 context_length 会被学到并用上` —— 两家都不声明窗口，全靠学；
+   断言日志出现 `[roomy] 从上游目录学到 …`，且学到的 10 tokens 那家被排到最后。
+3. `上游目录不带 context_length 时保持不可知 —— 绝不猜数字改变路由顺序` —— 反例保护。
+   这是本功能的红线：11/15 家没有字段，若把"学不到"当某个默认值，这些家的相对顺序就会被动到，
+   而用户把某家放 priority 1 是有意的。
+
+⚠ 踩坑（值得记）：启用 `roomyLearn` 后，`2026-10-19 预算预留` 那条老用例开始失败
+（`慢家应只被尝试 1 次，实际 2`）—— 因为它的假上游把 `/v1/models` 也算进 `calls`。
+这是**测试的计数器口径**问题，不是功能回退。修法：那个假上游只统计非 `/v1/models` 的请求
+（目录探测不计费、也不产生模型输出，本就不该算作"被尝试"）。
+
+### S.6 验收
+
+```
+node --check src\gateway\model-gateway.mjs / tests\gateway.test.js  → SYNTAX OK
+node --test tests\gateway.test.js                                   → 218 passed, 0 failed（原 215，+3）
+其余五文件                                                           → unit 98 / writers 42 / edge 29 / security 19 / renderer 15
+合计                                                                → 421 项 0 失败
+parity                                                              → 未声明 45 条（全是历史债，本轮 9 个新块已登记）
+```
+
+真网关直播（`DSH_GATEWAY_ROOMY_LEARN=1` 起一次）：
+```
+[roomy] 6 家有模型条目未声明上下文窗口 → 稍后后台向上游目录学（学不到就保持不可知，不影响路由）
+[roomy] 从上游目录学到 amd 的 10 条上下文窗口（其余 5 条上游没给，保持不可知）
+[roomy] 学 aihubmix.com 的上下文窗口失败（不影响路由）：fetch failed
+→ 一次真实补全：served deepseek-v4.1-flash via commandcode，dur=3345ms
+```
+默认（`roomyLearn` 不设）重启后启动日志：
+```
+magpie 三项：循环守卫=on 工具死循环拦截=on 上下文窗口过滤=on（窗口学自上游目录=off）
+```
+—— 一条探测请求都不发，符合"默认不动用户上游"。
+
+### S.7 未解决
+
+- `amd` 有 4 条模型能学到窗口但配置里没填。要不要把它们写进 `gateway.config.json`？
+  **本轮没改用户配置**：`out/data/gateway.config.json` 会被 GUI 保存整份覆写（历史上已被覆写过
+  三次，把 priority 与 models 写回旧形态），改文件有被覆盖的风险。建议在界面里改，或等
+  `roomyLearn` 常态开着来兜。
+- `workbuddy` 的 `space-bunny`、`windhub` 的 `gpt-6-luna`（上游目录里都没有这个 ID）、
+  `aihubmix.com` 的 6 条免费档 —— 三处**没有任何来源**，只能留空（roomy 对它们不动作）。
