@@ -3373,6 +3373,10 @@ const accountPool = new Map();     // `${providerId}#${acctId}` → { state, unt
 const accountRR = new Map();       // providerId → 轮询游标
 const ACCOUNT_CREDIT_COOLDOWN_MS = envMs('DSH_GATEWAY_ACCOUNT_CREDIT_COOLDOWN_MS', 30 * 60_000);  // 额度耗尽：长冷却
 const ACCOUNT_SESSION_COOLDOWN_MS = envMs('DSH_GATEWAY_ACCOUNT_SESSION_COOLDOWN_MS', 60 * 60_000); // 会话失效：等重新登录
+// 账号被上游封禁/限制：等是没用的（只有申诉解封），所以取一个"事实上下次启动前不会自己好"的长度。
+// 不取 Infinity 的理由：用户可能真的申诉成功了，而这个进程不重启的话永远看不到 ——
+// 12 小时是个折中（比 session 的 1 小时长一个量级，又不至于把一整天都锁死）。
+const ACCOUNT_RESTRICTED_COOLDOWN_MS = envMs('DSH_GATEWAY_ACCOUNT_RESTRICTED_COOLDOWN_MS', 12 * 60 * 60_000);
 const ACCOUNT_RATE_COOLDOWN_MS = envMs('DSH_GATEWAY_ACCOUNT_RATE_COOLDOWN_MS', 90_000);            // 限流：短冷却（基准值）
 const ACCOUNT_RATE_COOLDOWN_MAX_MS = envMs('DSH_GATEWAY_ACCOUNT_RATE_COOLDOWN_MAX_MS', 30 * 60_000); // 限流冷却上限（含 Retry-After 的夹取）
 // 账户池容量上界。键含上游模型 ID（provider#acct@model），"上游逐模型限流"时每模型一条 ——
@@ -3497,7 +3501,8 @@ function markAccountFailure(providerId, acct, kind, detail, model, serverMs) {
   const prev = accountPool.get(key);
   const ms = kind === 'credit' ? ACCOUNT_CREDIT_COOLDOWN_MS
     : kind === 'session' ? ACCOUNT_SESSION_COOLDOWN_MS
-      : rateCooldownMs(prev ? prev.fails : 0, serverMs);
+      : kind === 'restricted' ? ACCOUNT_RESTRICTED_COOLDOWN_MS
+        : rateCooldownMs(prev ? prev.fails : 0, serverMs);
   accountPool.set(key, {
     state: kind, until: Date.now() + ms, fails: (prev ? prev.fails : 0) + 1,
     // D6（安全）：必须过 maskSecrets —— 上游鉴权失败时回显收到的 Authorization 是常见实现，
@@ -5011,6 +5016,23 @@ async function aggregateOpenAIStream(upstream, headBytes) {
 const WORKBUDDY_CREDIT_RE = /insufficient credit|credit insufficient|no credit|credit exhausted|credits exhausted|out of credit|quota exceeded|quota exhaust|payment required|credit not enough|not enough credit|insufficient[_ ]?balance|insufficient[_a-z]*quota|exceeded\s+your\s+(?:current\s+)?quota|积分不足|额度不足|余额不足|积分用完|额度用尽|没有积分/i;
 const WORKBUDDY_SESSION_RE = /Offline user session not found|12153|session not found|login expired|重新登录/i;
 /**
+ * 「账号被上游封禁/限制」——**独立一类**，不能混进 session（2026-10-25 第十一轮审计）。
+ *
+ * 形态（参照实现 yetone/magpie 的 `gateway-routing.md` 记录，本机未复现过——
+ * 我们的 workbuddy 车道一直是 11128 渠道拒绝，还没被限制过）：
+ * `403 {"code":11140,"msg":"request illegal","displayMsg":{"en":"Your account has been
+ * restricted due to unusual activity"}}`
+ *
+ * 为什么必须单独一类：这类失败**等多久都不会自己好**，只有用户去申诉解封。
+ * 混进 `'session'` 的后果有两个，都是误导：
+ *   ① 面板显示「登录失效」→ 用户去重新登录，白折腾（凭据是好的）；
+ *   ② 冷却 1 小时后又去撞一次，可能加重上游的风控印象。
+ *
+ * ⚠ 刻意**不认裸 "request illegal"**（magpie 也这么做）：11140 是腾讯系的码，
+ * 但 `request illegal` 这种措辞别家也可能用，裸匹配会误伤。
+ */
+const ACCOUNT_RESTRICTED_RE = /"code"\s*:\s*11140|account\s+has\s+been\s+restricted|restricted\s+due\s+to\s+unusual\s+activity|账号[^\n]{0,10}?(?:被限制|受限|被封)/i;
+/**
  * 「账户级失败」判定表（2026-10-20 改为**表驱动**）。
  *
  * 动机：这段原本是一串 if/return，而每一条都是某次真实事故换来的，顺序本身就是契约
@@ -5023,10 +5045,11 @@ const WORKBUDDY_SESSION_RE = /Offline user session not found|12153|session not f
  * 判定结果仍保持本文件原有的语义与返回码 —— **行为不变，只是变得可读、可加**。
  *
  * 返回值（kind）：
- *   'rate'    瞬时限流 → 冷却账户一小段
- *   'credit'  欠费/额度 → 长期冷却
- *   'session' 这把 Key 失效 → 换下一把 Key
- *   null      不是账户级问题（交给供应商级处理）
+ *   'rate'       瞬时限流 → 冷却账户一小段
+ *   'credit'     欠费/额度 → 长期冷却
+ *   'session'    这把 Key 失效 → 换下一把 Key
+ *   'restricted' 账号被上游封禁/限制 → 超长冷却，只能申诉，等没用
+ *   null         不是账户级问题（交给供应商级处理）
  *
  * @type {Array<{id:string, why:string, kind:string|null, test:(status:number, detail:string)=>boolean}>}
  */
@@ -5058,6 +5081,15 @@ const ACCOUNT_FAILURE_RULES = [
     test: (_status, detail) => WORKBUDDY_CREDIT_RE.test(detail),
   },
   {
+    id: 'account-restricted',
+    kind: 'restricted',
+    why: '账号被上游封禁/限制 —— 等多久都不会自己好，只有申诉解封；混进 session 会误导用户去重新登录',
+    // ⚠ 必须排在 `session-wording` 与 `bare-401-403` **之前**：
+    //   11140 的正文里既没有会话类措辞、也不会命中 CONTENT_BLOCK_RE，
+    //   所以排在后面就会被裸 403 规则吃掉，判成 session 冷却 1 小时。
+    test: (_status, detail) => ACCOUNT_RESTRICTED_RE.test(detail),
+  },
+  {
     id: 'session-wording',
     kind: 'session',
     why: '正文是会话过期/需重新登录',
@@ -5083,7 +5115,7 @@ const ACCOUNT_FAILURE_RULES = [
  * 判定一次上游失败是否属于**账户级**（该换 Key 而不是换供应商）。
  * @param {number} status 上游 HTTP 状态
  * @param {string} detail 上游错误正文（已读并截断）
- * @returns {'rate'|'credit'|'session'|null}
+ * @returns {'rate'|'credit'|'session'|'restricted'|null}
  */
 function classifyAccountFailure(status, detail) {
   // ⚠ 2026-10-25 第八轮审计：本函数与 accountFailureRule **曾各写一份同样的循环**，

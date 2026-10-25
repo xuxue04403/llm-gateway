@@ -4,7 +4,7 @@
 
 [![Release](https://img.shields.io/github/v/release/xuxue04403/llm-gateway?label=%E4%B8%8B%E8%BD%BD&color=2ea043)](https://github.com/xuxue04403/llm-gateway/releases/latest)
 [![License](https://img.shields.io/github/license/xuxue04403/llm-gateway?color=blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-435%20passed-2ea043)](#测试与校验)
+[![Tests](https://img.shields.io/badge/tests-436%20passed-2ea043)](#测试与校验)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4)](#下载)
 
 通用桌面版 LLM 网关。把十几种上游模型服务（OpenAI / Anthropic / 各家中转）聚合成**一个本地端点 + 一把 Key**，
@@ -64,7 +64,7 @@ npm run portable
 
 npm run icon     # 仅生成图标（程序化绘制，零外部素材）
 
-npm test         # 435 项测试，应全绿
+npm test         # 436 项测试，应全绿
 npm run parity   # 引擎差异校验：清单已腐烂、恒 FAIL（45 条历史欠债，详见下文）
 ```
 
@@ -102,7 +102,7 @@ npm run parity   # 引擎差异校验：清单已腐烂、恒 FAIL（45 条历�
 - **多供应商路由**：按 `priority` 升序，同级内按列表顺序；支持「主备」与「负载均衡（轮询）」两种策略
 - **自动故障切换 + 分级熔断**：401/403 与「余额/额度」类拒绝断 30 分钟；网络/5xx 连续 3 次断 90 秒，指数退避
 - **半开探测**：冷却后放**一个**探测请求试上游；供应商显式声明 `timeoutMs` 时探测也按它执行
-- **账户池**：同一供应商多把 Key 轮换；额度耗尽（账户级）/ 登录失效（账户级）/ 限流（**模型级**）分别冷却
+- **账户池**：同一供应商多把 Key 轮换；额度耗尽（账户级）/ 登录失效（账户级）/ **账号被上游封禁（账户级，12 小时）** / 限流（**模型级**）分别冷却
 - **WorkBuddy 接入**：直接读腾讯 CodeBuddy 桌面版的登录凭据并自动刷新，多账号池
 - **WorkBuddy 渠道指纹改写**：2026-10-20 起腾讯网关对**请求体文本**做渠道校验（`system` 里出现 `You are an AI agent powered by DeepSeek Harness.` 就回 `400 / 11128`）。网关在发上游前把身份句换成中性开场白、并抹掉残留品牌词，默认只动 `system`（实测 `user` 里同一句不触发），`identityScrub: "all"` 可全角色改写；三条协议（chat / Anthropic 翻译 / Responses）都覆盖
 - **客户端仿真**：`claude` / `codex` / `cline` 三档，按主机名自动推断，也可逐家覆盖
@@ -174,7 +174,7 @@ npm run parity   # 引擎差异校验：清单已腐烂、恒 FAIL（45 条历�
 ## 测试与校验
 
 ```powershell
-npm test                    # 435 项，全绿
+npm test                    # 436 项，全绿
 npm run parity              # 引擎相对 dsh-app 版本的差异是否与"声明清单"一致
 npm run check               # 语法检查
 npm run test:models         # 模型全量体检：逐个模型真跑一次（见下）
@@ -187,7 +187,7 @@ npm run test:models         # 模型全量体检：逐个模型真跑一次（�
 | `tests/edge.test.js` | 29 | 边界与降级：无供应商/全停用/无模型/空 Key/坏 JSON/目标是目录/引擎缺失；dsh 预览与引擎落盘逐字一致 |
 | `tests/renderer.test.js` | 15 | 界面（渲染层）：用最小 DOM 桩**真实执行** `core.js`/`providers.js`；一键获取模型的选择器、编辑抽屉的监听器生命周期、数字列转义、双击行为 |
 | `tests/security.test.js` | 19 | **每条都对应一次实跑确认过的真实缺陷**：TOML 写坏形态、读不到就中止、占位 Key、空 Key 不覆盖凭据、脚本注入、密钥脱敏 |
-| `tests/gateway.test.js` | 221 | 网关引擎端到端：鉴权、SSE、三协议翻译、熔断、账户池、客户端仿真、**逐模型超时**、**仿真头镜像防漂移**、gzip 压缩 SSE、地区受限 403 不连坐、客户端指纹被拒、Retry-After 遵循、**WorkBuddy 渠道身份改写（chat / Anthropic 翻译 / Responses 三协议 + 路径语境不得改写 + 非本家不得改写）**、**循环守卫（三条流式路径 + 正常答复不得误切）**、**工具死循环拦截（chat 与 Anthropic 两入口）**、**上下文窗口过滤（排到最后而非删除 + 零误动边界 + 同名映射第二条也算 + 从目录学窗口 + 学不到不得猜）**、**11128 现场转储（开关关着不落盘 + 错误体打码）**、**用量保留期覆盖界面最长期（90 天，可 env 覆盖）** |
+| `tests/gateway.test.js` | 222 | 网关引擎端到端：鉴权、SSE、三协议翻译、熔断、账户池、客户端仿真、**逐模型超时**、**仿真头镜像防漂移**、gzip 压缩 SSE、地区受限 403 不连坐、客户端指纹被拒、Retry-After 遵循、**WorkBuddy 渠道身份改写（chat / Anthropic 翻译 / Responses 三协议 + 路径语境不得改写 + 非本家不得改写）**、**循环守卫（三条流式路径 + 正常答复不得误切）**、**工具死循环拦截（chat 与 Anthropic 两入口）**、**上下文窗口过滤（排到最后而非删除 + 零误动边界 + 同名映射第二条也算 + 从目录学窗口 + 学不到不得猜）**、**11128 现场转储（开关关着不落盘 + 错误体打码）**、**用量保留期覆盖界面最长期（90 天，可 env 覆盖）**、**账号被封禁（11140）单独成类而非"登录失效"** |
 
 ### 超时怎么定（三级，就近优先）
 

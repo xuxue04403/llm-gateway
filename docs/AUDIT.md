@@ -1833,3 +1833,64 @@ node scripts\check-engine-parity.mjs         → 未声明 45 条（历史债，
 2. 给每个"应该没发生"配上"应该发生"的对照（U.3 第 2 条）。
 
 这两条都是从本项目自己的历史事故里长出来的 —— `restart` 并发用例恒真、`fmtNum` 的 XSS 事故注释、以及 R10 那个"断言了 400 实际是 503"的坑，都是同一种错误的变体：**用错误的理由通过测试。**
+
+### U.6 追加（同一轮）：账号被上游封禁（11140）被误判成"登录失效"
+
+**来源**：magpie 的 `docs/subsystems/gateway-routing.md` 记录了一个我们没有处理的码 ——
+`403 {"code":11140,"msg":"request illegal","displayMsg":{"en":"Your account has been restricted due to unusual activity"}}`
+（magpie 叫 `restrictedRest`，冷却 2 小时；本机未复现过，我们的 workbuddy 车道一直是 11128 渠道拒绝）。
+
+**我们这边的实际行为**（用探针确认，不是推测）：
+
+```
+detail = {"code":11140,"msg":"request illegal","displayMsg":{"en":"Your account has been restricted due to unusual activity"}}
+CLIENT_FINGERPRINT hits: false
+CONTENT_BLOCK hits:      false
+=> bare-401-403 命中 → kind=session → 冷却 3600s
+```
+
+也就是说：**账号被封了，面板却显示「登录失效」**。后果有三个，都是实质性的：
+1. 用户去重新登录 —— 凭据本身是好的，白折腾；
+2. 一小时后又去撞一次，可能加重上游的风控印象；
+3. 排查方向被带偏（"登录问题"和"账号被限制"的处置完全不同）。
+
+**修法**：
+- 新增 `ACCOUNT_RESTRICTED_RE`（认 `"code":11140`、`account has been restricted`、
+  `restricted due to unusual activity`、`账号…被限制/受限/被封`）。
+  **刻意不认裸 `request illegal`** —— 11140 是腾讯系的码，但这句措辞别家也可能用，裸匹配会误伤
+  （magpie 也这么做）。
+- `ACCOUNT_FAILURE_RULES` 新增 `account-restricted` 规则，`kind: 'restricted'`，
+  位置 **必须在 `session-wording` 与 `bare-401-403` 之前**（11140 不命中会话措辞，
+  排后面就会被裸 403 规则吃掉）。
+- `ACCOUNT_RESTRICTED_COOLDOWN_MS` 默认 12 小时。**不取 Infinity 的理由**：用户可能真的申诉成功了，
+  而这个进程不重启就永远看不到 —— 12 小时比 session 的 1 小时长一个量级，又不至于锁死一整天。
+- 渲染层 `renderer/js/core.js` 的 `COOL_KIND` 加 `restricted: { text: '账号受限', cls: 'bad' }`
+  —— 否则界面会退化成显示原始字符串 `restricted`。
+
+**钉测试**（`tests/gateway.test.js`，+1 条，两把 Key 的家 + 假上游对所有请求回 11140）：
+1. 最终收口 **503**（账户级失败换下一把，不是 400 终止）；
+2. `/health` 里两把 Key 的 `state` 都必须是 `restricted`（不是 `session`）；
+3. `remainMs` 必须 **> 2 小时**（远大于 session 的 1 小时）；
+4. 日志里必须出现 `命中规则 account-restricted`。
+
+**变异验证**：把规则的 `kind` 改回 `'session'` → 用例失败，报错原文正好是旧行为的证据：
+```
+11140 必须判成 restricted，判成别的就是把"账号被限制"误报给用户：
+[{"id":"bad","state":"session","reason":"{\"code\":11140,...}"}, ...]
+```
+改回后通过。
+
+**这一条的价值不在于修了一个码**：它证明"对着别的实现的设计文档逐条核对自己的分类表"是有产出的 ——
+11140 这个码我们从来没遇到过（自己的日志里一次都没有），但它一旦出现就会被归错类，
+而**归错类的代价是让用户去修一个没坏的东西**。
+
+### U.7 本轮最终水位
+
+```
+unit 101 / writers 50 / edge 29 / security 19 / renderer 15 / gateway 222
+合计 → 436 项 0 失败
+node scripts\check-engine-parity.mjs → 未声明 45 条（历史债；本轮 USAGE_KEEP_DAYS、
+                                       ACCOUNT_RESTRICTED_RE、ACCOUNT_RESTRICTED_COOLDOWN_MS、
+                                       ACCOUNT_FAILURE_RULES 四条已登记）
+变异测试 4 次（3 次 magpie 开关 + 1 次 11140 规则）→ 全部被用例如期抓到，均已还原
+```

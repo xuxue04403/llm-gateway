@@ -7417,6 +7417,82 @@ let upstreamPort = 0;
     }
   });
 
+  t('网关（审计 R11）：账号被上游限制（11140）必须单独成一类 —— 不能当成"登录失效"骗用户去重新登录', async () => {
+    // 形态（参照实现 yetone/magpie 的 gateway-routing.md，本机未复现过）：
+    //   403 {"code":11140,"msg":"request illegal",
+    //        "displayMsg":{"en":"Your account has been restricted due to unusual activity"}}
+    //
+    // 为什么必须单独一类：
+    //   ① 这类失败**等多久都不会自己好**，只有用户去申诉解封；
+    //   ② 混进 session 时面板显示「登录失效」→ 用户去重新登录，白折腾（凭据是好的）；
+    //   ③ 冷却 1 小时后又去撞一次，可能加重上游的风控印象 → 改成 12 小时。
+    //
+    // 旧实现的实际后果（这条用例守的就是它）：11140 正文不含会话措辞、也不命中
+    // CONTENT_BLOCK_RE，于是被**裸 401/403 规则**吃掉 → kind=session → 面板「登录失效」。
+    const upRestricted = http.createServer((q, s) => {
+      q.resume();
+      q.on('end', () => {
+        s.writeHead(403, { 'content-type': 'application/json' });
+        s.end(Buffer.from(JSON.stringify({
+          code: 11140,
+          msg: 'request illegal',
+          displayMsg: {
+            zh: '账号因异常活动被限制',
+            en: 'Your account has been restricted due to unusual activity',
+          },
+        }), 'utf8'));
+      });
+    });
+    await new Promise((r) => upRestricted.listen(0, '127.0.0.1', r));
+
+    // 多账户家：11140 是**这把 Key / 这个账号**的事实，应该换下一把，不熔断整家
+    const mkAcct = (id) => ({
+      id, baseURL: 'http://127.0.0.1:' + upRestricted.address().port + '/v2',
+      protocol: 'openai-chat', models: ['test-model'], priority: 1, enabled: true,
+      accounts: [
+        { id: 'bad', apiKey: 'sk-' + 'b'.repeat(15) },
+        { id: 'good', apiKey: 'sk-' + 'g'.repeat(15) },
+      ],
+    });
+
+    try {
+      const gw = await startGatewayWith([mkAcct('wb-restricted')], 'wb11140', {}, {});
+      try {
+        const r = await call({
+          port: gw.port, p: '/v1/chat/completions',
+          body: { model: 'test-model', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+        });
+        // 两把 Key 都会撞 11140（假上游对谁都回 403），所以最终是收口 503，
+        // 而不是 400 —— 11140 属账户级失败，语义是"换下一把"。
+        assert.strictEqual(r.status, 503,
+          '两把 Key 都被限制时应以 503 收口，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+
+        const h = JSON.parse((await call({ port: gw.port, p: '/health', method: 'GET' })).text);
+        const accts = (h.accounts || []).filter((a) => a.provider === 'wb-restricted');
+        assert.ok(accts.length >= 1, '账户池应有记录：' + JSON.stringify(h.accounts));
+
+        // ① 必须是 restricted，不是 session（这是本条用例的核心断言）
+        const wrong = accts.filter((a) => a.state !== 'restricted');
+        assert.strictEqual(wrong.length, 0,
+          '11140 必须判成 restricted，判成别的就是把"账号被限制"误报给用户：'
+          + JSON.stringify(accts.map((a) => ({ id: a.id, state: a.state, reason: a.reason }))));
+
+        // ② 冷却时长必须远大于 session 的 1 小时（默认 12 小时）
+        for (const a of accts) {
+          assert.ok(a.remainMs > 2 * 3600_000,
+            '账号受限的冷却应远超 session 的 1 小时（默认 12 小时），实际 ' + Math.round(a.remainMs / 1000) + 's');
+        }
+
+        // ③ 日志里要能看到"命中的规则 id"，否则排障时分不清是哪条规则判的
+        const logText = fs.readFileSync(gw.logPath, 'utf8');
+        assert.ok(/命中规则 account-restricted/.test(logText),
+          '日志应写明命中的是 account-restricted 规则：' + logText.slice(-1200));
+      } finally { killGw(gw); }
+    } finally {
+      try { upRestricted.close(); } catch { /* 忽略 */ }
+    }
+  });
+
   for (const { name, fn } of __tests) {
     await fn();
     passed++;

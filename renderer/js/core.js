@@ -322,6 +322,9 @@ const COOL_KIND = {
   rate: { text: '限流', cls: 'warn' },
   network: { text: '网络错误', cls: 'warn' },
   auth: { text: '鉴权失败', cls: 'bad' },
+  // 账号被上游封禁/限制：**不是**登录失效 —— 凭据本身是好的，重新登录白折腾，
+  // 只能去申诉。混进 session 会误导用户（见引擎 ACCOUNT_RESTRICTED_RE 的注释）。
+  restricted: { text: '账号受限', cls: 'bad' },
   // 单 Key 供应商的"不可用"记在供应商级熔断上（它没有账户级记录）→ 单独一个语义，
   // 避免把"渠道熔断"误显示成"额度耗尽/登录失效"这类账户问题（见 accountPoolSnapshot 注释）
   breaker: { text: '渠道熔断', cls: 'bad' },
