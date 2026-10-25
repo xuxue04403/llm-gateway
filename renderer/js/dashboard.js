@@ -99,6 +99,7 @@ LG.renders.dashboard = function renderDashboard() {
   });
 
   renderHealth();
+  renderGuards();
 };
 
 /**
@@ -195,6 +196,59 @@ function renderFirstRun() {
   }
 }
 
+/* 防护计数（审计 R11）
+ *
+ * 为什么必须显示：magpie 三项防护（循环守卫 / 工具死循环拦截 / 上下文窗口过滤）默认全开，
+ * 但此前界面上一个字都没有。用户既无法确认它们在干活，也无法在它们误伤时发现 ——
+ * R10 那个 `pendingHead` 缺陷就是"代码写了、永远不触发、没人察觉"的实例。
+ *
+ * 三列设计刻意区分两种"0"：
+ *   - **关闭**（灰）→ 用户自己关的，或配置里 loopGuard/toolLoop/roomy 设了 false；
+ *   - **0 次**（正常色）→ 开着但确实没触发过，这是好事，用说明文字讲清楚。
+ * 混在一起会让"关了"看起来像"工作了但没事发生"，那正是我们要避免的那类谎。
+ */
+function renderGuards() {
+  const box = $('#guardsBox');
+  if (!box) return;
+  if (!LG.state || !LG.state.gateway.running) {
+    box.innerHTML = '<div class="empty">网关未运行，暂无数据。</div>';
+    return;
+  }
+  const h = LG.health;
+  if (!h) { box.innerHTML = '<div class="empty">正在读取 /health…</div>'; return; }
+  const g = h.guards;
+  if (!g || typeof g !== 'object') {
+    // 老引擎（< 1.0.19）没有这个字段：如实说不支持，而不是画一排 0 假装在工作。
+    box.innerHTML = '<div class="empty">当前引擎版本不支持防护计数（v1.0.19 起提供）。</div>';
+    return;
+  }
+  const en = (g && g.enabled) || {};
+  const cells = [
+    ['循环守卫', g.loopGuard, en.loopGuard, '模型答复陷进"重复同一句话"时主动切断，止损到那一刻'],
+    ['工具死循环拦截', g.toolLoop, en.toolLoop, 'agent 连续 8 轮发起同一批调用且结果一样时本地作答，不烧额度'],
+    ['上下文窗口过滤', g.roomy, en.roomy, '装不下这次请求的供应商排到最后（不删除），省掉必然超长的一次往返'],
+  ];
+  box.innerHTML = '<div class="grid grid-3">' + cells.map(([name, n, on, why]) => {
+    const count = Number.isFinite(Number(n)) ? Number(n) : 0;
+    const state = on
+      ? (count > 0
+        ? '<span class="tag ok">已生效 ' + esc(String(count)) + ' 次</span>'
+        : '<span class="tag">已开启 · 暂未触发</span>')
+      : '<span class="tag">已关闭</span>';
+    return '<div class="stat-card" title="' + attr(why) + '">'
+      + '<div class="stat-label">' + esc(name) + '</div>'
+      + '<div class="stat-value">' + (on ? esc(String(count)) : '<span class="hint">—</span>') + '</div>'
+      + '<div class="stat-sub">' + state + '</div>'
+      + '</div>';
+  }).join('') + '</div>'
+    + '<div class="hint" style="margin-top:8px;">'
+    + (en.roomyLearn
+      ? '上下文窗口会额外从上游目录学习（roomyLearn 已开）。'
+      : '上下文窗口只认配置里声明的值（roomyLearn 关闭，不外打上游）。')
+    + '计数只在本进程内累计，重启归零；历史记录看日志里的 <span class="mono">[loop]</span> 与 '
+    + '<span class="mono">[route] … 装不下的候选</span> 行。</div>';
+}
+
 function renderHealth() {
   const box = $('#healthBox');
   if (!LG.state || !LG.state.gateway.running) {
@@ -246,7 +300,12 @@ function renderHealth() {
 }
 
 async function refreshHealth() {
-  if (!LG.state || !LG.state.gateway.running) { LG.health = null; renderHealth(); return; }
+  if (!LG.state || !LG.state.gateway.running) {
+    LG.health = null;
+    renderHealth();
+    renderGuards();
+    return;
+  }
   try {
     LG.health = await window.lgw.gwHealth();
   } catch (_) {
@@ -255,7 +314,7 @@ async function refreshHealth() {
   // 只重绘，不在这里另写 #dashAccounts —— 同一元素被两处写会造成
   // "统计卡显示『无』而副标题显示『正在读取』"这种自相矛盾的画面（实测踩到）。
   if (LG.activeView === 'dashboard') LG.renders.dashboard();
-  else renderHealth();
+  else { renderHealth(); renderGuards(); }
 }
 
 LG.dashboard = { refreshHealth };

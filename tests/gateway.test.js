@@ -7493,6 +7493,38 @@ let upstreamPort = 0;
     }
   });
 
+  t('网关（审计 R11）：/health 的 guards 计数必须真实反映拦截次数，且带上开关状态', async () => {
+    // 为什么要有这条：三项防护默认全开，但界面上此前完全不可见 —— 用户既无法确认
+    // 它们在干活，也无法在它们误伤时发现（R10 的 pendingHead 缺陷就是这样潜伏的：
+    // 代码写了、永远不触发、没人察觉）。这里同时钉住"计数对"与"开关状态对"，
+    // 因为界面上"关了"和"开了但没触发"必须是两种不同的显示。
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const gw = await startGatewayWith([openaiProvider('gs', up, { quirks: ['force-stream'] })], 'guardstats');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const health = async () => JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
+
+      // ① 刚启动：三个计数都是 0，但三个 enabled 都是 true —— 这正是界面要区分的样子
+      const h0 = await health();
+      assert.ok(h0.guards, '/health 必须带 guards 字段：' + JSON.stringify(h0).slice(0, 400));
+      assert.strictEqual(h0.guards.loopGuard, 0, '刚启动不该有循环守卫计数');
+      assert.strictEqual(h0.guards.toolLoop, 0, '刚启动不该有工具死循环计数');
+      assert.strictEqual(h0.guards.roomy, 0, '刚启动不该有窗口过滤计数');
+      assert.strictEqual(h0.guards.enabled.loopGuard, true, '循环守卫默认应开启（界面靠它区分"关了"与"没触发"）');
+      assert.strictEqual(h0.guards.enabled.toolLoop, true, '工具死循环拦截默认应开启');
+      assert.strictEqual(h0.guards.enabled.roomy, true, '窗口过滤默认应开启');
+      assert.strictEqual(h0.guards.enabled.roomyLearn, false, 'roomyLearn 默认关（会额外打上游）');
+
+      // ② 真触发一次工具死循环：toolLoop 必须 +1，loopGuard/roomy 不得跟着变
+      const r = await call({ port: gw.port, body: { model: 'test-model', messages: mkChatToolRounds(8) } });
+      assert.strictEqual(r.status, 200, '本地作答仍是 200，实际 ' + r.status);
+      const h1 = await health();
+      assert.strictEqual(h1.guards.toolLoop, 1, '工具死循环拦截过一次，计数必须是 1：' + JSON.stringify(h1.guards));
+      assert.strictEqual(h1.guards.loopGuard, 0, '没发生循环守卫，它的计数不得被顺手加一：' + JSON.stringify(h1.guards));
+      assert.strictEqual(h1.guards.roomy, 0, '没发生窗口过滤，它的计数不得被顺手加一：' + JSON.stringify(h1.guards));
+      assert.strictEqual(up.st.calls, 0, '命中死循环后上游应当**一次都没被打**，实际 ' + up.st.calls);
+    } finally { killGw(gw); closeUp(up); }
+  });
   for (const { name, fn } of __tests) {
     await fn();
     passed++;

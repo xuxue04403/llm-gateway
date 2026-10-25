@@ -1894,3 +1894,71 @@ node scripts\check-engine-parity.mjs → 未声明 45 条（历史债；本轮 U
                                        ACCOUNT_FAILURE_RULES 四条已登记）
 变异测试 4 次（3 次 magpie 开关 + 1 次 11140 规则）→ 全部被用例如期抓到，均已还原
 ```
+
+### U.8 追加（同一轮）：三项防护在界面上完全不可见 —— 属于审计缺陷，也是最小新功能
+
+**问题**：magpie 三项防护（循环守卫 / 工具死循环拦截 / 上下文窗口过滤）默认全开，但
+`renderer/` 里搜 `loop|死循环|循环守卫|roomy|窗口过滤` **零命中** —— 用户既无法确认它们在干活，
+也无法在它们误伤时发现。
+
+`/health` 里有 `accounts` / `proxy` / `egress`，唯独没有这三项。
+
+**这为什么算缺陷而不是"功能缺失"**：R10 抓到的 `pendingHead` 缺陷（直通路径的循环守卫因为
+"偷看首个事件"把整条流吞进 `pendingHead` 而**从未被调用**）就是靠读代码发现的。
+一个"默默保护你"的功能与被关掉没有区别 —— 它既不能自证在工作，也不能在误伤时被察觉。
+三项能力都写着"默认开"，那就必须有一个地方能回答"它今天真的替我拦了几次"。
+
+**已实现**（引擎 + 界面各一半）：
+- `src/gateway/model-gateway.mjs:2170` 新增 `const guardStats = { loopGuard: 0, toolLoop: 0, roomy: 0 };`
+  注释写明三条边界：① 只放三个整数（`/health` 免鉴权，不能出现任何可能与具体会话关联的信息）；
+  ② 不持久化，重启归零是**有意**的（这三个数回答"这个进程做了什么"，不是"历史上做了多少"）；
+  ③ 历史去翻日志。
+- 计数点共 **9 处**，覆盖三条流式路径 + 两个 handler：`:8566`/`:8656`/`:10058`/`:10705`（loopGuard，
+  直通 pendingHead 分支 / 直通读循环 / 矩阵路径 / 翻译路径）、`:11926`/`:12354`（roomy，两个 handler）、
+  `:11942`/`:12363`（toolLoop，两个 handler）。**只增对应那一项**，不连带。
+- `/health` 响应（`:12735` 一带）新增 `guards: { loopGuard, toolLoop, roomy, enabled: { loopGuard, toolLoop, roomy, roomyLearn } }`。
+  带 `enabled` 是为了让界面能分清"关了"和"开了但没触发"。
+- 界面：`renderer/index.html` 概览页新增「防护计数」卡（`#guardsBox`），
+  `renderer/js/dashboard.js` 新增 `renderGuards()` 并在 `renderDashboard()` 与 `refreshHealth()` 两处调用。
+
+**界面设计上的一个决定（值得单说）**：两种"0"必须长得不一样 ——
+| 情形 | 显示 |
+|---|---|
+| 用户关掉了 | **已关闭**（灰）+ 数值位显示 `—` |
+| 开着但没触发过 | **已开启 · 暂未触发** + 数值 `0` |
+| 触发过 | **已生效 N 次**（绿）+ 数值 `N` |
+| 老引擎没有 `guards` 字段 | **当前引擎版本不支持防护计数（v1.0.19 起提供）** |
+把"关了"画成"0 次"，正是本项目在别处反复栽跟头的那类谎（`dumpWorkbuddy11128` 死代码、
+用量保留 30 天却让界面选 90 天、README 里 253 项测试）。所以这里的写法是**先判断开关、再判断数字**。
+
+**钉测试 2 条**：
+1. `tests/gateway.test.js`：`/health 的 guards 计数必须真实反映拦截次数，且带上开关状态` ——
+   ① 刚启动三个计数全 0、三个 `enabled` 全 true、`roomyLearn` false；
+   ② 真触发一次工具死循环 → `toolLoop` 变 1，`loopGuard` 与 `roomy` **必须仍为 0**（不得被顺手加一），
+   且上游 `calls === 0`（本地作答，一次都没打）。
+   ⚠ 踩坑：第一版写 `calls === 1`（照抄 tool_loop 用例里"7 轮已打过一次"的上下文），
+   而这条用例前面**没有**打任何请求 → 实际应为 0。错的是断言不是代码。
+2. `tests/renderer.test.js`：`防护计数必须区分「已关闭」与「已开启但未触发」—— 两种 0 不能长一样` ——
+   五种状态全断言（全开未触发 / 有触发 / 关了一项 / 老引擎无字段 / 网关未运行）。
+
+**变异验证（两处）**：
+| 变异 | 抓到它的断言 |
+|---|---|
+| 去掉 `guardStats.toolLoop += 1`（两处全去掉） | `工具死循环拦截过一次，计数必须是 1：{"loopGuard":0,"toolLoop":0,...}` |
+| 把 dashboard 的「已关闭」文案改成「已开启 · 暂未触发」 | `关掉的那项必须显示「已关闭」`（报错里能看到被关的那项画成了"已开启·暂未触发"） |
+两次都已还原。
+
+**直播验证**（`_scratch/probe-guards-live.cjs`，真引擎 3091 + 真 /health）：
+```
+拦截前 guards: {"loopGuard":0,"toolLoop":0,"roomy":0,"enabled":{...全 true, roomyLearn:false}}
+POST /v1/chat/completions（8 轮一样的工具调用）→ 200
+拦截后 guards: {"loopGuard":0,"toolLoop":1,"roomy":0,...}
+toolLoop 增量: 1 | loopGuard 增量: 0 | roomy 增量: 0
+```
+
+**最终水位**：
+```
+unit 101 / writers 50 / edge 29 / security 19 / renderer 16(+1) / gateway 223(+1)
+合计 → 438 项 0 失败
+node scripts\check-engine-parity.mjs → 未声明 45 条（guardStats 已登记）
+```

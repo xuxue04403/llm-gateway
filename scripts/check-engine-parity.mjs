@@ -454,6 +454,8 @@ const DECLARED = [
   { name: 'rotateFailed', why: '新增（审计 R8-4）：轮转失败只报一次，避免文件被占用时每 10 秒刷一条 WARN 把日志撑爆' },
   { name: 'dumpWorkbuddy11128', why: '接线（审计 R8-1）：该函数从引入起就没被调用过（git log --all -S 只有引入那一次），但引擎注释、日志与 README 排错表**四处**都在承诺"开 DSH_GATEWAY_DUMP_WB11128=1 就能转储比对" —— 用户照做时一个字节都不会落盘，且没有任何提示，偏偏发生在唯一还在猫鼠游戏里的功能上。现在直通 forward() 与翻译 forwardAnthropicViaOpenAI() 两处 11128 分支各补一行调用（同一判定两处实现的老坑）' },
 
+  // ---- 审计 R11：防护计数可见性 ----
+  { name: 'guardStats', why: '新增（审计 R11）：三项防护的运行期计数（loopGuard / toolLoop / roomy），只放三个整数挂在免鉴权的 /health 上 —— 那里不能出现任何可能与具体会话关联的信息，所以刻意不记模型名/供应商/时间，也不持久化（重启归零是有意的：这三个数回答的是"这个进程替你做了什么"）。为什么必须要有：这三项能力默认全开，但界面上此前一个字都没有，用户既无法确认它们在干活，也无法在它们误伤时发现 —— R10 那个 pendingHead 缺陷正是"代码写了、永远不触发、没人察觉"的实例。计数点在五处流式路径的命中分支 + 两处 roomy + 两处 tool_loop' },
   // ---- 审计 R11：账号被封禁（11140）单独成一类 ----
   { name: 'ACCOUNT_RESTRICTED_RE', why: '新增（审计 R11）：识别「账号被上游封禁/限制」。形态来自参照实现 yetone/magpie 的 gateway-routing.md —— 403 {"code":11140,"msg":"request illegal","displayMsg":{"en":"Your account has been restricted due to unusual activity"}}（本机未复现过，我们的 workbuddy 车道一直是 11128 渠道拒绝）。刻意**不认裸 "request illegal"**（magpie 也这么做）：11140 是腾讯系的码，但这句话别家也可能用，裸匹配会误伤。不认这个码的后果：11140 正文既无会话措辞也不命中 CONTENT_BLOCK_RE，于是被**裸 401/403 规则**吃掉 → kind=session → 面板显示「登录失效」，用户跑去重新登录（凭据其实是好的），白折腾一场' },
   { name: 'ACCOUNT_RESTRICTED_COOLDOWN_MS', why: '新增（审计 R11）：账号受限的冷却（默认 12 小时，env 可调）。取这个量级而不是 Infinity 的理由：用户可能真的申诉成功了，而这个进程不重启就永远看不到 —— 12 小时比 session 的 1 小时长一个量级，又不至于把一整天锁死' },

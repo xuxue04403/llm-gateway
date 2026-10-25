@@ -559,3 +559,67 @@ t('渲染层：预置配置的首启引导必须出现，配好后必须消失�
 });
 
 run();
+
+/* ================================================================
+ * 概览页：防护计数必须说人话（审计 R11）
+ *
+ * 背景：magpie 三项防护（循环守卫 / 工具死循环拦截 / 上下文窗口过滤）默认全开，
+ * 但界面上此前一个字都没有。用户既无法确认它们在干活，也无法在它们误伤时发现 ——
+ * R10 那个 pendingHead 缺陷就是"代码写了、永远不触发、没人察觉"的实例。
+ *
+ * 这条用例重点钉住两种"0"不能长得一样：
+ *   - 用户自己关掉了 → 必须显示「已关闭」；
+ *   - 开着但没触发过 → 必须显示「已开启 · 暂未触发」。
+ * 混在一起会让"关了"看起来像"工作了但没事发生"，那正是要避免的那类谎。
+ * ================================================================ */
+
+t('渲染层：防护计数必须区分「已关闭」与「已开启但未触发」—— 两种 0 不能长一样', () => {
+  const S = makeSandbox();
+  const { refs, sandbox } = S;
+  refs.LG.state = { gateway: { running: true, ready: true, port: 3091, configPath: 'C:\\x\\gateway.config.json' } };
+  refs.LG.config = { providers: [], apiKey: 'k' };
+  const box = () => sandbox.document.querySelector('#guardsBox');
+
+  // ① 三个都开着、都没触发过：必须说"暂未触发"，不能说成"已生效 0 次"那种含糊话，
+  //    更不能画一排 0 让人以为坏了。
+  refs.LG.health = {
+    accounts: [],
+    guards: { loopGuard: 0, toolLoop: 0, roomy: 0, enabled: { loopGuard: true, toolLoop: true, roomy: true, roomyLearn: false } },
+  };
+  refs.LG.renders.dashboard();
+  let html = box().innerHTML;
+  assert.ok(/循环守卫/.test(html), '必须列出循环守卫：' + html);
+  assert.ok(/工具死循环拦截/.test(html), '必须列出工具死循环拦截：' + html);
+  assert.ok(/上下文窗口过滤/.test(html), '必须列出上下文窗口过滤：' + html);
+  assert.strictEqual((html.match(/暂未触发/g) || []).length, 3, '三个都该显示「暂未触发」：' + html);
+  assert.ok(!/已关闭/.test(html), '全开着时不该出现「已关闭」：' + html);
+
+  // ② 触发过：显示实际次数（这才是用户真正想看的东西 —— "它替我拦了几次"）
+  refs.LG.health.guards = { loopGuard: 3, toolLoop: 1, roomy: 12, enabled: { loopGuard: true, toolLoop: true, roomy: true, roomyLearn: false } };
+  refs.LG.renders.dashboard();
+  html = box().innerHTML;
+  assert.ok(/已生效 3 次/.test(html), '循环守卫该显示 3 次：' + html);
+  assert.ok(/已生效 1 次/.test(html), '工具死循环该显示 1 次：' + html);
+  assert.ok(/已生效 12 次/.test(html), '窗口过滤该显示 12 次：' + html);
+  assert.ok(!/暂未触发/.test(html), '有触发时不该残留「暂未触发」：' + html);
+
+  // ③ 用户关掉了循环守卫：必须明确说「已关闭」，且不能显示成"已开启·暂未触发"。
+  //    这是本条用例的核心：关掉和没触发是**完全不同**的事实，界面必须能分辨。
+  refs.LG.health.guards = { loopGuard: 0, toolLoop: 0, roomy: 0, enabled: { loopGuard: false, toolLoop: true, roomy: true, roomyLearn: false } };
+  refs.LG.renders.dashboard();
+  html = box().innerHTML;
+  assert.ok(/已关闭/.test(html), '关掉的那项必须显示「已关闭」：' + html);
+  assert.strictEqual((html.match(/暂未触发/g) || []).length, 2, '只有真开着的两项才该显示「暂未触发」：' + html);
+
+  // ④ 老引擎（v1.0.19 之前）没有 guards 字段：如实说不支持，而不是画一排 0 假装在工作。
+  refs.LG.health = { accounts: [] };
+  refs.LG.renders.dashboard();
+  html = box().innerHTML;
+  assert.ok(/不支持防护计数/.test(html), '老引擎必须如实说不支持：' + html);
+  assert.ok(!/暂未触发/.test(html), '不支持时不得画假的「暂未触发」：' + html);
+
+  // ⑤ 网关未运行：说未运行，不编数据
+  refs.LG.state.gateway.running = false;
+  refs.LG.renders.dashboard();
+  assert.ok(/网关未运行/.test(box().innerHTML), '未运行时要说明：' + box().innerHTML);
+});

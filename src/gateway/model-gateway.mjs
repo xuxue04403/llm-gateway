@@ -2153,6 +2153,22 @@ let ACTIVE_ROOMY = DEFAULT_ROOMY;
 let ACTIVE_ROOMY_LEARN = DEFAULT_ROOMY_LEARN;
 
 /** 三态布尔：配置里写 true/false/"on"/"off"/1/0 都认；未设 → 用缺省值。 */
+/**
+ * 三项防护的**运行期计数**（2026-10-25 审计 R11 补）。
+ *
+ * 为什么要有它：这三项能力默认全开，但它们在界面上**完全不可见** —— 用户无法知道
+ * 网关替他拦下了多少次死循环、救回了多少次白烧的额度。一个"默默保护你"的功能
+ * 与被关掉没有区别：既无法确认它在工作（R10 那个 `pendingHead` 缺陷就是这样潜伏的 ——
+ * 代码写了，永远不触发，没人发现），也无法在它误伤时被发现。
+ *
+ * 只放三个整数（不记模型名/供应商/时间），因为它挂在**免鉴权的 `/health`** 上：
+ * 那里不能出现任何可能与具体会话关联的信息。计数本身不敏感。
+ *
+ * 不持久化：重启归零是**有意**的 —— 这三个数回答的是"这个进程替你做了什么"，
+ * 而不是"历史上做过多少"。要看历史去翻日志（`[loop]` / `[route] … 装不下的候选` 行）。
+ */
+const guardStats = { loopGuard: 0, toolLoop: 0, roomy: 0 };
+
 function cfgBool(v, dflt) {
   if (v === undefined || v === null || v === '') return dflt;
   if (typeof v === 'boolean') return v;
@@ -8547,6 +8563,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       const t = feedLoopGuard(pendingHead.toString('utf8'));
       if (t) {
         loopText = t;
+        guardStats.loopGuard += 1;
         log(`[loop] 直通路径（${provider.id}）：答复陷进重复（整条流在首个分片内就已判出）→ 主动切断：${t}`);
       }
     }
@@ -8636,6 +8653,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
           const t = feedLoopGuard(Buffer.from(value).toString('utf8'));
           if (t) {
             loopText = t;
+            guardStats.loopGuard += 1;
             log(`[loop] 直通路径（${provider.id}）：答复陷进重复 → 主动切断`
               + `（已转发 ${tail.length} 字节尾部窗口）：${t}`);
           }
@@ -10037,7 +10055,7 @@ async function pumpMatrixStream({ res, upstream, upstreamWire, clientWire, model
           if (!e || e.t !== 'text' || !e.d) continue;
           textChars += String(e.d).length;
           const t = guard.feed(e.d);
-          if (t) { loopText = t; loopTripped = true; break; }
+          if (t) { loopText = t; loopTripped = true; guardStats.loopGuard += 1; break; }
         }
       } else {
         for (const e of evs) if (e && e.t === 'text' && e.d) textChars += String(e.d).length;
@@ -10684,6 +10702,7 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
     if (!t) return false;
     loopTripped = true;
     loopText = t;
+    guardStats.loopGuard += 1;
     log(`[loop] 流式答复陷进重复 → 主动切断（已产出 ${outText.length} 字符）：${t}`);
     return true;
   };
@@ -11904,6 +11923,7 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
     const rm = roomyOrder(tryOrder, model, body);
     if (rm) {
       tryOrder = rm.order;
+      guardStats.roomy += 1;
       log(`[route] ${model}: 约 ${rm.est} tokens，装不下的候选排到最后：${rm.moved.join('、')}`
         + '（不删除 —— 全都失败时仍会轮到它们）');
     }
@@ -11919,6 +11939,7 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
     const loop = detectToolLoop(body, wire);
     if (loop) {
       const text = toolLoopNotice(loop);
+      guardStats.toolLoop += 1;
       log(`[loop] ${model}: 工具死循环 —— 连续 ${loop.repeats} 轮相同调用（${loop.names.filter(Boolean).slice(0, 3).join('、')}）`
         + '→ 本地作答，不发给任何上游');
       recordUsage({
@@ -12330,6 +12351,7 @@ async function handleMessages(cfg, req, res, body) {
     const rm = roomyOrder(tryOrder, model, outBody);
     if (rm) {
       tryOrder = rm.order;
+      guardStats.roomy += 1;
       log(`[route] ${model}: 约 ${rm.est} tokens，装不下的候选排到最后：${rm.moved.join('、')}`
         + '（不删除 —— 全都失败时仍会轮到它们）');
     }
@@ -12338,6 +12360,7 @@ async function handleMessages(cfg, req, res, body) {
     const loop = detectToolLoop(outBody, 'anthropic-messages');
     if (loop) {
       const text = toolLoopNotice(loop);
+      guardStats.toolLoop += 1;
       log(`[loop] ${model}: 工具死循环 —— 连续 ${loop.repeats} 轮相同调用（${loop.names.filter(Boolean).slice(0, 3).join('、')}）`
         + '→ 本地作答，不发给任何上游（anthropic 路径）');
       recordUsage({
@@ -12732,7 +12755,26 @@ async function routeRequest(cfg, req, res) {
       // 代理可见性（v1.8.2）：把"是否走代理 / 哪些域名直连"也放进来——2026-09-16 事故里
       // 上游 ECONNREFUSED 的真凶是 clash 端口没在监听，而 /health 当时只有 accounts。
       // egress（2026-10-20）：多出口轮换的状态（当前用哪个、哪些在冷却）。
-      json(res, 200, { ok: true, accounts: accountPoolSnapshot(cfg), proxy: proxyStatus(), egress: outletStatus() });
+      // guards（2026-10-25，审计 R11）：magpie 三项防护在本进程内**实际生效的次数**。
+      // 只放三个整数：这里免鉴权，不能出现任何可能与具体会话关联的信息。
+      // 也顺带把开关状态带出来 —— 用户看到 0 时至少要能分清"没触发"和"已关闭"。
+      json(res, 200, {
+        ok: true,
+        accounts: accountPoolSnapshot(cfg),
+        proxy: proxyStatus(),
+        egress: outletStatus(),
+        guards: {
+          loopGuard: guardStats.loopGuard,
+          toolLoop: guardStats.toolLoop,
+          roomy: guardStats.roomy,
+          enabled: {
+            loopGuard: !!ACTIVE_LOOP_GUARD,
+            toolLoop: !!ACTIVE_TOOL_LOOP,
+            roomy: !!ACTIVE_ROOMY,
+            roomyLearn: !!ACTIVE_ROOMY_LEARN,
+          },
+        },
+      });
       return;
     }
 
