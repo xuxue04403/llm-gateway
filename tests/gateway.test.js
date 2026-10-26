@@ -2636,7 +2636,14 @@ let upstreamPort = 0;
         }
         if (behavior === 'credit') {
           res.writeHead(402, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ code: 0, msg: 'insufficient credit: 积分不足' }));
+          // ⚠ 必须让 opts.errorBody 生效（审计 R12 修正）。
+          //
+          // 原实现**硬编码**这个响应体，完全忽略传入的 errorBody。于是 D6 与 P1 两条
+          // "脱敏"用例把带密钥的错误体交给这里，却从未真的让上游吐出来 ——
+          // 断言"日志/health 不含密钥"在 leaky 根本不存在的情况下**永远为真**。
+          // 这正是变异测试的价值：把 markAccountFailure 里的 maskSecrets 删掉，
+          // 两条用例照旧全绿，而 /health 上真的躺着一把完整 key。
+          res.end(JSON.stringify(opts.errorBody || { code: 0, msg: 'insufficient credit: 积分不足' }));
           return;
         }
         if (behavior === 'sseCredit') {
@@ -2648,7 +2655,7 @@ let upstreamPort = 0;
         }
         if (behavior === 'session') {
           res.writeHead(401, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ code: 0, msg: 'Offline user session not found 12153' }));
+          res.end(JSON.stringify(opts.errorBody || { code: 0, msg: 'Offline user session not found 12153' }));
           return;
         }
         // 2026-09-18：**裸 403**（实测 nvidia 形态）——没有账号/额度措辞，旧实现按"供应商级 403"熔断整家；
@@ -7318,6 +7325,105 @@ let upstreamPort = 0;
     } finally {
       try { upBlocked.close(); } catch { /* 忽略 */ }
     }
+  });
+
+  t('网关（审计 R12）：11128 转储必须只保留最近若干份 —— 注释承诺过，变异测试证明此前无人守', async () => {
+    // 缺陷形态：`dumpWorkbuddy11128` 上方注释写着"目录沿用项目既有的 logs/dump，
+    // 并**只保留最近若干份**"，但函数体里**没有任何 prune 调用**。
+    // 与 P3 修掉的 blocked-*.json 无界增长是同一族 —— 那份写了 prune，这份只在注释里写了。
+    //
+    // 为什么这条特别值得钉：开着 DSH_GATEWAY_DUMP_WB11128=1 长期跑、且反复撞 11128 的实例
+    // **正是这个开关存在的场景**，于是它会稳定地把 logs/dump 撑到无界。
+    // 变异测试（删掉那一行 prune 调用）跑全量 222 条用例，**一条都没红** —— 没有任何回归保护。
+    const upBlocked = http.createServer((q, s) => {
+      q.resume();
+      q.on('end', () => {
+        s.writeHead(400, { 'content-type': 'application/json' });
+        s.end(JSON.stringify({ code: 11128, msg: 'Illegal API invocation from an unapproved channel' }));
+      });
+    });
+    await new Promise((r) => upBlocked.listen(0, '127.0.0.1', r));
+
+    const mk = () => ({
+      id: 'wb-prune', baseURL: 'http://127.0.0.1:' + upBlocked.address().port + '/v2',
+      protocol: 'openai-chat', models: ['test-model'],
+      apiKey: 'sk-' + 'a'.repeat(15), priority: 1, enabled: true,
+    });
+
+    try {
+      const gw = await startGatewayWith([mk()], 'wbprune', { DSH_GATEWAY_DUMP_WB11128: '1' }, {});
+      try {
+        assert.ok(gw.ready, '独立网关实例应就绪');
+        // 打 DUMP_KEEP_FILES + 若干次，确保超过上限
+        const N = 26;   // DUMP_KEEP_FILES = 20
+        for (let i = 0; i < N; i++) {
+          await call({ port: gw.port, p: '/v1/chat/completions', body: { model: 'test-model', messages: [{ role: 'user', content: 'hi ' + i }] } });
+        }
+        const dumpDir = path.join(gw.dir, 'dump');
+        assert.ok(fs.existsSync(dumpDir), '开关打开时必须有 dump 目录：' + dumpDir);
+        const files = fs.readdirSync(dumpDir).filter((f) => /^wb11128-.*\.json$/.test(f));
+        assert.ok(files.length > 0,
+          '必须真的落过盘（否则这条用例在测一个没发生的场景）：' + JSON.stringify(fs.readdirSync(dumpDir)));
+        // 上限是 20，打了 26 次，允许"正好 20"或略多（清理与写入的时序），但绝不能是 26
+        assert.ok(files.length <= 20,
+          '转储必须只保留最近 ' + 20 + ' 份（打 ' + N + ' 次后实际留下 ' + files.length
+          + ' 份）—— 上限失效会让目录无界增长：' + JSON.stringify(files));
+      } finally { killGw(gw); }
+    } finally {
+      try { upBlocked.close(); } catch { /* 忽略 */ }
+    }
+  });
+
+  t('网关（审计 R12）：maskSecrets 的裸高熵串兜底必须生效 —— 变异删掉它，全量用例一条都不红', async () => {
+    // 变异测试结果：把 `maskSecrets` 最后那条「裸高熵串兜底」整段去掉，
+    // `node --test tests/gateway.test.js` 222 条用例**全绿**。
+    // 也就是说 2026-10-08 那次真实事故（上游 401 把收到的凭据裸回显成
+    // `auth rejected for credential aB3xK9mQ2pL7wR4tY6uI8oP0sD5fG1hJ2k`）的修复，
+    // 没有任何回归保护 —— 它是脱敏链的**最后一层**，前面的前缀/关键词规则全不命中时只剩它。
+    //
+    // 这里用 D6 的同一形态（上游把 Authorization 原样回显），但故意选一个
+    // **既无前缀、也无关键词**的高熵串，逼着只能靠兜底那一条规则命中。
+    const SECRET = 'aB3xK9mQ2pL7wR4tY6uI8oP0sD5fG1hJ2k';   // 32 字符，字母+数字，无前缀无关键词
+    const up = await startFakeOpenAIUpstream({
+      behavior: 'credit',
+      errorBody: { error: { message: 'auth rejected for credential ' + SECRET } },
+    });
+    const gw = await startGatewayWith([openaiProvider('hb', up, { apiKeys: ['k1'] })], 'highEntropy');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      await call({ port: gw.port });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(!logText.includes(SECRET),
+        '日志里不得出现裸高熵凭据（说明兜底规则没生效）：' + logText.slice(-400));
+      const h = JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
+      const reasons = JSON.stringify(h.accounts || []);
+      assert.ok(!reasons.includes(SECRET),
+        '/health 的 reason 不得含裸高熵凭据（免鉴权接口）：' + reasons);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关（审计 R12）：网关 apiKey 不足 16 字符必须拒绝 —— 变异删掉下限，222 条用例全绿', async () => {
+    // 变异测试结果：把 `authorized()` 里的 `if (expect.length < 16) return false;`
+    // 改成 `if (expect.length === 0) return false;`，222 条用例**一条都没红**。
+    // 也就是说"网关鉴权要求 ≥16 字符"这条约束（`src/gateway-manager.js:238` 的配置校验
+    // 与引擎里的 authorized() 两处都写了）在引擎侧完全没有测试保护。
+    //
+    // 为什么这条重要：短 apiKey 的爆破面是**线性**的（4 字符 = 几十秒），
+    // 而网关监听回环、/health 免鉴权、配置由用户在 GUI 里填 —— 一个手滑填的 "1234"
+    // 就会把整条链路的鉴权降级成摆设。
+    // 配置校验（gateway-manager.js）存在，但**引擎是独立可启动的**（DSH_GATEWAY_CONFIG 直接起），
+    // 不经过 gateway-manager 的校验，所以引擎侧必须自己守住。
+    const gw = await startGatewayWith(
+      [{ id: 'x', baseURL: 'http://127.0.0.1:1/v1', protocol: 'openai-chat', models: ['test-model'], apiKey: 'k', priority: 1, enabled: true }],
+      'shortKey', {}, { apiKey: 'short1234' },   // 10 字符，< 16
+    );
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪（配置能被加载）');
+      const r = await call({ port: gw.port, key: 'short1234' });
+      assert.strictEqual(r.status, 401,
+        '配置里的 apiKey 不足 16 字符时，任何请求都必须 401（不能因为"它和配置一致"就放行）：实际 '
+        + r.status + ' ' + r.text.slice(0, 200));
+    } finally { killGw(gw); }
   });
 
   t('网关（审计 R11）：用量保留天数必须覆盖界面能选的最长期（90 天）—— 否则「90 天」是个谎', async () => {

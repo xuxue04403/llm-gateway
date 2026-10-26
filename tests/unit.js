@@ -2004,4 +2004,50 @@ t('restart：并发调用必须串行（后一次不得杀掉前一次刚起的�
   assert.strictEqual(stopCalls, 2, 'restart 结束后 _restarting 必须复位，第二次调用应重新执行');
 });
 
+/* ==================== 源码级守卫：鉴权的恒定时间比较 ==================== */
+
+t('引擎 authorized()：必须用摘要 + timingSafeEqual 比较（变异测试证明黑盒用例抓不到它退回 ===）', () => {
+  // ⚠ 这条为什么只能做**源码级**断言：
+  //
+  // 安全面变异测试（_scratch/audit-mutate-security.cjs）把 authorized() 里的
+  //     const a = crypto.createHash('sha256').update(given, 'utf8').digest();
+  //     const b = crypto.createHash('sha256').update(expect, 'utf8').digest();
+  //     return crypto.timingSafeEqual(a, b);
+  // 整段替换成 `return given === expect;`，跑全量 222 条用例**一条都没红**。
+  //
+  // 这是必然的 —— 两种写法在**功能上完全等价**，差别只在"比较耗时是否随
+  // 首个不同字节的位置变化"。黑盒测试无法从外部观测到纳秒级差异（噪声远大于信号），
+  // 所以这条防线永远不可能被端到端用例保护。能守住的只有"实现形态"本身。
+  //
+  // 风险到底有多大（如实记录，不夸大）：
+  //   · 网关监听 127.0.0.1，攻击者要打时序侧信道得先能在本机跑代码 —— 那时
+  //     它能直接读 gateway.config.json，时序攻击毫无意义；
+  //   · 所以这是**纵深防御**，不是主要防线。但既然代码里已经这么写了、
+  //     注释里也解释了原因，就不该让它被无声地退回 `===`。
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'gateway', 'model-gateway.mjs'), 'utf8');
+  const m = src.match(/function authorized\(req, cfg\) \{([\s\S]*?)\n\}/);
+  assert.ok(m, '应能找到 authorized 函数体');
+  const body = m[1];
+
+  // ① 必须是恒定时间比较，不能是裸字符串相等
+  assert.ok(/crypto\.timingSafeEqual\(/.test(body),
+    'authorized 必须用 crypto.timingSafeEqual 比较凭据（现在没有 → 可能被退回裸 ===）');
+  assert.ok(!/return\s+given\s*===\s*expect/.test(body),
+    'authorized 不得直接用 given === expect 比较（功能等价，但会泄漏比较耗时）');
+
+  // ② 比较前必须先过摘要 —— timingSafeEqual 要求两个 Buffer 等长，
+  //    直接拿原文比会因长度不同抛异常（那会变成"正确 key 也进不去"，且极难归因）。
+  assert.ok(/createHash\('sha256'\)\.update\(given/.test(body) && /createHash\('sha256'\)\.update\(expect/.test(body),
+    '两边都必须先 sha256 摘要再比较（timingSafeEqual 要求等长 Buffer）');
+
+  // ③ 空 key / 短 key 必须 fail-closed。
+  //    ⚠ 这里只断言 `< 16` 一条 —— 它已经把空串（length 0）包含在内，
+  //    第一版还额外断言了 `expect.length === 0) return false`，实测**失败**：
+  //    实现里只有 `< 16` 这一个判断。断言一个并不存在（且冗余）的语句，
+  //    属于"照着想象中的实现写测试"，比没有测试更糟。
+  assert.ok(/expect\.length < 16\) return false/.test(body),
+    '配置 apiKey 不足 16 字符（含空串）必须判伪 —— 短 key 爆破面是线性的。'
+    + '注意 gateway-manager.js 的配置校验只管 GUI 那条路径，引擎可被直接启动，必须自己守');
+});
+
 run();

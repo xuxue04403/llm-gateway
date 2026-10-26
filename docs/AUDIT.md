@@ -1962,3 +1962,183 @@ unit 101 / writers 50 / edge 29 / security 19 / renderer 16(+1) / gateway 223(+1
 合计 → 438 项 0 失败
 node scripts\check-engine-parity.mjs → 未声明 45 条（guardStats 已登记）
 ```
+
+---
+
+## V. 第十二轮审计（2026-10-26）：安全面自查 + 测试有效性（变异测试）
+
+本轮是被用户当面点出来的：上一轮我建了 6 项待办，其中「审计安全面」「审计测试有效性」两项**没做完**就宣布收尾 ——
+安全面那个子代理跑了很久没有产出，我 `interrupt_agent` 中止了它，然后就把这一项当成做完了；
+测试有效性只做了 4 次变异，是个半成品。这一轮的产出，一半是缺陷，一半是**证明上一轮哪些"绿"不算数**。
+
+### V.1 结论先行
+
+| # | 结论 | 定级 |
+|---|---|---|
+| 1 | **11128 转储目录无界增长** —— 注释承诺"只保留最近若干份"，函数体里根本没有 prune | 中（已修） |
+| 2 | 8 条安全变异中 **5 条存活** —— 这些防线没有被任何测试保护 | 中（已补 4 条用例） |
+| 3 | 其中一条存活是**测试辅助函数自己的 bug**：`startFakeOpenAIUpstream` 忽略 `errorBody`，导致 D6/P1 两条"脱敏"用例**从未真的让上游吐过密钥** | 高（已修） |
+| 4 | 恒定时间比较无法被黑盒测试保护（功能等价），改用**源码级守卫** | 低（已补） |
+| 5 | 路径穿越 / 出站 SSRF / 渲染层 XSS / IPC / 命令执行 / 供应链 —— **逐项核完，无缺陷** | — |
+| 6 | `mode: 0o600` 在 Windows 上是心理安慰（ACL 仍继承父目录） | 低（未修，记录） |
+
+### V.2 路径穿越 / SSRF / 供应链：核完，无缺陷
+
+**路径穿越**：`path.join|resolve` 40 处、可疑 `../` 0 处；15 处写文件调用点没有任何一处把请求路径或 URL 拼进文件名。
+`writeBlockedDump` 的 tag 有 `String(provider.id).replace(/[^A-Za-z0-9_.-]/g, '_')`。
+
+**出站 SSRF**：`fetch` 15 处目标全是 `upstreamBase(provider.baseURL)` + 固定路径或常量。
+`src/gateway-manager.js:333-340` 强制 baseURL 必须是 http(s) 绝对地址（`new URL()` + protocol 白名单）
+→ **只能由用户配置决定，请求不可控**。`handleResponsesResource` 拿到 `decodeURIComponent(rawId)` 后
+立即 `encodeURIComponent(id)` 重编码成 `base = '/responses/' + encodeURIComponent(id)`，注入出不了路径段。
+
+**命令执行**：全仓 `eval(` / `new Function(` 0 处。`execFile(exe, [helperPath])` 参数固定、
+exe 来自 `workbuddyElectronCandidates()` 且逐个 `existsSync` 过滤。
+`spawn('powershell', ['-NoProfile','-Command',script])` 的 `script` 只有一处调用点，是**硬编码字符串常量**
+（读注册表代理），不含插值。
+
+**供应链（本项最强）**：引擎只有 7 个 `node:` 内置 import（`http`/`net`/`fs`/`path`/`os`/`crypto`/`child_process`），零第三方；
+宿主侧 `src/*.js` 与 `src/writers/*.js` 全部 `require` 内置模块 + `electron`；`package.json` 无 `dependencies`；
+`package-lock.json` 356 个包里 `hasInstallScript` **0 个**。
+
+**渲染层**：`contextIsolation: true` / `nodeIntegration: false` / `sandbox: true`；CSP 全套（`default-src 'none'` 起步）；
+无外部资源引用；导航拦截三件套（`will-navigate` / `will-attach-webview` / `setWindowOpenHandler`）；
+`preload.js` 只暴露 22 个**具名**动作，不暴露 `ipcRenderer` 本身。
+`core.js:44` 的 `el()` 第三参直进 `innerHTML`，但两个调用点都先过 `esc()`；
+`dashboard.js:178` 唯一未转义插值由内部常量拼接而成。
+
+### V.3 🔴 缺陷一：11128 转储目录无界增长（已修）
+
+`dumpWorkbuddy11128` 上方注释写着"目录沿用项目既有的 logs/dump，并**只保留最近若干份**"，
+但函数体里**没有任何 prune 调用**。与 P3 修掉的 `blocked-*.json` 无界增长同族 ——
+那份写了 prune，这份只在注释里写了。
+
+为什么这条不是小事：开着 `DSH_GATEWAY_DUMP_WB11128=1` 长期跑、**且反复撞 11128** 的实例，
+正是这个开关存在的场景。它会稳定地把 `logs/dump` 撑到无界。
+
+修法（写文件之后、打日志之前）：
+```js
+pruneDumpDir(dir, /^wb11128-.*\.json$/i, DUMP_KEEP_FILES);
+```
+`DUMP_KEEP_FILES = 20`；`full-*.json` 仍不自动删（用户显式开 `DSH_GATEWAY_DUMP_FULL` 的取证文件）。
+
+**钉测试**：`11128 转储必须只保留最近若干份` —— 打 26 次，断言留下的 ≤ 20 份。
+变异（删掉那行 prune）→ 报错原文 `转储必须只保留最近 20 份（打 26 次后实际留下 26 份）`。
+
+### V.4 🔴 缺陷二（本轮最重要）：测试辅助函数骗了所有人
+
+`startFakeOpenAIUpstream` 的 `st` 对象里**根本没有 `errorBody` 字段** ——
+`behavior === 'credit'` 分支直接硬编码响应 `{code:0,msg:'insufficient credit: 积分不足'}`，
+把调用方传进来的 `opts.errorBody` 完全丢弃。
+
+于是 **D6**（`账户失败原因必须脱敏`）与 **P1**（`非 sk- 前缀的凭证也必须脱敏`）两条用例：
+- 用例里精心构造了带密钥的 `errorBody`，断言"日志与 /health 不得含这个密钥"；
+- 但那个密钥**从来没有进入过上游的响应**；
+- → 断言在"泄漏源根本不存在"的前提下恒真，无论脱敏有没有实现。
+
+**这是怎么发现的**：变异测试把 `markAccountFailure` 里的 `maskSecrets` 删掉，
+全量用例照旧全绿；而我手工起一个假上游（真的把 key 回显出来）后，
+`/health` 上赫然躺着一把完整 key。
+
+修法与验证见 V.6。
+
+### V.5 缺陷三：`startFakeUpstream` 的 `credit` / `session` 两个分支
+
+同一个辅助函数家族里的 `startFakeUpstream`（另一个函数）**正确使用了** `st.errorBody`（`:1219`），
+说明这不是"设计如此"，就是 `startFakeOpenAIUpstream` 漏写。
+
+`credit` 与 `session` 两个分支都已改为 `opts.errorBody || <原默认值>` ——
+保留默认值是为了不打破既有用例（它们依赖那两段固定文案触发分类规则）。
+
+### V.6 安全面变异测试：8 条里 5 条存活
+
+方法：逐条把关键防线改坏，跑 `node --test tests/gateway.test.js`，看是否真的会红；每次跑完立即还原。
+
+| 变异 | 修前 | 修后 |
+|---|---|---|
+| 鉴权：`timingSafeEqual` → `===` | ✗ 存活 | ✓ 源码级守卫抓到 |
+| 鉴权：删掉 `expect.length < 16` | ✗ 存活 | ✓ 新用例抓到 |
+| DNS rebinding：Host 校验恒放行 | ✓ 抓到 | ✓ |
+| DNS rebinding：Origin 校验恒放行 | ✓ 抓到 | ✓ |
+| 脱敏：裸高熵串兜底整段去掉 | ✗ 存活 | ✓ 新用例抓到 |
+| 账户失败原因不过 `maskSecrets` | ✗ 存活 | ✓ 修辅助函数后抓到 |
+| 11128 转储不脱敏 | ✓ 抓到 | ✓ |
+| 11128 转储保留上限删掉 | ✗ 存活 | ✓ 新用例抓到 |
+
+**存活的 5 条全部有解释，且解释各不相同** —— 这正是变异测试的价值所在：
+
+1. **`timingSafeEqual` → `===`**：两种写法**功能完全等价**，只差时序特征。
+   黑盒测试无法观测纳秒级差异（噪声远大于信号），这条防线**永远不可能**被端到端用例保护。
+   → 改用源码级守卫（见 V.7）。
+2. **`expect.length < 16`**：`gateway-manager.js:238` 有同一约束，但那只管 GUI 路径；
+   **引擎可被直接启动**（`DSH_GATEWAY_CONFIG=... node model-gateway.mjs`），不经过那道校验。
+3. **裸高熵串兜底**：它是脱敏链的**最后一层**，前面所有前缀/关键词规则都不命中时才轮到它。
+   2026-10-08 那次真实事故（`auth rejected for credential aB3xK9mQ...`）就死在这一层。
+4. **账户失败原因脱敏**：不是脱敏的问题，是**上游从未吐过密钥**（V.4）。
+5. **转储保留上限**：功能刚加（V.3），自然没人守。
+
+### V.7 恒定时间比较：为什么只能做源码级守卫
+
+```js
+const m = src.match(/function authorized\(req, cfg\) \{([\s\S]*?)\n\}/);
+assert.ok(/crypto\.timingSafeEqual\(/.test(body), '...');
+assert.ok(!/return\s+given\s*===\s*expect/.test(body), '...');
+```
+
+**如实记录风险，不夸大**：网关监听 127.0.0.1，攻击者要打时序侧信道得先能在本机跑代码 ——
+那时它可以直接读 `gateway.config.json`，时序攻击毫无意义。**这是纵深防御，不是主要防线。**
+
+但既然代码里已经这么写了、注释里也解释了原因，就不该让它被无声地退回 `===`。
+这是本项目第二处源码级守卫（第一处是 `upstreamBase` 的两份实现一致性）。
+
+⚠ **这条用例第一版写错了**：除了 `< 16` 还断言了 `expect.length === 0) return false`，
+跑下来 FAIL —— 实现里**只有** `< 16` 这一个判断（它已包含空串）。断言一个并不存在（且冗余）的语句，
+属于"照着想象中的实现写测试"，比没有测试更糟。已删掉。
+
+### V.8 未修但记录：`mode: 0o600` 在 Windows 上是心理安慰
+
+`mode: 0o600` 出现在 3 处（WorkBuddy own 凭据、Codex token tmp、目录 `0o700`）。
+用 `icacls` 读真实 ACL 实测：
+```
+NT AUTHORITY\Authenticated Users:(I)(M)
+BUILTIN\Users:(I)(RX)
+```
+全部带 `(I)` = 继承自父目录。`gateway.config.json` 同样（`Authenticated Users: Modify`）。
+
+**定级：低**。威胁模型是同机多用户，本程序面向单用户桌面；
+且代码注释、README、AUDIT 都**没有**声称这些 mode 能保护凭据 → 不算"文档说谎"。
+要修需用 `icacls /inheritance:r /grant:r "%USERNAME%:F"`，属跨平台行为差异，建议单独立项。
+
+### V.9 顺手核对：日志泄露面（用真实数据验证）
+
+- `log()` **本身不做脱敏** —— 235 处调用里只有 13 处显式过 `maskSecrets`，这是最大风险点。
+- 但逐个核查"把 detail/body/错误体拼进日志"的 20 处未脱敏调用，全部安全：
+  `pre.detail` 只含 `host:port（via，ms，阈值）`、`causeText`/`reasonsText` 是枚举、
+  `tripMessage()` 是固定文案 + 各片段前 40 字符（会带一点模型输出，但那是用户自己的内容）。
+- 实弹扫描现网 4.3MB 日志 + 275KB app.log + dump 目录，
+  正则 `sk-[A-Za-z0-9_-]{20,}|eyJ…|nvapi-…|rc-[A-Za-z0-9]{20,}` 命中 **0 处**。
+- 从真实配置抽出 24 个密钥片段、三种回显语境过 `maskSecrets`：**23/23 真实密钥全覆盖**，
+  漏出的 1 个是 `opencode.apiKey = "public"`（上游公开占位值，非密钥）。
+
+### V.10 最终水位
+
+```
+unit 102(+1) / writers 50 / edge 29 / security 19 / renderer 16 / gateway 226(+3)
+合计 → 442 项 0 失败
+node scripts\check-engine-parity.mjs → 未声明 45 条（本轮未新增）
+```
+
+引擎改动 5 行（V.3 的 prune）；测试新增 4 条（gateway 3 条 + unit 1 条源码守卫）；
+README 水位与覆盖说明同步。
+
+### V.11 本轮方法论
+
+**"绿"和"有用"是两件事。** 上一轮我加了 7 条新用例、全绿，就以为测试有效性做完了。
+这一轮的变异测试说明：**新加的用例能抓住它对应那个 bug，不等于整套用例能抓住这一类 bug** ——
+8 条里 5 条存活，其中一条还是"测试辅助函数自己骗人"。
+
+**变异测试最有价值的产出不是"抓到变异"，而是"没抓到"时的那句为什么。**
+五条存活的解释各不相同：功能等价（注定抓不到）、别处有校验但这条路径绕开了、
+是最后一层兜底没有专项用例、**上游根本没吐数据**、功能刚加。
+如果只记"5 条存活"这个数字，下一次还会踩。
+

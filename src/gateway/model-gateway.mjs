@@ -4150,6 +4150,11 @@ function dumpWorkbuddy11128(provider, bodyText, detail) {
     };
     const file = path.join(dir, 'wb11128-' + Date.now() + '.json');
     fs.writeFileSync(file, JSON.stringify(out, null, 2), 'utf8');
+    // 审计 R12：这里原先**没有**保留上限 —— 而同一函数上方注释写着"并只保留最近若干份"。
+    // 一个开着开关长期跑、且反复撞 11128 的实例（正是这个开关存在的场景）会把这个目录
+    // 撑到无界。和 P3 修掉的 blocked-*.json 无界增长是同一族缺陷，只是那份写了 prune、
+    // 这份只在注释里写了。full-*.json 仍不自动删（用户显式开 DSH_GATEWAY_DUMP_FULL 的取证文件）。
+    pruneDumpDir(dir, /^wb11128-.*\.json$/i, DUMP_KEEP_FILES);
     log(`WorkBuddy 11128 现场已转储 → ${file}`
       + `（bytes=${out.bytes} nodes=${out.nodes} tools=${meta.toolCount || '?'}）`);
   } catch (e) {
