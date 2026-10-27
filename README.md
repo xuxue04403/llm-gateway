@@ -4,7 +4,7 @@
 
 [![Release](https://img.shields.io/github/v/release/xuxue04403/llm-gateway?label=%E4%B8%8B%E8%BD%BD&color=2ea043)](https://github.com/xuxue04403/llm-gateway/releases/latest)
 [![License](https://img.shields.io/github/license/xuxue04403/llm-gateway?color=blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-445%20passed-2ea043)](#测试与校验)
+[![Tests](https://img.shields.io/badge/tests-447%20passed-2ea043)](#测试与校验)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4)](#下载)
 
 通用桌面版 LLM 网关。把十几种上游模型服务（OpenAI / Anthropic / 各家中转）聚合成**一个本地端点 + 一把 Key**，
@@ -64,7 +64,7 @@ npm run portable
 
 npm run icon     # 仅生成图标（程序化绘制，零外部素材）
 
-npm test         # 445 项测试，应全绿
+npm test         # 447 项测试，应全绿
 npm run parity   # 引擎差异校验：清单已腐烂、恒 FAIL（45 条历史欠债，详见下文）
 ```
 
@@ -174,7 +174,7 @@ npm run parity   # 引擎差异校验：清单已腐烂、恒 FAIL（45 条历�
 ## 测试与校验
 
 ```powershell
-npm test                    # 445 项，全绿
+npm test                    # 447 项，全绿
 npm run parity              # 引擎相对 dsh-app 版本的差异是否与"声明清单"一致
 npm run check               # 语法检查
 npm run test:models         # 模型全量体检：逐个模型真跑一次（见下）
@@ -182,7 +182,7 @@ npm run test:models         # 模型全量体检：逐个模型真跑一次（�
 
 | 套件 | 项数 | 覆盖 |
 |---|---|---|
-| `tests/unit.js` | 102 | 纯函数与文件读写：原子写/备份/恢复、TOML 词法、脱敏、模型清单推导、**模型元数据与自动映射**、配置校验、代理解析、Settings、**TOML 行形状自检**、**日志着色分级**、**引擎鉴权的恒定时间比较（源码级守卫，黑盒测不到）** |
+| `tests/unit.js` | 104 | 纯函数与文件读写：原子写/备份/恢复、TOML 词法、脱敏、模型清单推导、**模型元数据与自动映射**、配置校验、代理解析、Settings、**TOML 行形状自检**、**日志着色分级**、**引擎鉴权的恒定时间比较（源码级守卫，黑盒测不到）**、**探测超时归因（三情形各报各的话，不许断言没验证过的原因）** |
 | `tests/writers.test.js` | 50 | 5 个一键写入目标的 preview → apply → restore 全流程；"只动自己那一块"；baseURL 形态；**原文件已损坏时拦下**、**失败时仍带出备份路径**、**恢复部分失败要报出原因** |
 | `tests/edge.test.js` | 29 | 边界与降级：无供应商/全停用/无模型/空 Key/坏 JSON/目标是目录/引擎缺失；dsh 预览与引擎落盘逐字一致 |
 | `tests/renderer.test.js` | 19 | 界面（渲染层）：用最小 DOM 桩**真实执行** `core.js`/`providers.js`；一键获取模型的选择器、编辑抽屉的监听器生命周期、数字列转义、双击行为、**供应商序号输入跳转（插入语义 / 越界不动 / Escape 还原）**、**序号框里拖选不得拖走整行** |
@@ -336,7 +336,8 @@ scripts/               引擎一致性校验 / 绿色目录打包
 |---|---|
 | **`timeoutMs` 硬上限 600000（10 分钟）** | 这不是"够不够用"，而是**下溢**：`setTimeout` 的延时上限是 2^31-1，超出的值会被 Node 悄悄改成 **1ms**。一旦配上这种值，该模型每个请求瞬间被 abort，而 AbortError 明确不重试 → 反复失败最终把**整家熔断**。配置校验会直接拒掉超限值。 |
 | **无法伪装 TLS / HTTP 客户端指纹** | 程序跑在 Node 上。少数上游在连接层做指纹校验，这类拒绝换 Key、换账户、重试**全都没用**，而且继续打只会加剧风控。程序会识别出来、停止重试并说明原因 —— 但做不到"骗过去"。这是已知上限。 |
-| **`/models` 目录不保证完整** | 有些中转的目录里没有实际可用的模型，也有实际可用却不在目录里的。所以「一键获取」拿到的清单**只是参考**，真实可用性要靠「测试」或实测超时。 |
+| **`/models` 目录不保证完整，也不代表你有权限** | 目录是**平台级清单**，与这把 Key 的分组、套餐、余额都无关。2026-10-27 全量实测：x666 与 sensenova 声明的模型**在目录里全都在**，生成却照样 `503 model_not_found` / `403 model is not available in the current token plan`；反过来也有目录里没有、实际能用的。所以「一键获取」拿到的清单**只是参考**，真实可用性只能靠「测试」或实测超时 —— 目录比对本身判定不了可用性。 |
+| **单次「测试」的结论会翻转（实测 13.3%）** | 同一份配置、同一个脚本连跑三轮，45 个 (供应商, 模型) 组合里有 6 个结论前后不一致。成因各不相同：上游按时间片调度、限流窗口、代理侧抖动、临时无渠道。**别拿一次「测试」的红色当定论** —— 判"这家该不该删"至少跑两轮，且要区分「确定性失败」（两轮都挂，且错误文案是 `model_not_found` / `计划不含` / `余额为 0`）与「偶发」（一轮通一轮不通，多半是 `No available channel` / 超时 / `bulk_probe_detected`）。 |
 | **参数拿不到就留空，不编数字** | 上游只回 `{id, object, created, owned_by}` 时，我们**不知道**上下文长度。填一个看起来合理的值会让客户端真的按那个数字发包（有前车之鉴：某次写入因拿不到值而退回默认 1024000，等于向上游虚报 5 倍上下文）。这些模型会在界面上单独列出来由你决定。 |
 | **符号链接目标未验证** | 开发机上没有管理员权限，`fs.symlinkSync` 返回 EPERM，未能测试"目标是指向别处的符号链接"时的行为。 |
 | **只在 Windows x64 上验证过** | 代码里的路径处理做了跨平台考量，但 macOS / Linux 未测试。 |
