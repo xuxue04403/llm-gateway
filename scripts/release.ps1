@@ -16,6 +16,9 @@
 #   -OutName   产物目录名，默认 LLM-Gateway（配合 -OnlyGate 可验别的目录，如 .verify-test）
 #   -OnlyGate  只跑门禁后退出（构建完想单独复验，或发布中断后重验）
 #   -DryRun    只打印步骤，不做任何改动
+#   -Proxy     HTTP 代理，如 http://127.0.0.1:7890。缺省取 $env:HTTPS_PROXY → $env:HTTP_PROXY。
+#              **直连 GitHub 不通时必须有它** —— 本脚本所有 curl 调用（建 Release / 传附件 /
+#              下载校验）都要经过它，否则会全程失败；git push 用的是 $env:HTTPS_PROXY，同一来源。
 #
 # 步骤（门禁插在**正确的位置**：构建之后、发布之前）：
 #   0  前置检查：版本一致 / 说明文件存在 / token 可用
@@ -44,7 +47,8 @@ param(
   [string]$OutName = 'LLM-Gateway',
   [string]$TagNote = '',
   [switch]$OnlyGate,
-  [switch]$DryRun
+  [switch]$DryRun,
+  [string]$Proxy = ''
 )
 
 $ErrorActionPreference = 'Continue'
@@ -54,6 +58,20 @@ if (-not (Test-Path $GIT)) { $GIT = 'git' }
 $CURL = Join-Path $env:SystemRoot 'System32\curl.exe'
 $REPO = 'xuxue04403/llm-gateway'
 $OUT_NAME = $OutName
+
+# 代理：本机直连 GitHub 不通（Clash fake-ip 等）时必须走代理。
+# 缺省顺序：-Proxy → $env:HTTPS_PROXY → $env:HTTP_PROXY；三者都空就直连。
+# ⚠ 之前这里没有代理支持，所有 curl 调用（建 Release / 传 3 个附件 / 下载校验）都会静默失败，
+#   表现为"建 Release 失败"或"下载线上 zip 失败"，很难看出根因是网络而不是发布逻辑。
+if (-not $Proxy) { $Proxy = $env:HTTPS_PROXY }
+if (-not $Proxy) { $Proxy = $env:HTTP_PROXY }
+$CX = @()
+if ($Proxy) {
+  $CX = @('-x', $Proxy)
+  # git push 走 libcurl 的 env 代理，与 curl 的 -x 必须指向同一出口，否则一个通一个不通
+  $env:HTTPS_PROXY = $Proxy
+  $env:HTTP_PROXY = $Proxy
+}
 
 $fail = { param($m) Write-Host "`n✗ $m" -ForegroundColor Red; exit 1 }
 
@@ -254,7 +272,7 @@ else {
 
 # ─────────────────────────── 7) 创建 Release ───────────────────────────
 Step 7 '创建 Release'
-$H = @('-H', "Authorization: Bearer $Token", '-H', 'User-Agent: lg-publish', '-H', 'Accept: application/vnd.github+json')
+$H = $CX + @('-H', "Authorization: Bearer $Token", '-H', 'User-Agent: lg-publish', '-H', 'Accept: application/vnd.github+json')
 $rel = $null
 if ($DryRun) { Info "将 POST /repos/$REPO/releases（tag v$Version）" }
 else {
@@ -330,7 +348,7 @@ else {
   $today = (Get-Date).ToString('yyyy-MM-dd')
   $stale = 0
   foreach ($a in $j.assets) {
-    $code = (& $CURL -s -L -o NUL -w '%{http_code}' -r 0-0 --max-time 180 $a.browser_download_url 2>&1) -join ''
+    $code = (& $CURL -s @CX -L -o NUL -w '%{http_code}' -r 0-0 --max-time 180 $a.browser_download_url 2>&1) -join ''
     $created = ([datetime]$a.created_at).ToLocalTime().ToString('yyyy-MM-dd HH:mm')
     $isOld = -not $created.StartsWith($today)
     if ($isOld) { $stale++ }
@@ -343,22 +361,45 @@ else {
 }
 
 # ─────────────────────────── 10) 线上校验 ───────────────────────────
-Step 10 '线上校验：下载回来比对 sha256'
-if ($DryRun) { Info '将下载线上 zip 并与本地逐字节比对' }
+# 优先用 GitHub 给附件的 digest（sha256:<hex>，2025 起提供）：它是**服务端算的**，
+# 权威性等同"下载回来比一遍"，但不用传 150MB —— 走代理下载大文件在本机实测会中途失败
+# （--speed-limit 触发 abort），那是网络抖动，不该判成"发布产物有问题"。
+# 拿不到 digest 时退回下载比对（保留老逻辑，兼容 GitHub 尚未给出该字段的情况）。
+Step 10 '线上校验：sha256 与本地逐字节比对'
+if ($DryRun) { Info '将用附件 digest（拿不到则下载回来）与本地 sha256 比对' }
 else {
-  $tmp = Join-Path $env:TEMP "$OUT_NAME-$Version-online.zip"
-  if (Test-Path $tmp) { Remove-Item $tmp -Force }
-  $url = "https://github.com/$REPO/releases/download/v$Version/$OUT_NAME-$Version.zip"
-  Info '下载中…'
-  & $CURL -s -L --speed-limit 20480 --speed-time 25 --max-time 2400 -o $tmp $url
-  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tmp)) { & $fail '下载线上 zip 失败' }
-  $hl = (Get-FileHash $zipPath -Algorithm SHA256).Hash
-  $hd = (Get-FileHash $tmp -Algorithm SHA256).Hash
-  Info "本地   $((Get-Item $zipPath).Length) 字节  $hl"
-  Info "线上   $((Get-Item $tmp).Length) 字节  $hd"
-  if ($hl -ne $hd) { & $fail '线上 zip 与本地不一致 —— 发布产物有问题' }
-  Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-  Ok '线上 zip 与本地逐字节一致'
+  $targets = @($zipPath, $exePortable, $exeSetup)
+  $byName = @{}
+  foreach ($a in @($j.assets)) { $byName[$a.name] = $a }
+  $mismatch = 0
+  foreach ($f in $targets) {
+    $nm = Split-Path $f -Leaf
+    $h = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+    $a = $byName[$nm]
+    if ($a -and $a.PSObject.Properties['digest'] -and $a.digest) {
+      $rh = ($a.digest -replace '^sha256:', '').ToLower()
+      if ($h -ne $rh) { $mismatch++; Warn "$nm  digest 不一致"; Info "  本地 $h"; Info "  线上 $rh" }
+      else { Ok "$($nm.PadRight(36)) digest 一致  $h" }
+    }
+    else {
+      $tmp = Join-Path $env:TEMP "$OUT_NAME-$Version-online.zip"
+      if ($nm -eq (Split-Path $zipPath -Leaf)) {
+        Info "$nm 无 digest 字段 → 下载回来比对"
+        if (Test-Path $tmp) { Remove-Item $tmp -Force }
+        & $CURL -s @CX -L --speed-limit 20480 --speed-time 25 --max-time 2400 -o $tmp "https://github.com/$REPO/releases/download/v$Version/$nm"
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tmp)) { & $fail '下载线上 zip 失败' }
+        $hd = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
+        Info "  本地 $h"
+        Info "  线上 $hd"
+        if ($h -ne $hd) { & $fail "线上 zip 与本地不一致 —— 发布产物有问题" }
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        Ok "$nm  下载比对一致"
+      }
+      else { Warn "$nm 无 digest 字段，且非 zip → 跳过逐字节校验（已比对字节数）" }
+    }
+  }
+  if ($mismatch) { & $fail "有 $mismatch 个产物的 sha256 与本地不一致 —— 发布产物有问题" }
+  Ok '线上产物与本地逐字节一致'
 }
 
 Write-Host "`n=========================================" -ForegroundColor Green
