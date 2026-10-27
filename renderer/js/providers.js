@@ -49,7 +49,9 @@ LG.renders.providers = function renderProviders() {
     return `
     <div class="prov ${p.enabled === false ? 'off' : ''}" draggable="true" data-idx="${i}">
       <span class="handle" title="拖拽调整同级顺序">⣿</span>
-      <span class="idx">#${i + 1}</span>
+      <span class="idx" title="列表里的第几位（搜索过滤时仍是全局位次）。点数字输入目标位次、回车生效 —— 把第 20 家挪到第 2 位不必连点 18 次 ▲">#<input class="idx-in" type="number" min="1" max="${total}" step="1"
+        value="${i + 1}" data-jump="${i}" draggable="false" inputmode="numeric"
+        aria-label="把 ${esc(p.id || '该供应商')} 移到第几位" /></span>
       <label class="switch" title="启用 / 停用"><input type="checkbox" data-act="toggle" data-idx="${i}" ${p.enabled === false ? '' : 'checked'} /><span></span></label>
       <div class="main">
         <div class="name">
@@ -92,6 +94,54 @@ function wireProviderRows() {
     });
   });
 
+  // ---- 直接输入位次跳转（`#N` 那个数字框）----
+  //
+  // 为什么需要：▲▼ 一次只挪一位，把第 20 家拖到第 2 位要点 18 次。拖拽能一步到位，
+  // 但**目标行在屏幕外**时得先滚过去、还要落在正确的缝隙里，长列表里同样难用。
+  // 输入序号是第三种手段：知道"要第几位"的人，一次就能说完。
+  //
+  // 语义与拖拽**完全一致**：只重排 `LG.config.providers` 数组，不碰 priority ——
+  // 跨优先级调序仍然要改 priority 数字（表头那句提示不变）。用 moveItem 而不是 swap，
+  // 因为「移到第 N 位」是插入语义，中间那些行要整体让位；swap 只会交换两行、其余不动。
+  box.querySelectorAll('input[data-jump]').forEach((n) => {
+    // ⚠ 这里原本挂了 `dragstart` + `mousedown` 的 stopPropagation，想让"在序号框里拖选数字"
+    //    不触发整行拖拽 —— 实测**完全无效**，已删除。原因见下方 `dragstart` 处理里的说明：
+    //    浏览器的 dragstart 发在最近的 draggable 祖先（行）上，输入框上的监听器不会参与。
+    //    拦阻改在行的 dragstart 里做（判断 e.target 是不是表单控件）。
+
+    // commit 里做全部校验；返回是否已经消费掉这次输入（用于决定要不要"回弹"显示值）
+    const commit = () => {
+      const list = LG.config.providers || [];
+      const from = Number(n.dataset.jump);
+      const raw = String(n.value == null ? '' : n.value).trim();
+      // 空输入 / 非整数 / 越界：一律还原成当前真实位次，**不做任何移动**。
+      // 不能"就近 clamp"——用户输 99 时悄悄挪到最后一格，比什么都不做更让人困惑。
+      const to = /^\d+$/.test(raw) ? Number(raw) : NaN;
+      if (!Number.isFinite(to) || to < 1 || to > list.length) {
+        n.value = String(from + 1);
+        toast(`位次要在 1 – ${list.length} 之间`, 'warn', 4000);
+        return false;
+      }
+      const target = to - 1;
+      if (target === from) { n.value = String(from + 1); return false; }
+      moveItem(list, from, target);
+      markDirty('供应商顺序');
+      LG.renders.providers();
+      toast(`已移到第 ${to} 位`, 'ok', 2500);
+      return true;
+    };
+
+    // 回车提交。不用 change：`type="number"` 的上下小箭头每点一次都触发 change，
+    // 而用户往往要连点几下到目标值，那会中途多次重排 + 多次 toast。change 只用来
+    // "别的地方改了值、失焦时同步回来"的兜底（见下）。
+    n.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commit(); n.blur(); }
+      else if (e.key === 'Escape') { n.value = String(Number(n.dataset.jump) + 1); n.blur(); }
+    });
+    // 失焦时若值被改过（含浏览器原生上下箭头）也提交 —— 与回车等价，避免"输了数字点别处白输"。
+    n.addEventListener('change', () => { commit(); });
+  });
+
   box.querySelectorAll('input[data-act="toggle"]').forEach((n) => {
     n.addEventListener('change', () => {
       const i = Number(n.dataset.idx);
@@ -119,7 +169,26 @@ function wireProviderRows() {
     });
     row.style.cursor = 'pointer';
 
+    // 记住"这次按下是不是落在表单控件里"。
+    // ⚠ 不能只在 dragstart 里看 `e.target`：Chromium 把 dragstart 的 target 设成
+    //    **可拖拽的那个元素（这一行 .prov）**，而不是鼠标真正按下的深层 input。
+    //    第一版就是靠 `e.target.closest('input,…')` 判断的，实测拿到的 target 是
+    //    `<div class="prov dragging">`，`closest` 永远返回 null → 判断恒为"不是控件"
+    //    → 拦截分支形同虚设（已用 CDP 真鼠标事件复现并确认）。
+    //    改成在 mousedown（先于 dragstart 发生）时记标记，dragstart 只读标记。
+    let downOnControl = false;
+    row.addEventListener('mousedown', (e) => {
+      downOnControl = !!(e.target.closest && e.target.closest('input, select, textarea, button, a, label'));
+    });
+
     row.addEventListener('dragstart', (e) => {
+      // 从表单控件里发起的拖拽必须取消，否则"在序号框里按住鼠标拖选数字"
+      // 会变成"拖走整行"。`draggable="false"` 只表示"本元素不可拖"，
+      // 并不会阻止浏览器继续向上找可拖祖先（就是这一行）。
+      if (downOnControl) {
+        e.preventDefault();
+        return;
+      }
       dragIndex = Number(row.dataset.idx);
       row.classList.add('dragging');
       e.dataTransfer.effectAllowed = 'move';

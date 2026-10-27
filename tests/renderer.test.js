@@ -623,3 +623,201 @@ t('渲染层：防护计数必须区分「已关闭」与「已开启但未触�
   refs.LG.renders.dashboard();
   assert.ok(/网关未运行/.test(box().innerHTML), '未运行时要说明：' + box().innerHTML);
 });
+
+/* ================================================================
+ * 供应商排序：直接输入序号跳转
+ *
+ * 背景（用户实测反馈）：▲▼ 一次只挪一位，把第 20 家拖到第 2 位要点 18 次；
+ * 拖拽能一步到位，但目标行常在屏幕外、还得找准缝隙。用户明确要求"直接改序号"。
+ *
+ * 语义必须与拖拽一致：只重排 `LG.config.providers` 数组，**不碰 priority**
+ * （表头写着"跨优先级调序请改 priority 数字"）。用插入语义（moveItem）而不是
+ * 交换（swap）：移到第 4 位时中间那些行要整体让位，swap 只会交换两行。
+ * ================================================================ */
+
+/** 造一个能被 wireProviderRows 认出来的 `#provList`，并把 `input[data-jump]` 换成真实可点桩。 */
+function provListWithJumpInputs(S, n) {
+  const listEl = makeEl('div');
+  const jumps = [];
+  for (let i = 0; i < n; i++) {
+    const inp = makeEl('input');
+    inp.dataset.jump = String(i);
+    inp.value = String(i + 1);
+    // ⚠ makeEl 默认 `closest()` 恒返回 null，而实现靠 `e.target.closest('input,…')`
+    //    判断"按下的是不是表单控件"。不补这一处，测试里输入框永远"不是控件"，
+    //    拦截分支就永远进不去 —— 会把一个能用的实现判成坏的（假阴性）。
+    inp.closest = (sel) => (/input/.test(sel) ? inp : null);
+    jumps.push(inp);
+  }
+  // wireProviderRows 会依次问：`[data-act]` / `input[data-jump]` / `input[data-act="toggle"]` / `.prov`
+  listEl.querySelectorAll = (sel) => (sel === 'input[data-jump]' ? jumps : []);
+  S.nodeById.set('#provList', listEl);
+  return jumps;
+}
+
+t('渲染层：供应商序号必须是可输入的框（不再是纯文本 #N）—— 长列表才能一步跳到目标位次', () => {
+  const S = makeSandbox();
+  const { refs } = S;
+  refs.LG.config = {
+    providers: [
+      { id: 'p0', baseURL: 'https://a/v1', models: [] },
+      { id: 'p1', baseURL: 'https://b/v1', models: [] },
+      { id: 'p2', baseURL: 'https://c/v1', models: [] },
+    ],
+  };
+  refs.LG.renders.providers();
+  const html = S.nodeById.get('#provList').innerHTML;
+
+  assert.ok(/<input class="idx-in" type="number"/.test(html), '序号应渲染成数字输入框：' + html);
+  // 纯文本 `#1</span>` 那种形态必须消失，否则用户看到的还是不能改的死数字
+  assert.ok(!/<span class="idx">#\d/.test(html), '不得残留纯文本序号：' + html);
+
+  // 三个框各自记住自己的位次：data-jump 是**数组下标**（0 基），value 是给用户看的 1 基
+  const jump = [...html.matchAll(/data-jump="(\d+)"/g)].map((m) => m[1]);
+  // ⚠ 顺序是 `value="N"` 在前、`data-jump="i"` 在后（见 providers.js 的模板），
+  //   反过来写会一个都抓不到 —— 那种"正则写错了却说断言过了"的假阴性要靠 deepStrictEqual 兜住。
+  const vals = [...html.matchAll(/value="(\d+)" data-jump="(\d+)"/g)].map((m) => m[1]);
+  assert.deepStrictEqual(jump, ['0', '1', '2'], 'data-jump 必须是从 0 开始的数组下标：' + html);
+  assert.deepStrictEqual(vals, ['1', '2', '3'], '显示值必须是 1 基位次：' + html);
+
+  // 越界输入要被浏览器拦住，不能靠 JS 兜底（用户按 ↑ 键到顶时就该停）
+  assert.ok(/data-jump="0"[^>]*min="1"/.test(html) || /min="1"[^>]*data-jump="0"/.test(html), '应有 min=1：' + html);
+  assert.ok(/max="3"/.test(html), 'max 应等于供应商总数：' + html);
+});
+
+t('渲染层：输入位次是"跳到第 N 位"（插入语义，不是交换），且越界不动、Escape 还原', () => {
+  const S = makeSandbox();
+  const { refs, captured } = S;
+  const ids = () => refs.LG.config.providers.map((p) => p.id);
+  refs.LG.config = {
+    providers: [
+      { id: 'p0', baseURL: 'https://a/v1', models: [], priority: 1 },
+      { id: 'p1', baseURL: 'https://b/v1', models: [], priority: 2 },
+      { id: 'p2', baseURL: 'https://c/v1', models: [], priority: 3 },
+      { id: 'p3', baseURL: 'https://d/v1', models: [], priority: 4 },
+      { id: 'p4', baseURL: 'https://e/v1', models: [], priority: 5 },
+    ],
+  };
+  const jumps = provListWithJumpInputs(S, 5);
+  const prioritiesBefore = refs.LG.config.providers.map((p) => p.priority);
+
+  assert.doesNotThrow(() => S.sandbox.wireProviderRows());
+  jumps.forEach((inp, i) => {
+    assert.strictEqual((inp._listeners.keydown || []).length, 1, `第 ${i} 个序号框应挂上 keydown`);
+    assert.strictEqual((inp._listeners.change || []).length, 1, `第 ${i} 个序号框应挂上 change`);
+  });
+
+  // ① 核心用例：把第 1 位（p0）移到第 4 位。
+  //    moveItem(0,3) → [p1,p2,p3,p0,p4]。若是 swap，会变成 [p3,p1,p2,p0,p4] ——
+  //    那样"第 2、3 位是谁"全变了，用户看到的不是"其它行整体上移一格"。
+  jumps[0].value = '4';
+  jumps[0]._fire('keydown', { key: 'Enter' });
+  assert.deepStrictEqual(ids(), ['p1', 'p2', 'p3', 'p0', 'p4'],
+    '「移到第 4 位」必须整体让位而不是交换两行：' + ids().join(','));
+  // ⚠ 断言的是"没有任何 priority 被**改写**"，不是"数组里的 priority 序列不变" ——
+  //   p0 自己带着 priority=1 一起搬到了第 4 位，序列当然会变。要钉的是
+  //   "重排数组不会去动 priority 这个字段"（表头那句"跨优先级调序请改 priority 数字"）。
+  assert.deepStrictEqual(refs.LG.config.providers.map((p) => p.priority).sort(), prioritiesBefore,
+    '重排数组不得改动 priority 字段的值（只是搬迁）：' + refs.LG.config.providers.map((p) => p.priority).join(','));
+  assert.strictEqual(refs.LG.config.providers[3].priority, 1, 'p0 必须带着自己的 priority=1 一起搬');
+  assert.ok(captured.toasts.some((x) => /已移到第 4 位/.test(x.msg)), '应有「已移到第 4 位」提示：' + JSON.stringify(captured.toasts));
+
+  // ② 原地不动：输同一个位次不该报错、也不该提示
+  const nToast = captured.toasts.length;
+  jumps[1].value = '2';   // 下标 1 现在是 p2，本来就是第 2 位
+  jumps[1]._fire('keydown', { key: 'Enter' });
+  assert.deepStrictEqual(ids(), ['p1', 'p2', 'p3', 'p0', 'p4'], '输入当前位次不该改变顺序');
+  assert.strictEqual(captured.toasts.length, nToast, '原地不动不该弹提示');
+
+  // ③ 越界：不能"就近 clamp"（悄悄挪到最后一格比什么都不做更让人困惑）
+  jumps[0].value = '99';
+  jumps[0]._fire('keydown', { key: 'Enter' });
+  assert.deepStrictEqual(ids(), ['p1', 'p2', 'p3', 'p0', 'p4'], '越界输入必须什么都不做');
+  assert.strictEqual(jumps[0].value, '1', '越界后显示值必须弹回真实位次：' + jumps[0].value);
+  assert.ok(captured.toasts.some((x) => /位次要在 1 – 5 之间/.test(x.msg)), '越界应给出可读提示：' + JSON.stringify(captured.toasts));
+
+  // ④ 空输入 / 小数同样不动（type=number 里 `abc` 会变成空串，那是最常见的误触）
+  jumps[2].value = '';
+  jumps[2]._fire('keydown', { key: 'Enter' });
+  assert.deepStrictEqual(ids(), ['p1', 'p2', 'p3', 'p0', 'p4'], '空输入不得移动');
+  jumps[2].value = '2.5';
+  jumps[2]._fire('keydown', { key: 'Enter' });
+  assert.deepStrictEqual(ids(), ['p1', 'p2', 'p3', 'p0', 'p4'], '非整数不得移动');
+
+  // ⑤ Escape：放弃这次输入，值回到当前真实位次，顺序不变
+  jumps[3].value = '1';
+  jumps[3]._fire('keydown', { key: 'Escape' });
+  assert.deepStrictEqual(ids(), ['p1', 'p2', 'p3', 'p0', 'p4'], 'Escape 不得移动');
+  assert.strictEqual(jumps[3].value, '4', 'Escape 后应还原成当前位次：' + jumps[3].value);
+
+  // ⑥ 失焦提交（change）：输了数字直接点别处也不该白输 —— 与回车等价
+  const jumps2 = provListWithJumpInputs(S, 5);
+  S.sandbox.wireProviderRows();
+  jumps2[4].value = '1';   // 把最后一位（p4）提到最前
+  jumps2[4]._fire('change');
+  assert.deepStrictEqual(ids(), ['p4', 'p1', 'p2', 'p3', 'p0'],
+    'change（失焦）也必须提交：' + ids().join(','));
+});
+
+t('渲染层：在序号框里拖选数字不得拖走整行（draggable 祖先会抢走 dragstart）', () => {
+  const S = makeSandbox();
+  const { refs } = S;
+  refs.LG.config = {
+    providers: [
+      { id: 'p0', baseURL: 'https://a/v1', models: [] },
+      { id: 'p1', baseURL: 'https://b/v1', models: [] },
+    ],
+  };
+  const jumps = provListWithJumpInputs(S, 2);
+
+  // 造两张真实的"行"桩：行上挂着 mousedown / dragstart，内部有一个序号框
+  const rows = jumps.map((inp) => {
+    const row = makeEl('div');
+    row.dataset.idx = String(Number(inp.dataset.jump));
+    const handle = makeEl('span');
+    handle.innerHTML = '';           // .handle 不是表单控件
+    row.querySelectorAll = () => [];
+    row._jumpInput = inp;
+    return row;
+  });
+  const listEl = S.nodeById.get('#provList');
+  listEl.querySelectorAll = (sel) => {
+    if (sel === 'input[data-jump]') return jumps;
+    if (sel === '.prov') return rows;
+    return [];
+  };
+  assert.doesNotThrow(() => S.sandbox.wireProviderRows());
+
+  // ① 鼠标按在序号框里再拖 → 行的 dragstart 必须被 preventDefault，且不得进入拖拽态
+  const row0 = rows[0];
+  assert.strictEqual((row0._listeners.mousedown || []).length, 1, '行应挂 mousedown 以记住按下目标');
+  assert.strictEqual((row0._listeners.dragstart || []).length, 1, '行应挂 dragstart');
+
+  // 关键：`dragstart` 的 target 是**行**（浏览器行为），不是里面的 input。
+  // 所以判据不能看 e.target.closest('input')，只能看 mousedown 时记下的标记 ——
+  // 这正是第一版实现的 bug（实测 target 是 `<div class="prov dragging">`，
+  // closest 恒为 null，拦截形同虚设）。
+  row0._fire('mousedown', { target: jumps[0] });
+  let prevented = false;
+  row0._fire('dragstart', {
+    target: row0,
+    preventDefault() { prevented = true; },
+    dataTransfer: { effectAllowed: '', setData() {} },
+  });
+  assert.strictEqual(prevented, true, '按在序号框里拖动时，行的 dragstart 必须 preventDefault');
+  assert.ok(!row0.classList.contains('dragging'), '被拦下的拖拽不得给行加 .dragging');
+
+  // ② 按在手柄/空白处再拖 → 必须正常进入拖拽态（别把正常拖拽排序弄坏）
+  row0._fire('mousedown', { target: makeEl('span') });   // .closest 返回 null 的普通元素
+  prevented = false;
+  let picked = null;
+  row0._fire('dragstart', {
+    target: row0,
+    preventDefault() { prevented = true; },
+    dataTransfer: { effectAllowed: '', setData(k, v) { picked = v; } },
+  });
+  assert.strictEqual(prevented, false, '从手柄发起拖拽不得被拦');
+  assert.ok(row0.classList.contains('dragging'), '正常拖拽必须进入 dragging 态');
+  assert.strictEqual(picked, '0', '正常拖拽要把行下标写进 dataTransfer');
+});
+

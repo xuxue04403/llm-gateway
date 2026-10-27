@@ -4,7 +4,7 @@
 
 [![Release](https://img.shields.io/github/v/release/xuxue04403/llm-gateway?label=%E4%B8%8B%E8%BD%BD&color=2ea043)](https://github.com/xuxue04403/llm-gateway/releases/latest)
 [![License](https://img.shields.io/github/license/xuxue04403/llm-gateway?color=blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-442%20passed-2ea043)](#测试与校验)
+[![Tests](https://img.shields.io/badge/tests-445%20passed-2ea043)](#测试与校验)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4)](#下载)
 
 通用桌面版 LLM 网关。把十几种上游模型服务（OpenAI / Anthropic / 各家中转）聚合成**一个本地端点 + 一把 Key**，
@@ -64,7 +64,7 @@ npm run portable
 
 npm run icon     # 仅生成图标（程序化绘制，零外部素材）
 
-npm test         # 442 项测试，应全绿
+npm test         # 445 项测试，应全绿
 npm run parity   # 引擎差异校验：清单已腐烂、恒 FAIL（45 条历史欠债，详见下文）
 ```
 
@@ -114,7 +114,7 @@ npm run parity   # 引擎差异校验：清单已腐烂、恒 FAIL（45 条历�
 ### 界面（相对原设置页重做）
 
 - **概览**：运行状态、接入信息（点一下即复制）、**账户池与冷却可视化**（原界面从未展示过 `/health` 的这些数据）、**防护计数**（循环守卫 / 工具死循环拦截 / 上下文窗口过滤各自生效过几次 —— 刻意区分「已关闭」与「已开启但未触发」，两种 0 不能长一样）
-- **供应商**：**拖拽排序**、内联启用开关、**逐家连通性测试**、**从上游拉取模型目录**、抽屉式编辑器（含协议/quirks/请求头/超时/账户池等全部高级字段）
+- **供应商**：**三种方式调序**（点 `#序号` 直接输入目标位次，一步到位 / 拖拽 / ▲▼ 单步）、内联启用开关、**逐家连通性测试**、**从上游拉取模型目录**、抽屉式编辑器（含协议/quirks/请求头/超时/账户池等全部高级字段）
 - **模型**：汇总所有客户端可选的逻辑模型，标出「只有一家提供」的单点风险
 - **客户端接入**：每个目标都有 **检测状态 → 预览 diff → 写入 → 一键恢复备份**
 - **设置**：端口、路由策略、客户端仿真、代理（含直连清单）、应用偏好、配置导入导出、原始 JSON 编辑
@@ -174,7 +174,7 @@ npm run parity   # 引擎差异校验：清单已腐烂、恒 FAIL（45 条历�
 ## 测试与校验
 
 ```powershell
-npm test                    # 442 项，全绿
+npm test                    # 445 项，全绿
 npm run parity              # 引擎相对 dsh-app 版本的差异是否与"声明清单"一致
 npm run check               # 语法检查
 npm run test:models         # 模型全量体检：逐个模型真跑一次（见下）
@@ -185,7 +185,7 @@ npm run test:models         # 模型全量体检：逐个模型真跑一次（�
 | `tests/unit.js` | 102 | 纯函数与文件读写：原子写/备份/恢复、TOML 词法、脱敏、模型清单推导、**模型元数据与自动映射**、配置校验、代理解析、Settings、**TOML 行形状自检**、**日志着色分级**、**引擎鉴权的恒定时间比较（源码级守卫，黑盒测不到）** |
 | `tests/writers.test.js` | 50 | 5 个一键写入目标的 preview → apply → restore 全流程；"只动自己那一块"；baseURL 形态；**原文件已损坏时拦下**、**失败时仍带出备份路径**、**恢复部分失败要报出原因** |
 | `tests/edge.test.js` | 29 | 边界与降级：无供应商/全停用/无模型/空 Key/坏 JSON/目标是目录/引擎缺失；dsh 预览与引擎落盘逐字一致 |
-| `tests/renderer.test.js` | 16 | 界面（渲染层）：用最小 DOM 桩**真实执行** `core.js`/`providers.js`；一键获取模型的选择器、编辑抽屉的监听器生命周期、数字列转义、双击行为 |
+| `tests/renderer.test.js` | 19 | 界面（渲染层）：用最小 DOM 桩**真实执行** `core.js`/`providers.js`；一键获取模型的选择器、编辑抽屉的监听器生命周期、数字列转义、双击行为、**供应商序号输入跳转（插入语义 / 越界不动 / Escape 还原）**、**序号框里拖选不得拖走整行** |
 | `tests/security.test.js` | 19 | **每条都对应一次实跑确认过的真实缺陷**：TOML 写坏形态、读不到就中止、占位 Key、空 Key 不覆盖凭据、脚本注入、密钥脱敏 |
 | `tests/gateway.test.js` | 226 | 网关引擎端到端：鉴权、SSE、三协议翻译、熔断、账户池、客户端仿真、**逐模型超时**、**仿真头镜像防漂移**、gzip 压缩 SSE、地区受限 403 不连坐、客户端指纹被拒、Retry-After 遵循、**WorkBuddy 渠道身份改写（chat / Anthropic 翻译 / Responses 三协议 + 路径语境不得改写 + 非本家不得改写）**、**循环守卫（三条流式路径 + 正常答复不得误切）**、**工具死循环拦截（chat 与 Anthropic 两入口）**、**上下文窗口过滤（排到最后而非删除 + 零误动边界 + 同名映射第二条也算 + 从目录学窗口 + 学不到不得猜）**、**11128 现场转储（开关关着不落盘 + 错误体打码）**、**用量保留期覆盖界面最长期（90 天，可 env 覆盖）**、**账号被封禁（11140）单独成类而非"登录失效"**、**/health 的防护计数（只增对应那一项）**、**11128 转储保留上限（打 26 次只留 20 份）**、**裸高熵凭据兜底脱敏（无前缀无关键词）**、**网关 apiKey 不足 16 字符必须 401** |
 

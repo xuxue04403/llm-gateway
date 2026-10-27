@@ -257,7 +257,30 @@ select.input { cursor: pointer; }
 .prov.off { opacity: .55; }
 .prov .handle { cursor: grab; color: var(--text-mute); font-size: 14px; letter-spacing: -2px; flex: 0 0 auto; user-select: none; }
 .prov .handle:active { cursor: grabbing; }
-.prov .idx { width: 22px; text-align: right; color: var(--text-mute); font-size: 11px; font-family: var(--mono); flex: 0 0 auto; }
+/* 序号框：既是"当前位置"的显示，也是"想去第几位"的输入。
+   以前这里是纯文本 `#12`，长列表里想挪到第 2 位只能连点 10 次 ▲，
+   或者拖拽 —— 而目标行常在屏幕外，还得找准缝隙。
+
+   宽度按"最多三位数"定：11px 等宽字体一个字符约 6.6px，三位 + padding 约 22px，
+   给到 26px 留一点余量。**左对齐**是刻意的 —— `#` 与数字必须紧贴，
+   若用右对齐 + 更宽的框（第一版就是 34px 右对齐），`#` 和数字之间会空出一大片，
+   看起来像两列而不是"第 N 位"。 */
+.prov .idx { display: inline-flex; align-items: center; gap: 0; color: var(--text-mute); font-size: 11px; font-family: var(--mono); flex: 0 0 auto; }
+.prov .idx-in {
+  width: 26px; padding: 1px 0; text-align: left;
+  background: transparent; border: 1px solid transparent; border-radius: 4px;
+  color: var(--text-mute); font-family: var(--mono); font-size: 11px; line-height: 1.4;
+  /* 隐藏 number 输入框的上下小箭头：行高只有 26px，箭头挤进来会把数字压没；
+     单步微调已经有 ▲▼ 按钮，不需要再来一套更小的。 */
+  -moz-appearance: textfield; appearance: textfield;
+}
+.prov .idx-in::-webkit-outer-spin-button,
+.prov .idx-in::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.prov .idx-in:hover { border-color: var(--border); color: var(--text-dim); }
+.prov .idx-in:focus {
+  outline: none; border-color: var(--accent); background: var(--panel-2);
+  color: var(--text);
+}
 .prov .main { flex: 1; min-width: 0; }
 .prov .name { display: flex; align-items: center; gap: 8px; }
 .prov .name b { font-weight: 600; }
