@@ -141,6 +141,17 @@ function getJson(urlStr, opts) {
     const mod = (useProxy && !isHttps) ? http : (isHttps ? https : http);
     let req;
     let hardTimer = null;
+    // ⚠ 这两个必须是**外层**变量，不能藏在下面的响应回调里。
+    //
+    // 旧实现把 `bytes` 声明在 `mod.request(...)` 的响应回调内部，而墙钟兜底
+    //（`hardTimer`）在外层 —— 它**根本读不到** `bytes`，于是无论实际收没收到数据，
+    // 一律打印"对端持续有数据流入但始终读不完"（旧文案）。实测（2026-10-27 全量复核）：
+    // 打 nvidia / h-e.top / windhub 的超时用例 `bytes=0`（一个字节都没来），
+    // 报错却断言"持续有数据流入" —— 排查时按这个文案去找"上游在流式吐垃圾"，
+    // 方向直接跑偏（这次就是这样被带偏的）。
+    // 超时报错必须只说**它量到的事实**：收没收到响应头、收了多少字节。
+    let gotHeaders = false;
+    let gotBytes = 0;
     // finish 现在负责清掉下面的绝对墙钟。`resolve` 天然幂等，重复调用无副作用。
     const finish = (obj) => {
       if (hardTimer) { clearTimeout(hardTimer); hardTimer = null; }
@@ -148,6 +159,7 @@ function getJson(urlStr, opts) {
     };
     try {
       req = mod.request(reqOpts, (res) => {
+        gotHeaders = true;
         let body = '';
         let bytes = 0;                 // 已累计的**字节**数
         let truncated = false;
@@ -176,6 +188,7 @@ function getJson(urlStr, opts) {
             body += c;
             bytes += cb;
           }
+          gotBytes = bytes;
         });
         res.on('end', () => finish({
           ok: res.statusCode >= 200 && res.statusCode < 300,
@@ -209,22 +222,42 @@ function getJson(urlStr, opts) {
     //   ② 「⚡一键获取全部模型」的按钮靠 finally 复位 `disabled`，永不复位；
     //   ③ 每挂死一次泄漏一条 TCP/TLS 句柄。
     // 这里补一个不看数据流的截止时间。+500ms 是留给"刚好卡在边界上的正常慢响应"。
+    // ⚠ 超时归因**只在一处**产生（下面是 timeoutText()），所有分支共用。
+    //
+    // 旧实现有两个失败出口，文案各写各的：墙钟那条带了一大段归因（而且是凭空断言的），
+    // `req.setTimeout` / `req.on('timeout')` 这两条只写 `超时 600ms`。
+    // 后果实测（2026-10-27 复核）：连"响应头都不回"的服务端走的是**不活动超时**分支，
+    // 于是最需要归因的那种情形（上游根本不回话）反而只得到一句光秃秃的"超时 600ms"。
+    // 三条出口现在共用同一个函数，不会再出现"有的情形有归因、有的没有"。
+    const timeoutText = (elapsed) => {
+      const state = !gotHeaders
+        ? '连响应头都没收到（上游或代理没有回话）'
+        : (gotBytes === 0
+          ? '收到响应头但一个字节的响应体都没来（上游接了单却不回内容）'
+          : `已收到 ${gotBytes} 字节但始终读不完`);
+      return `超时 ${elapsed}ms：${state}`;
+    };
+
     hardTimer = setTimeout(() => {
       try { req.destroy(); } catch (_) { /* 忽略 */ }
       // 报**实际经过时间**：写 timeoutMs 会和界面「测试连通性」里显示的耗时对不上
       //（实测：文案说 2500ms，用户看到 3008ms），排查时会以为是两回事。
-      const elapsed = Date.now() - t0;
-      finish({ ok: false, error: '超时（整体墙钟 ' + elapsed + 'ms：对端持续有数据流入但始终读不完）' });
+      //
+      // 三种情况的处置方向完全不同，绝不能混成一句话：
+      //   · 连响应头都没来 → 上游/代理没回话，可能是网络、黑洞、TLS 后无响应；
+      //   · 头来了但 0 字节 → 上游接了单在"思考"或者干脆不回，**不是**在流式吐数据；
+      //   · 头来了且有字节 → 数据在流但读不完（这才是旧文案描述的场景，也是唯一适用的场景）。
+      finish({ ok: false, error: '（整体墙钟）' + timeoutText(Date.now() - t0) });
     }, timeoutMs + 500);
     if (hardTimer && typeof hardTimer.unref === 'function') hardTimer.unref();
 
     req.setTimeout(timeoutMs, () => {
       try { req.destroy(); } catch (_) { /* 忽略 */ }
-      finish({ ok: false, error: '超时 ' + timeoutMs + 'ms' });
+      finish({ ok: false, error: timeoutText(Date.now() - t0) });
     });
     req.on('timeout', () => {
       try { req.destroy(); } catch (_) { /* 忽略 */ }
-      finish({ ok: false, error: '超时 ' + timeoutMs + 'ms' });
+      finish({ ok: false, error: timeoutText(Date.now() - t0) });
     });
     req.on('error', (e) => finish({ ok: false, error: String(e && e.message ? e.message : e) }));
     // POST 体（测速要发一次最小 chat 请求）。Content-Length 必须显式给，

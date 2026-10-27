@@ -366,6 +366,78 @@ t('probe.upstreamBase：与引擎 upstreamBase 规则一致（补 /v1 / 收敛�
 
 
 
+t('probe.getJson：超时报错必须只说量到的事实，不许断言没验证过的原因', () => {
+  // ⚠ 真实缺陷（2026-10-27 全量复核发现）：墙钟兜底的文案原来是
+  //     `超时（整体墙钟 Nms：对端持续有数据流入但始终读不完）`
+  // 而 `bytes` 当时声明在响应回调**内部**、墙钟在外部，它根本读不到 ——
+  // 于是无论有没有收到数据，一律这么报。
+  //
+  // 实测被骗：打 nvidia / h-e.top / windhub 的超时用例全是 `bytes=0`
+  //（一个字节都没来），报错却说"持续有数据流入"。照这个文案去找"上游在流式吐垃圾"，
+  // 方向完全跑偏（本次复核最初就是这么被带偏的）。
+  //
+  // 光是"改文案"不够 —— 必须钉住"三种情形报三种话"，否则下次有人图省事又合并回一句。
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'probe.js'), 'utf8');
+  // 检查前先剥掉注释 —— 注释里**引用**旧文案来说明问题是对的，不该被当成"没删"。
+  // （第一版守卫没剥，直接误报在注释上：它说"必须删掉"，而注释正是解释为什么删的地方。）
+  const code = src.replace(/^\s*\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+
+  // 旧文案不许再出现在**代码**里（它断言了一个没被测量的原因）
+  assert.ok(!/对端持续有数据流入但始终读不完/.test(code),
+    '旧的"对端持续有数据流入"文案必须删掉 —— 它在 bytes=0 时也会出现，属于凭空断言');
+
+  // 必须真的把状态记到外层可读的变量里
+  assert.ok(/let gotHeaders = false;/.test(src), '必须有外层 gotHeaders 记录"响应头到没到"');
+  assert.ok(/let gotBytes = 0;/.test(src), '必须有外层 gotBytes 记录"收了多少字节"');
+  assert.ok(/gotHeaders = true;/.test(src), '收到响应头时必须置 gotHeaders');
+  assert.ok(/gotBytes = bytes;/.test(src), '读到数据时必须同步 gotBytes');
+
+  // 三种情形必须给三种不同的结论（缺一不可）
+  assert.ok(/连响应头都没收到/.test(src), '必须有为"连响应头都没来"准备的文案');
+  assert.ok(/一个字节的响应体都没来/.test(src), '必须有为"头来了但 0 字节"准备的文案');
+  assert.ok(/已收到 \$\{gotBytes\} 字节但始终读不完/.test(src), '必须有为"有数据但读不完"准备的文案');
+
+  // ⚠ 反面：不许把 gotHeaders/gotBytes 再声明回响应回调里面
+  const reqCb = src.match(/mod\.request\(reqOpts, \(res\) => \{([\s\S]*?)\n      \}\);/);
+  assert.ok(reqCb, '应能找到响应回调');
+  assert.ok(!/let gotBytes = 0;/.test(reqCb[1]),
+    'gotBytes 不能再声明在响应回调内 —— 墙钟兜底读不到它（这正是旧 bug 的成因）');
+});
+
+t('probe.getJson：三种超时情形必须真的报三种话（行为级，不只看源码）', async () => {
+  // 上面那条是源码守卫（防回退）；这条真起一个本地服务，验证不同实际情形确实分得开。
+  // 三种服务端：① 立刻接受连接但永不回响应头 ② 回响应头后永不发 body ③ 发了 body 但不结束
+  const net = require('node:net');
+  const cases = [
+    { name: 'no-headers', handler: () => { /* 什么都不做，连接挂着 */ } },
+    { name: 'no-body', handler: (sock) => sock.write('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n') },
+    { name: 'endless', handler: (sock) => { sock.write('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n'); const iv = setInterval(() => { try { sock.write(' '); } catch (_) { clearInterval(iv); } }, 50); sock.on('close', () => clearInterval(iv)); } },
+  ];
+  for (const c of cases) {
+    const srv = net.createServer((sock) => { sock.on('error', () => {}); c.handler(sock); });
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const port = srv.address().port;
+    // eslint-disable-next-line no-await-in-loop
+    const res = await probe.getJson('http://127.0.0.1:' + port + '/x', { timeoutMs: 600, proxy: null, noProxy: [] });
+    srv.close();
+    assert.strictEqual(res.ok, false, c.name + ' 应该判失败');
+    assert.ok(/超时/.test(String(res.error)), c.name + ' 应报超时，实际：' + res.error);
+    if (c.name === 'no-headers') {
+      assert.ok(/连响应头都没收到/.test(res.error),
+        'no-headers 情形必须报"连响应头都没收到"，实际：' + res.error);
+    } else if (c.name === 'no-body') {
+      assert.ok(/一个字节的响应体都没来/.test(res.error),
+        'no-body 情形必须报"0 字节"，实际：' + res.error);
+    } else {
+      assert.ok(/已收到 \d+ 字节但始终读不完/.test(res.error),
+        'endless 情形必须报"收到 N 字节但读不完"，实际：' + res.error);
+    }
+    // 三种情形的前提：都不许出现"没测量就断言"的旧说法
+    assert.ok(!/对端持续有数据流入/.test(res.error), '不许出现旧文案，实际：' + res.error);
+  }
+});
+
 t('providerProtocol 必须委托 wireOfName（不许再内联协议别名表 —— 本轮第 6 处同类漂移）', () => {
   // ⚠ 背景：引擎里"认哪些 protocol 拼法"曾经有**两份实现**：
   //   · wireOfName()       —— 认 9 种（含简写 chat / messages）
