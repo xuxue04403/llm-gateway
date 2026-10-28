@@ -267,6 +267,16 @@
               <input type="number" id="stBrkCooldownMin" class="input short" min="1" max="1440" placeholder="30" />
               <span class="hint">分钟。留空 = 默认 30 分钟。该家其它模型不受影响</span>
             </div>
+            <label>工具裁剪</label>
+            <div class="field">
+              <label class="switch"><input type="checkbox" id="stMaxToolsOn" /><span></span></label>
+              <span class="hint"><b>默认关闭</b>。开启后，客户端声明的工具数超过上限时保留全部内置工具、按序补 MCP 工具</span>
+            </div>
+            <label>裁剪上限</label>
+            <div class="field">
+              <input type="number" id="stMaxTools" class="input short" min="1" max="2000" placeholder="128" />
+              <span class="hint">个。仅在上面开关打开时生效；留空 = 128。<b>关掉时不会往配置里写 0</b>，直接删键</span>
+            </div>
           </div>
         </div>
 

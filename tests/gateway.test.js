@@ -562,15 +562,21 @@ let upstreamPort = 0;
   });
 
 
-  t('网关：WorkBuddy chat 必须带 X-Conversation-* 三头（国际版缺了必 400/11128）', async () => {
+  t('网关：WorkBuddy 会话头必须是官方那种 32hex，且国内端点不得发 X-Root-Request-ID（头指纹对齐）', async () => {
     // 参照实现 issue #139（2026-10-16 起生效）：国际版 www.workbuddy.ai 对**缺全部三个**
     // `X-Conversation-*` 头的 /v2/chat/completions 回
     //   400 / code 11128 / msg "conversation id missing"
     // 而用户看到的 displayMsg.zh 是「请求被拦截，请重新发送」—— 与渠道风控文案完全相同，
     // 极易被误判成"随机风控"（本网关此前就这么判，于是永远重发同一份请求）。
     //
-    // 三个值都必须是 v4 UUID，且**每次请求新铸一组**（上游不按该 id 存历史，
-    // 参照实现实测两次调用共享同一组没有任何收益）。
+    // 2026-10-28 对齐官方抓包（Zhengyuuuui/workbuddy2api `doc/mitm-capture-playbook.md` §3.2）：
+    //   ① 官方用的是 **32 位小写 hex**，不是 `randomUUID()` 的 36 字符带横线 UUID ——
+    //      带横线本身就是一眼可辨的格式指纹；
+    //   ② 官方 `x-request-id` 与 `x-conversation-request-id` **同值**，我们此前只发了后者；
+    //   ③ `X-Root-Request-ID` 只在国际版 5.7+ 需要，**国内官方头集里没有** ——
+    //      多一个非官方头就多一个特征，所以国内不发。
+    //
+    // 三个值仍**每次请求新铸一组**（上游不按该 id 存历史，参照实现实测共享无收益）。
     const seen = [];
     const s = http.createServer((req, res) => {
       const chunks = [];
@@ -593,8 +599,9 @@ let upstreamPort = 0;
       port, apiKey: GATEWAY_KEY,
       providers: [{
         id: 'wb-conv', baseURL: 'http://127.0.0.1:' + s.address().port + '/v2', protocol: 'openai-chat',
-        // ⚠ auth='workbuddy' 才会走 workbuddyHeaders（桌面身份 + 三头）；
-        //   这里给 apiKey 让凭据解析短路，避免依赖本机 WorkBuddy 安装
+        // ⚠ auth='workbuddy' 才会走 workbuddyHeaders（桌面身份 + 会话头）；
+        //   这里给 apiKey 让凭据解析短路，避免依赖本机 WorkBuddy 安装。
+        //   不声明 region、凭据域为空 → 判定为国内（workbuddyRegionOf 的既有规则）。
         auth: 'workbuddy', apiKey: 'sk-cccccccccccccccccccccccc',
         models: ['test-model'], priority: 1, enabled: true,
       }],
@@ -606,7 +613,7 @@ let upstreamPort = 0;
     try {
       const ok = await waitHealth(port, 20000);
       if (!ok) { console.log('    [SKIP] 网关未就绪'); return; }
-      const V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+      const HEX32 = /^[0-9a-f]{32}$/;
       for (let i = 0; i < 2; i++) {
         const r = await call({ port, body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }] } });
         assert.strictEqual(r.status, 200, '第 ' + (i + 1) + ' 次应 200，实际 ' + r.status + ' ' + r.text.slice(0, 160));
@@ -615,20 +622,141 @@ let upstreamPort = 0;
       for (const h of seen.map((x) => x.headers)) {
         for (const name of ['x-conversation-id', 'x-conversation-request-id', 'x-conversation-message-id']) {
           assert.ok(h[name], '缺头 ' + name + '（国际版会回 11128 conversation id missing）');
-          assert.ok(V4.test(h[name]), name + ' 必须是 v4 UUID，实际 ' + h[name]);
+          assert.ok(HEX32.test(h[name]), name + ' 必须是 32 位小写 hex（官方形态），实际 ' + h[name]);
         }
-        // 国际版 5.7 起多要求一个 X-Root-Request-ID（同一错误码、同一句 "conversation id
-        // missing"）；缺了在 5.7+ 上仍是 400/11128，所以这里必须一起钉住
-        assert.ok(h['x-root-request-id'], '缺头 x-root-request-id（国际版 5.7+ 会回 11128）');
-        assert.ok(V4.test(h['x-root-request-id']), 'x-root-request-id 必须是 v4 UUID，实际 ' + h['x-root-request-id']);
-        assert.strictEqual(h['x-root-request-id'], h['x-conversation-request-id'],
-          '根 id 应与本次请求 id 同源（同属一个请求），实际 ' + h['x-root-request-id'] + ' vs ' + h['x-conversation-request-id']);
+        // 官方把 x-request-id 与 x-conversation-request-id 设成同一个值
+        assert.strictEqual(h['x-request-id'], h['x-conversation-request-id'],
+          'x-request-id 必须与 x-conversation-request-id 同值，实际 ' + h['x-request-id'] + ' vs ' + h['x-conversation-request-id']);
+        // 国内端点：官方头集里没有 X-Root-Request-ID，不得发（多余的头就是特征）
+        assert.strictEqual(h['x-root-request-id'], undefined,
+          '国内端点不得发 x-root-request-id（官方国内头集没有这个头），实际 ' + h['x-root-request-id']);
       }
       const t1 = seen[0].headers['x-conversation-id'];
       const t2 = seen[1].headers['x-conversation-id'];
-      assert.notStrictEqual(t1, t2, '三次会话头应每请求新铸一组（参照实现实测共享无收益），实际两次都是 ' + t1);
+      assert.notStrictEqual(t1, t2, '会话头应每请求新铸一组（参照实现实测共享无收益），实际两次都是 ' + t1);
     } finally {
       try { proc.kill(); } catch { /* 忽略 */ }
+      try { s.close(); } catch { /* 忽略 */ }
+    }
+  });
+
+  t('网关：WorkBuddy 国内头集必须补齐官方 IDE 的 7 个头、且一个哨兵头都不许带', async () => {
+    // 出处：Zhengyuuuui/workbuddy2api 的 `doc/mitm-capture-playbook.md` §3.2（官方国内 IDE
+    // 请求头抓包原文）+ `server/test_fingerprint_headers.py` 的两组断言。两个要点：
+    //   ① 官方国内 IDE 必带 x-model-id / x-product-code / x-product-version / x-env-id /
+    //      x-agent-intent / accept-language / sec-fetch-mode，我们此前一个都没发；
+    //   ② 我们此前固定带 x-no-user-id / x-no-enterprise-id / x-no-department-info 三个
+    //      "哨兵头" —— 官方头集里**根本没有**这些（该项目的测试专门断言"官方没有的
+    //      头一律不发"），缺值就应该干脆不发。
+    // 同时锁住"国内补的头不得漏到国际端点"（另一条断言），所以下面再跑一遍 global。
+    const seen = [];
+    const s = http.createServer((req, res) => {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        seen.push({ headers: { ...req.headers } });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          id: 'c1', object: 'chat.completion', created: 1, model: 'test-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+        }));
+      });
+    });
+    await new Promise((r) => s.listen(0, '127.0.0.1', r));
+
+    const base = 'http://127.0.0.1:' + s.address().port + '/v2';
+    // 国内（凭据域为空）—— 补头
+    const dirCn = fs.mkdtempSync(path.join(tmp, 'wbcn-'));
+    const portCn = await freePort();
+    // 国际（显式 region）—— 一个国内头都不许漏
+    const dirIntl = fs.mkdtempSync(path.join(tmp, 'wbintl-'));
+    const portIntl = await freePort();
+    const provider = (id, region) => ({
+      id, baseURL: base, protocol: 'openai-chat',
+      auth: 'workbuddy', apiKey: 'sk-cccccccccccccccccccccccc',
+      models: ['test-model'], priority: 1, enabled: true,
+      ...(region ? { region } : {}),
+    });
+    // 国际版必须让凭据也属于国际域（`workbuddy.ai`），否则会被**跨区守卫**直接拒绝 ——
+    // 那道守卫是对的（两个区域的凭据互不通用），所以这里显式声明 account.domain。
+    const intlProvider = {
+      id: 'wb-intl', baseURL: base, protocol: 'openai-chat',
+      auth: 'workbuddy', region: 'global',
+      accounts: [{ id: 'ai1', apiKey: 'sk-cccccccccccccccccccccccc', domain: 'workbuddy.ai' }],
+      models: ['test-model'], priority: 1, enabled: true,
+    };
+    fs.writeFileSync(path.join(dirCn, 'c.json'),
+      JSON.stringify({ port: portCn, apiKey: GATEWAY_KEY, providers: [provider('wb-cn')] }), 'utf8');
+    fs.writeFileSync(path.join(dirIntl, 'c.json'),
+      JSON.stringify({ port: portIntl, apiKey: GATEWAY_KEY, providers: [intlProvider] }), 'utf8');
+
+    const spawnGw = (dir, port) => spawn(process.execPath,
+      [MJS, '--config', path.join(dir, 'c.json'), '--log', path.join(dir, 'g.log'), '--port', String(port)],
+      { stdio: 'ignore', windowsHide: true });
+    const p1 = spawnGw(dirCn, portCn);
+    const p2 = spawnGw(dirIntl, portIntl);
+    try {
+      if (!await waitHealth(portCn, 20000)) { console.log('    [SKIP] 国内实例未就绪'); return; }
+      if (!await waitHealth(portIntl, 20000)) { console.log('    [SKIP] 国际实例未就绪'); return; }
+
+      const r1 = await call({ port: portCn, body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r1.status, 200, '国内应 200，实际 ' + r1.status + ' ' + r1.text.slice(0, 160));
+      const cn = seen[seen.length - 1].headers;
+
+      // ① 官方国内 IDE 必带的头，一个都不能缺
+      assert.strictEqual(cn['x-agent-intent'], 'craft', 'x-agent-intent 应为 craft，实际 ' + cn['x-agent-intent']);
+      assert.strictEqual(cn['x-model-id'], 'test-model', 'x-model-id 必须是上游真实模型 ID，实际 ' + cn['x-model-id']);
+      assert.strictEqual(cn['x-product-code'], 'codebuddy', 'x-product-code 应为 codebuddy，实际 ' + cn['x-product-code']);
+      assert.strictEqual(cn['x-env-id'], 'production', 'x-env-id 应为 production，实际 ' + cn['x-env-id']);
+      // ⚠ `accept` / `accept-language` / `sec-fetch-mode` 断言在这里**没有鉴别力**：
+      // undici 的 fetch 在没有显式值时就会补上 `accept: */*`、`accept-language: *`、
+      // `sec-fetch-mode: cors`，与我们写不写这三个头完全一样。所以不动这三点，只断言
+      // 那些"只有官方 IDE 才发、undici 绝不会补"的头（它们才是头指纹的鉴别项）。
+      assert.ok(cn['x-agent-intent'] && cn['x-product-code'] && cn['x-env-id'],
+        '国内头集缺少官方 IDE 专属头');
+      // x-product-version 必须与 x-ide-version 同值，否则三件套内部自相矛盾
+      assert.ok(cn['x-product-version'], '缺头 x-product-version');
+      assert.strictEqual(cn['x-product-version'], cn['x-ide-version'],
+        'x-product-version 必须与 x-ide-version 同值，实际 ' + cn['x-product-version'] + ' vs ' + cn['x-ide-version']);
+
+      // ② 哨兵头一律不许出现（官方没有这些头）
+      for (const banned of ['x-no-user-id', 'x-no-enterprise-id', 'x-no-department-info']) {
+        assert.strictEqual(cn[banned], undefined, '不得发送哨兵头 ' + banned + '（官方头集里没有）');
+      }
+
+      // ③ 同一套"国内补的头"不得漏到国际端点
+      //    先清空 seen：两个实例共用同一个假上游，若不清空，"最后一条"可能是国内那边留下的
+      //    （这条断言第一版就踩了：读到的其实是上一个实例的请求头）。
+      seen.length = 0;
+      const r2 = await call({ port: portIntl, body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r2.status, 200, '国际应 200，实际 ' + r2.status + ' ' + r2.text.slice(0, 160));
+      assert.strictEqual(seen.length, 1, '国际实例应恰好发 1 次上游请求，实际 ' + seen.length);
+      const intl = seen[0].headers;
+      // ⚠ 这里**不能**断言 `accept-language` / `sec-fetch-mode` 缺席：网关的上游请求走的是
+      // 全局 `fetch`（undici），而 undici **无条件**注入 `accept-language: *` /
+      // `sec-fetch-mode: cors` / `accept-encoding: gzip, deflate` —— 实测（本机 node 22）：
+      //   fetch 一个本地服务，服务端收到的头里就带这三个，与调用方写没写毫无关系。
+      // 也就是说它们不是"我们发的国内专属头"，而是**传输层指纹**，国内国际两边一样。
+      // 真正属于"国内头集"、也确实能把两套头区分开的，是下面这几个（官方国际客户端不产）。
+      for (const cnOnly of ['x-model-id', 'x-product-code', 'x-product-version', 'x-env-id',
+        'x-agent-intent']) {
+        assert.strictEqual(intl[cnOnly], undefined,
+          '国际端点不得发国内专属头 ' + cnOnly + '（上游官方客户端不产该头），实际 ' + intl[cnOnly]);
+      }
+      // 反向保护：国际版仍必须是**官方那套 accept**，不能被 `upstreamRequestHeaders()`
+      // 的兜底值（`application/json, text/event-stream`）顶掉。
+      // 第一版就是这么错的：`base` 的 accept 覆盖了官方值，`base` 的 accept-language 又
+      // 绕过 `dropHeaderCI` 漏到上游 —— 真因是 workbuddy 分支继承了客户端透传头。
+      assert.strictEqual(intl['accept'], 'application/json, text/plain, */*',
+        '国际版 accept 必须是官方 workbuddy 值，实际 ' + intl['accept']);
+      // 而国际版 5.7+ 必需的 X-Root-Request-ID 必须在这里出现
+      assert.ok(intl['x-root-request-id'], '国际版缺 x-root-request-id（5.7+ 会回 11128）');
+      assert.strictEqual(intl['x-root-request-id'], intl['x-conversation-request-id'],
+        '根 id 应与本次请求 id 同源，实际 ' + intl['x-root-request-id'] + ' vs ' + intl['x-conversation-request-id']);
+    } finally {
+      try { p1.kill(); } catch { /* 忽略 */ }
+      try { p2.kill(); } catch { /* 忽略 */ }
       try { s.close(); } catch { /* 忽略 */ }
     }
   });

@@ -252,6 +252,15 @@ function validateConfigText(text) {
       return { ok: false, error: 'clientProfile 非法（可选：' + CLIENT_PROFILES.join(' / ') + '，留空=关闭）当前：' + JSON.stringify(cfg.clientProfile) };
     }
   }
+  // 工具裁剪上限（本程序新增校验）：缺省 = 不裁剪（引擎侧 DEFAULT_MAX_TOOLS = 0）。
+  // 负数/小数/字符串数字都会被引擎静默当成"关闭"（`raw > 0` 且 `Number.isFinite`），
+  // 用户以为开了、其实一个工具都没裁 —— 保存前说清楚，与 routing/clientProfile 同口径。
+  if (cfg.maxTools !== undefined && cfg.maxTools !== null) {
+    const n = Number(cfg.maxTools);
+    if (!Number.isFinite(n) || Math.floor(n) !== n || n < 0 || n > 2000) {
+      return { ok: false, error: 'maxTools 必须是 0-2000 的整数（0 = 关闭裁剪，缺省即关闭），当前：' + JSON.stringify(cfg.maxTools) };
+    }
+  }
   // 代理（本程序新增校验）：enabled=true 但 url 空会让引擎回退自动探测，
   // 用户以为"指定了代理"其实没有——保存前说清楚
   if (cfg.proxy !== undefined) {

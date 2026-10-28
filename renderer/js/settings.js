@@ -16,6 +16,15 @@ LG.renders.settings = function renderSettings() {
   const brk = (c.breaker && typeof c.breaker === 'object') ? c.breaker : {};
   $('#stBrkThreshold').value = brk.threshold == null ? '' : brk.threshold;
   $('#stBrkCooldownMin').value = brk.cooldownMs == null ? '' : Math.round(brk.cooldownMs / 60_000);
+  // 工具裁剪：**缺省即关闭**（引擎侧 DEFAULT_MAX_TOOLS = 0，`maxTools` 不存在 = 不裁剪）。
+  // 判据必须是 `> 0` 而不是 `!= null`：配置里写成 0 / 负数 / 字符串数字，引擎都会当成关闭
+  // （`Number.isFinite(raw) && raw > 0`），界面若显示成"已开启"就会骗人。
+  const mtRaw = Number(c.maxTools);
+  const mtOn = Number.isFinite(mtRaw) && mtRaw > 0;
+  $('#stMaxToolsOn').checked = mtOn;
+  $('#stMaxTools').value = mtOn ? String(Math.floor(mtRaw)) : '';
+  // 关闭时把上限框置灰，避免"填了数字却没生效"的困惑
+  $('#stMaxTools').disabled = !mtOn;
 
   const st = LG.state;
   if (st) {
@@ -78,6 +87,20 @@ function readSettingsInto() {
   }
   if (Object.keys(brkKeys).length) set('breaker', brkKeys);
   else if (c.breaker !== undefined) { delete c.breaker; changed = true; }
+
+  // 工具裁剪（默认关闭）：关掉时**删键**而不是写 0。
+  // 写 0 与"没设过"在引擎里等价，但导出的配置会留下 `"maxTools": 0`，
+  // 日后调整默认值就影响不到他 —— 与上面 breaker 的处理保持一致。
+  // ⚠ 漏了这段的后果不是"多个提示"，而是：用户在界面关掉开关 → 配置里仍留 128 →
+  // 重启后引擎照样裁剪，界面显示关闭、实际开启，全程无提示。
+  if ($('#stMaxToolsOn').checked) {
+    const raw = String($('#stMaxTools').value || '').trim();
+    const n = raw ? Number(raw) : 128;              // 留空 = 128（与输入框 placeholder 一致）
+    set('maxTools', Number.isFinite(n) && n > 0 ? Math.floor(n) : 128);
+  } else if (c.maxTools !== undefined) {
+    delete c.maxTools;
+    changed = true;
+  }
   return changed;
 }
 
@@ -96,6 +119,15 @@ function validateSettingsInput() {
   const cd = String($('#stBrkCooldownMin').value || '').trim();
   if (cd && (!/^\d+$/.test(cd) || Number(cd) < 1 || Number(cd) > 1440)) {
     return '「冷却时长」必须是 1–1440 分钟（留空 = 默认 30 分钟）';
+  }
+  // 工具裁剪：只有开关打开时才校验上限。留空合法（= 128）。
+  // 上限卡 2000：再大的数字没有任何实际意义（真实客户端最多几百个工具），
+  // 而超大的值等于"裁剪形同虚设"，不如让用户直接关掉开关。
+  if ($('#stMaxToolsOn').checked) {
+    const mt = String($('#stMaxTools').value || '').trim();
+    if (mt && (!/^\d+$/.test(mt) || Number(mt) < 1 || Number(mt) > 2000)) {
+      return '「工具裁剪上限」必须是 1–2000 的整数（留空 = 128）';
+    }
   }
   return '';
 }
@@ -130,9 +162,15 @@ LG.initSettings = function initSettings() {
   // 点「保存并生效」写回去的还是旧值 → **界面显示 3、实际生效 90**，全程无任何提示。
   // （2026-10-14 审计发现：这是我上一个版本引入这两个框时漏掉的接线。）
   ['stRouting', 'stProfile', 'stProxyEnabled', 'stProxyUrl', 'stNoProxy', 'stForceProxy',
-    'stBrkThreshold', 'stBrkCooldownMin'].forEach((id) => {
+    'stBrkThreshold', 'stBrkCooldownMin', 'stMaxTools'].forEach((id) => {
       $('#' + id).addEventListener('change', () => applyChange('网关设置'));
     });
+  // 工具裁剪开关单独接：它还要联动"上限输入框是否可编辑"，所以改完要重画一次设置页。
+  // 重画是安全的 —— applyChange 已经先把值写进 LG.config，重画读的就是刚写进去的值。
+  $('#stMaxToolsOn').addEventListener('change', () => {
+    applyChange('工具裁剪');
+    LG.renders.settings();
+  });
   $('#stPort').addEventListener('change', () => applyChange('端口 ' + $('#stPort').value));
 
   // 应用偏好：直接落盘（与网关配置无关）

@@ -3346,7 +3346,10 @@ function providerAccounts(provider) {
     const apiKey = String(a.apiKey || '').trim();
     // auth=workbuddy 时允许只写 { id }：authFile 留空 → 运行时按平台默认路径自动发现
     if (!authFile && !apiKey && !isWorkBuddy) return;
-    out.push({ id, authFile, apiKey });
+    // `domain` 只在"直接给 apiKey"时才有意义：它决定该账户算国内还是国际
+    //（跨区守卫与头集选择都靠它）。真实桌面凭据的 domain 来自 auth 文件解密结果；
+    // 写死 apiKey 的场景（测试、自建中转）没有 auth 文件，只能显式声明。
+    out.push({ id, authFile, apiKey, domain: String(a.domain || a.region || '').trim() });
   });
   return out;
 }
@@ -4171,26 +4174,41 @@ function dumpWorkbuddy11128(provider, bodyText, detail) {
  * 用户看到的 `displayMsg.zh` 是「请求被拦截，请重新发送」—— 与渠道风控文案**完全相同**，
  * 因此极易误判成"随机风控"（本网关此前就是这么判的）。
  *
- * 三个值都是 v4 UUID，**每次请求新铸一组**即可：参照实现实测上游不按该 id 存历史，
- * 两次调用共享同一组也没有任何收益。
+ * 三个值都是 **32 位小写 hex（无横线）**，不是 `crypto.randomUUID()` 那种 36 字符带横线
+ * 的形态 —— 官方客户端抓包原文就是 32hex（Zhengyuuuui/workbuddy2api 的
+ * `doc/mitm-capture-playbook.md` §3.2），带横线的 UUID 是一眼可辨的格式指纹。
+ * **每次请求新铸一组**即可：参照实现实测上游不按该 id 存历史，两次调用共享同一组没有收益。
  *
  * ⚠ 2026-10-24 补：国际版 **5.7** 起要求**四个**头，多一个是 `X-Root-Request-ID`
  *   （chengshenyangtai/dsh-workbuddy-trae-qoder-connect 的 CHANGELOG 记录：缺它同样
- *   回 400/11128 "conversation id missing"）。这里一并补上 —— 与既有三头同源（同一个
- *   请求的根 id），旧版上游多收一个未声明的头无副作用。
+ *   回 400/11128 "conversation id missing"）。国内官方头集里**没有**这个头 ——
+ *   多一个非官方头就多一个可识别特征，所以只在国际版发。
  *
  * ⚠ 国内版 `copilot.tencent.com` 实测**不要求**这些头（带与不带都 200），
  *   所以这是兼容性防护，不是国内链路的必要条件。
  */
-function workbuddyConversationHeaders() {
-  const conversationId = crypto.randomUUID();
-  const requestId = crypto.randomUUID();
-  return {
-    'X-Conversation-ID': conversationId,
-    'X-Conversation-Request-ID': requestId,
-    'X-Conversation-Message-ID': crypto.randomUUID(),
-    'X-Root-Request-ID': requestId,
+
+/** 官方客户端用 32 位小写 hex；`randomUUID()` 的 36 字符带横线是格式级指纹差异 */
+function wbHex32() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+/**
+ * @param {{ intl?: boolean }} [opts] `intl: true` 时额外发 `X-Root-Request-ID`（国际版 5.7+ 必需）
+ */
+function workbuddyConversationHeaders(opts) {
+  const intl = !!(opts && opts.intl);
+  const requestId = wbHex32();
+  const h = {
+    'x-conversation-id': wbHex32(),
+    'x-conversation-request-id': requestId,
+    'x-conversation-message-id': wbHex32(),
+    // 官方抓包原文里 `x-request-id` 与 `x-conversation-request-id` 是**同一个值**；
+    // 我们此前只发后者 —— 少一个官方必带的头同样是特征。
+    'x-request-id': requestId,
   };
+  if (intl) h['x-root-request-id'] = requestId;
+  return h;
 }
 
 /**
@@ -4209,7 +4227,7 @@ function workbuddyConversationHeaders() {
 
 /** 解析该账户当前可用的凭据（缓存 → 自留副本 → 桌面 auth 文件），必要时单飞刷新 */
 async function resolveWorkBuddyCredential(provider, acct) {
-  if (acct.apiKey) return { accessToken: acct.apiKey, refreshToken: '', expiresAtMs: Date.now() + 3600_000, domain: '', uid: '' };
+  if (acct.apiKey) return { accessToken: acct.apiKey, refreshToken: '', expiresAtMs: Date.now() + 3600_000, domain: String(acct.domain || ''), uid: '' };
   const key = accountKey(provider.id, acct.id);
   const cached = workbuddyCredCache.get(key);
   if (cached && !workbuddyNeedsRefresh(cached.cred)) return cached.cred;
@@ -4476,41 +4494,106 @@ function workbuddyChatUserAgent(domain) {
 function workbuddyIdeHeaders() {
   const { appVersion } = workbuddyVersions();
   return {
-    'X-IDE-Type': 'WorkBuddy',
-    'X-IDE-Name': 'WorkBuddy',
-    'X-IDE-Version': appVersion || WORKBUDDY_FALLBACK_APP_VERSION,
+    'x-ide-type': 'WorkBuddy',
+    'x-ide-name': 'WorkBuddy',
+    'x-ide-version': appVersion || WORKBUDDY_FALLBACK_APP_VERSION,
   };
 }
 
 /**
- * 用凭据构造上游请求头（Authorization + 身份头 + 客户端仿真头）
- * @param {boolean} [forChat] true = chat 请求（用桌面身份 UA）；缺省 = 刷新/目录（CLI 形态 UA）
+ * 国内官方 IDE 客户端（CodeBuddyIDE）在 `/v2/chat/completions` 上**额外**带的头。
+ *
+ * 出处：Zhengyuuuui/workbuddy2api 的 `doc/mitm-capture-playbook.md` §3.2（官方请求头
+ * 抓包原文）与 `server/test_fingerprint_headers.py` 的两组断言。
+ *
+ * 🔑 关键事实：**国内与海外是两套头集，不是同一个集合的两个版本**。
+ *   国内多发：`x-model-id` / `x-product-code` / `x-product-version` / `x-env-id` /
+ *            `accept-language` / `sec-fetch-mode` / `monitor_httpsendtime` /
+ *            `x-request-trace-id` / `x-device-token`
+ *   海外一个都不发 —— 该项目的 `test_no_accept_encoding_noise` 明确断言这些
+ *   **不许出现**在海外请求里（"官方没有的头不允许发送"）。
+ *   所以这里只在 `region === 'cn'` 时补，绝不把国内头漏到国际端点。
+ *
+ * 有意**不补**的两项：
+ *   - `x-device-token`：465 字符、`v3:` 前缀的设备级指纹，**一设备一账号**，取错或
+ *     多账号共用会触发设备关联连坐封号。属人工提取后单独注入的范畴，不在代码里猜。
+ *   - `X-Domain`：本网关这一头承载的是**凭据域**（沿用参照实现的语义），与官方那个
+ *     `www.codebuddy.cn`（产品域）不是同一件事；强行覆盖会改变凭据语义。
+ *
+ * @param {string} ideVersion 与 `X-IDE-Version` 同值，保证三件套内部自洽
+ * @param {string} [model] 上游真实模型 ID（已过 bodyForProvider 映射）
  */
-function workbuddyHeaders(provider, cred, extra, forChat) {
-  const origin = workbuddyOrigin(cred.domain);
+function workbuddyCnIdeExtras(ideVersion, model) {
   const h = {
-    Accept: 'application/json, text/plain, */*',
-    'X-Requested-With': 'XMLHttpRequest',
-    Origin: origin,
-    Referer: origin + '/',
-    'Content-Type': 'application/json',
-    'X-Product': 'SaaS',
-    Authorization: 'Bearer ' + cred.accessToken,
-    ...(cred.uid ? { 'X-User-Id': cred.uid } : { 'X-No-User-Id': '1' }),
-    ...(cred.enterpriseId ? { 'X-Enterprise-Id': cred.enterpriseId } : { 'X-No-Enterprise-Id': '1' }),
-    ...(cred.domain ? { 'X-Domain': cred.domain } : { 'X-No-Department-Info': '1' }),
+    accept: '*/*',
+    'accept-language': '*',
+    'sec-fetch-mode': 'cors',
+    'x-agent-intent': 'craft',
+    'x-product-code': 'codebuddy',
+    'x-env-id': 'production',
+  };
+  if (ideVersion) h['x-product-version'] = ideVersion;
+  if (model) h['x-model-id'] = model;
+  return h;
+}
+
+/**
+ * 用凭据构造上游请求头（Authorization + 身份头 + 客户端仿真头）
+ *
+ * ⚠ 所有头名一律**小写**。不是为了好看：`upstreamRequestHeaders()` 里有一条
+ *   `if (!out['accept']) out['accept'] = 'application/json, text/event-stream'`
+ *   的兜底，它只认小写键。我们以前用大写 `Accept` 写进去，它看不见 → 又补了一个
+ *   小写的 `accept` → Node 把两个同名不同大小写的键拼成**一个脏头**，实测变成
+ *   `accept: application/json, text/event-stream, 星号斜杠星号`（最后那段是我们本想设的值）。
+ *   这种合并脏值本身就是与官方客户端对不上的特征（官方只有一个 `accept`），
+ *   所以统一小写消除这类问题。
+ *
+ * @param {boolean} [forChat] true = chat 请求（用桌面身份 UA）；缺省 = 刷新/目录（CLI 形态 UA）
+ * @param {string} [model] 上游真实模型 ID（填官方必带的 x-model-id）
+ */
+function workbuddyHeaders(provider, cred, extra, forChat, model) {
+  const origin = workbuddyOrigin(cred.domain);
+  // 区域决定**整套头集**，而不只是一个 x-domain：国内外官方客户端发的头是两套
+  // （见 workbuddyCnIdeExtras 的注释），混着发反而更可疑。
+  const region = workbuddyDeclaredRegion(provider) || workbuddyRegionOf(cred.domain);
+  const intl = region === 'global';
+  const h = {
+    accept: 'application/json, text/plain, */*',
+    'x-requested-with': 'XMLHttpRequest',
+    origin,
+    referer: origin + '/',
+    'content-type': 'application/json',
+    'x-product': 'SaaS',
+    authorization: 'Bearer ' + cred.accessToken,
+    // 2026-10-28：不再发 `x-no-user-id` / `x-no-enterprise-id` / `x-no-department-info`
+    // 这三个"哨兵头"。官方头集里根本没有它们（Zhengyuuuui/workbuddy2api 的
+    // `test_fingerprint_headers.py::test_no_accept_encoding_noise` 就是专门断言
+    // "官方没有的头一律不发"），而我们无论字段在不在都固定带一个 —— 缺值就干脆不发。
+    ...(cred.uid ? { 'x-user-id': cred.uid } : {}),
+    ...(cred.enterpriseId ? { 'x-enterprise-id': cred.enterpriseId } : {}),
+    ...(cred.domain ? { 'x-domain': cred.domain } : {}),
     ...(extra || {}),
   };
   // 身份仿真（关键）：chat 用桌面形态 UA + X-IDE-* 三头（使用端归属）；刷新/目录保持 CLI 形态。
   // 配置里的 headers.User-Agent 只作为刷新路径的覆盖，不参与 chat（chat 必须是桌面身份）。
   if (forChat) {
-    h['User-Agent'] = workbuddyChatUserAgent(cred.domain);
-    Object.assign(h, workbuddyIdeHeaders());
+    const add = {};
+    add['user-agent'] = workbuddyChatUserAgent(cred.domain);
+    const ide = workbuddyIdeHeaders();
+    Object.assign(add, ide);
+    if (!intl) Object.assign(add, workbuddyCnIdeExtras(ide['x-ide-version'], model));
     // 会话渠道头（参照实现 issue #139 + 国际版 5.7）：国际版缺了任一个就 400/11128
-    // "conversation id missing"（5.7 起多要求 X-Root-Request-ID）。国内版不要求，
-    // 但带上无害 —— 实测带/不带都 200，所以统一加，避免按域名分叉。
-    Object.assign(h, workbuddyConversationHeaders());
-  } else h['User-Agent'] = WORKBUDDY_CLI_UA;
+    // "conversation id missing"（5.7 起多要求 x-root-request-id）。
+    // 国内版不要求、且官方头集里没有 x-root-request-id → 只在国际版发。
+    Object.assign(add, workbuddyConversationHeaders({ intl }));
+    // 先按大小写不敏感清掉同名头再合并：`base`（客户端转发头）里常已带一个小写的
+    // `accept` / `accept-language`，直接再写同名键会被 Node 拼成 ", " 脏值。
+    for (const k of Object.keys(add)) dropHeaderCI(h, k.toLowerCase());
+    Object.assign(h, add);
+  } else {
+    dropHeaderCI(h, 'user-agent');
+    h['user-agent'] = WORKBUDDY_CLI_UA;
+  }
   return h;
 }
 
@@ -4754,7 +4837,7 @@ function isCodexProvider(provider) {
   return String((provider && provider.auth) || '').toLowerCase() === 'codex';
 }
 
-async function accountUpstreamHeaders(provider, acct, baseHeaders, { anthropicUpstream }) {
+async function accountUpstreamHeaders(provider, acct, baseHeaders, { anthropicUpstream, model }) {
   const extra = providerExtraHeaders(provider);
   const base = { ...(baseHeaders || {}) };
   for (const k of Object.keys(base)) {
@@ -4775,8 +4858,20 @@ async function accountUpstreamHeaders(provider, acct, baseHeaders, { anthropicUp
   }
   if (String(provider.auth || '').toLowerCase() === 'workbuddy') {
     const cred = await resolveWorkBuddyCredential(provider, acct || { id: 'default' });
-    Object.assign(out, workbuddyHeaders(provider, cred, out, true));   // 内部设置唯一的桌面身份 UA
-    return out;
+    // model 是**上游**模型 ID（调用点传的是 body.model，已过 bodyForProvider 映射），
+    // 用来填官方必带的 `x-model-id` —— 传空则不发该头（宁缺勿假）。
+    //
+    // ⚠ 这条通道**不继承 `base`（客户端透传头）**，只继承供应商自己配的 `headers`。
+    // 2026-10-28 实测踩到的坑：`upstreamRequestHeaders()` 的透传分支会把客户端自己的
+    // `accept` / `accept-language` / `sec-fetch-mode`（undici 的 fetch 默认就带后两个）
+    // 原样带上来，再经 `h = { ...官方头集, ...extra }` 覆盖官方值 —— 结果国际版明明
+    // 走的是 `intl` 分支、`add` 里没有任何 `accept-language`，上游却收到了
+    // `accept-language: *` / `sec-fetch-mode: cors`，`accept` 还被顶成
+    // `application/json, text/event-stream`（那本是 `upstreamRequestHeaders` 的兜底值）。
+    // 官方头集是**精确集合**（`Zhengyuuuui/workbuddy2api` 的
+    // `test_no_accept_encoding_noise` 就断言"官方没有的头一律不发"），混进客户端噪声
+    // 恰恰是"非官方渠道"的指纹，所以这里只保留 `providerExtraHeaders`。
+    return workbuddyHeaders(provider, cred, providerExtraHeaders(provider), true, model);
   }
   if (ua) out['User-Agent'] = ua;
   const key = (acct && acct.apiKey) || provider.apiKey;
@@ -4809,7 +4904,7 @@ async function forwardWithAccounts(provider, upstreamPath, baseHeaders, body, re
     const anthropicUpstream = upstreamPath === '/messages' || upstreamPath === '/v1/messages';
     let headers = baseHeaders;
     try {
-      headers = await accountUpstreamHeaders(provider, null, baseHeaders, { anthropicUpstream });
+      headers = await accountUpstreamHeaders(provider, null, baseHeaders, { anthropicUpstream, model: scopeModel });
     } catch (e) {
       log(`provider ${provider.id} 头部构造失败：${e && e.message}`);
       return false;
@@ -4832,7 +4927,7 @@ async function forwardWithAccounts(provider, upstreamPath, baseHeaders, body, re
     let headers;
     try {
       // eslint-disable-next-line no-await-in-loop
-      headers = await accountUpstreamHeaders(provider, acct, baseHeaders, { anthropicUpstream });
+      headers = await accountUpstreamHeaders(provider, acct, baseHeaders, { anthropicUpstream, model: scopeModel });
     } catch (e) {
       log(`account ${provider.id}#${acct.id} 凭据不可用：${e && e.message}`);
       markAccountFailure(provider.id, acct, 'session', e && e.message);
@@ -11141,7 +11236,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
     let headers;
     try {
       // 与直通路径共用同一套账户头构造（凭据 / 身份头 / Bearer / 自定义头，避免两处漂移）
-      headers = await accountUpstreamHeaders(provider, acct, upstreamBaseHeaders, { anthropicUpstream: false });
+      headers = await accountUpstreamHeaders(provider, acct, upstreamBaseHeaders, { anthropicUpstream: false, model: scopeModel });
     } catch (e) {
       log(`provider ${provider.id} 凭据不可用（${acct ? acct.id : '-'}）：${e && e.message}`);
       if (acct) { clearTimeout(timer); markAccountFailure(provider.id, acct, 'session', e && e.message); continue; }
@@ -12568,10 +12663,10 @@ function startServer(cfg) {
     ACTIVE_MAX_TOOLS = (cfg && cfg.maxTools !== undefined && Number.isFinite(raw) && raw > 0)
       ? Math.floor(raw) : DEFAULT_MAX_TOOLS;
     if (ACTIVE_MAX_TOOLS > 0) {
-      log(`工具裁剪上限 = ${ACTIVE_MAX_TOOLS}（超出时保留全部内置工具、按序补 MCP 工具；`
-        + `顶层 maxTools=0 可关闭）`);
+      log(`工具裁剪上限 = ${ACTIVE_MAX_TOOLS}（**非默认**，说明配置里显式写了 maxTools；`
+        + `超出时保留全部内置工具、按序补 MCP 工具；改回默认关闭：删掉 maxTools 或在设置页关掉开关）`);
     } else {
-      log('工具裁剪已关闭（maxTools=0）—— 客户端声明的工具会**全部**发给上游');
+      log('工具裁剪已关闭（默认状态，maxTools 未设或为 0）—— 客户端声明的工具会**全部**发给上游');
     }
   }
   // magpie 三项（loopGuard / toolLoop / roomy）：默认全开，见 DEFAULT_* 的说明。

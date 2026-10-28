@@ -821,3 +821,88 @@ t('渲染层：在序号框里拖选数字不得拖走整行（draggable 祖先�
   assert.strictEqual(picked, '0', '正常拖拽要把行下标写进 dataTransfer');
 });
 
+/* ================================================================
+ * 设置页：工具裁剪开关（maxTools）
+ *
+ * 背景：maxTools 的引擎缺省值是 0（关闭），但**设置页此前根本没有这个开关** ——
+ * 只有一个隐含在文档里的数字。用户要开/关只能手改 gateway.config.json，
+ * 而那份文件会被界面保存整份覆写，手改的东西下次点保存就没了。
+ * 更糟的是"看起来关了、其实还开着"：界面没有开关，用户以为自己没开过。
+ * ================================================================ */
+
+/** 把 settings.js 也加载进已有沙箱（makeSandbox 默认只装 core/providers/dashboard）。 */
+function loadSettings(S) {
+  vm.runInContext(fs.readFileSync(path.join(RJ, 'settings.js'), 'utf8'), S.sandbox, { filename: 'settings.js' });
+  return S;
+}
+
+t('渲染层（设置页）：工具裁剪**默认关闭** —— 配置里没有 maxTools 时开关必须是关的、上限框置灰', () => {
+  const S = makeSandbox();
+  loadSettings(S);
+  const $ = S.sandbox.$;
+  S.refs.LG.config = { port: 3091, providers: [] };
+  S.refs.LG.renders.settings();
+  assert.strictEqual($('#stMaxToolsOn').checked, false, '缺省（键不存在）必须是关闭 —— 引擎 DEFAULT_MAX_TOOLS = 0');
+  assert.strictEqual($('#stMaxTools').disabled, true, '关闭时上限框要置灰，避免"填了数字却没生效"');
+  assert.strictEqual($('#stMaxTools').value, '', '关闭时不应回填任何数字');
+
+  // 配置里是 0 / 负数 / 非数字，引擎都会当成关闭（`Number.isFinite(raw) && raw > 0`），
+  // 界面若显示成"已开启"就是在骗人。
+  for (const weird of [0, -5, 'abc', null]) {
+    S.refs.LG.config = { port: 3091, providers: [], maxTools: weird };
+    S.refs.LG.renders.settings();
+    assert.strictEqual($('#stMaxToolsOn').checked, false, `maxTools=${JSON.stringify(weird)} 应显示为关闭`);
+  }
+});
+
+t('渲染层（设置页）：关掉工具裁剪必须**删键**（不是写 0），打开且留空写 128', () => {
+  const S = makeSandbox();
+  loadSettings(S);
+  const $ = S.sandbox.$;
+  S.refs.LG.config = { port: 3091, providers: [], maxTools: 128 };
+  S.refs.LG.renders.settings();
+  assert.strictEqual($('#stMaxToolsOn').checked, true, '128 应显示为已开启');
+  assert.strictEqual($('#stMaxTools').value, '128', '已开启时要回填当前值');
+
+  // ① 关掉 → 删键。写 0 与"没设过"在引擎里等价，但导出的配置会留下 `"maxTools": 0`，
+  //    日后调整默认值就影响不到他（与 breaker 的处理同一套口径）。
+  $('#stMaxToolsOn').checked = false;
+  assert.strictEqual(S.sandbox.readSettingsInto(), true, '关掉开关必须算作"有改动"（否则不会提示保存）');
+  assert.ok(!('maxTools' in S.refs.LG.config), '关掉时必须删键，实际配置：' + JSON.stringify(S.refs.LG.config));
+
+  // ② 再打开、上限留空 → 128（与 placeholder 一致）
+  $('#stMaxToolsOn').checked = true;
+  $('#stMaxTools').value = '';
+  S.sandbox.readSettingsInto();
+  assert.strictEqual(S.refs.LG.config.maxTools, 128, '留空应写默认 128');
+
+  // ③ 填具体数字 → 原样写回
+  $('#stMaxTools').value = '64';
+  S.sandbox.readSettingsInto();
+  assert.strictEqual(S.refs.LG.config.maxTools, 64, '填了 64 就必须是 64');
+});
+
+t('渲染层（设置页）：工具裁剪上限越界必须拦下；开关关闭时不该因为上限框报错', () => {
+  const S = makeSandbox();
+  loadSettings(S);
+  const $ = S.sandbox.$;
+  S.refs.LG.config = { port: 3091, providers: [] };
+  S.refs.LG.renders.settings();
+
+  // 关闭状态下，上限框是置灰的，填了什么都无效 —— 不能因此拦住保存
+  $('#stMaxToolsOn').checked = false;
+  $('#stMaxTools').value = 'abc';
+  assert.strictEqual(S.sandbox.validateSettingsInput(), '', '开关关闭时不得因为上限框报错');
+
+  $('#stMaxToolsOn').checked = true;
+  for (const bad of ['0', '-1', '2.5', 'abc', '2001']) {
+    $('#stMaxTools').value = bad;
+    assert.ok(/工具裁剪上限/.test(S.sandbox.validateSettingsInput()), `"${bad}" 必须被拒`);
+  }
+  $('#stMaxTools').value = '2000';
+  assert.strictEqual(S.sandbox.validateSettingsInput(), '', '2000 是合法上界');
+  $('#stMaxTools').value = '';
+  assert.strictEqual(S.sandbox.validateSettingsInput(), '', '留空合法（= 128）');
+});
+
+
