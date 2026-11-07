@@ -164,7 +164,13 @@
         </div>
 
         <div class="card">
-          <div class="card-head"><h2>账户池与冷却</h2><button class="btn btn-ghost" id="btnRefreshHealth">刷新</button></div>
+          <div class="card-head">
+            <h2>账户池与冷却</h2>
+            <div class="head-actions">
+              <button class="btn btn-ghost" id="btnResetCooldowns" title="清空所有冷却/熔断状态，让被限制的供应商立刻可以再试">恢复</button>
+              <button class="btn btn-ghost" id="btnRefreshHealth">刷新</button>
+            </div>
+          </div>
           <div id="healthBox"><div class="empty">网关未运行，暂无数据。</div></div>
         </div>
       </section>
@@ -391,6 +397,35 @@
             <li><code>GET /v1/models</code> · <code>GET /health</code></li>
           </ul>
           <p class="hint block">同一模型可配多家上游：按 priority 路由 + 自动故障切换 + 分级熔断 + 账户池轮换 + SSE 透传 + 密钥打码，三种协议行为一致。</p>
+        </div>
+        <div class="card help-about">
+          <div class="card-head"><h2>关于与许可</h2></div>
+          <div class="about-rows">
+            <div class="about-row">
+              <span class="about-k">程序</span>
+              <span class="about-v"><b>LLM Gateway</b> <span class="mono" id="helpVer"></span> —— 跑在本机的多协议 LLM 网关：OpenAI Chat / OpenAI Responses / Anthropic Messages 三种协议互转，按优先级路由、自动故障切换、分级熔断与账户池轮换。</span>
+            </div>
+            <div class="about-row">
+              <span class="about-k">版权说明</span>
+              <span class="about-v">© 2026 <b>LLM Gateway contributors</b>（作者 xuxue04403）。本程序及其源代码、界面与文档的著作权归作者所有；界面中出现的第三方模型名称与商标归各自所有者。</span>
+            </div>
+            <div class="about-row">
+              <span class="about-k">许可协议</span>
+              <span class="about-v"><b>MIT License</b> —— 允许自由使用、修改、分发，也允许商用，唯一条件：保留版权声明与许可声明。
+                完整条文见 <a href="https://github.com/xuxue04403/llm-gateway/blob/main/LICENSE" target="_blank" rel="noopener">LICENSE</a>，或程序目录下的 <code>LICENSE</code> 文件。</span>
+            </div>
+            <div class="about-row">
+              <span class="about-k">项目地址</span>
+              <span class="about-v"><a href="https://github.com/xuxue04403/llm-gateway" target="_blank" rel="noopener">github.com/xuxue04403/llm-gateway</a></span>
+            </div>
+            <div class="about-row">
+              <span class="about-k">问题反馈</span>
+              <span class="about-v"><a href="https://github.com/xuxue04403/llm-gateway/issues" target="_blank" rel="noopener">github.com/xuxue04403/llm-gateway/issues</a>　（欢迎附上「日志」页里的 <code>[route]</code> / <code>[call]</code> 行，定位会快很多）</span>
+            </div>
+          </div>
+          <p class="hint block about-note">本程序按「现状」（AS IS）提供，不附带任何明示或暗示的担保，包括但不限于适销性、特定用途适用性与非侵权担保；作者不对使用本程序造成的任何直接或间接损失负责。
+            各上游模型服务另有自己的服务条款与计费规则，使用前请自行确认。</p>
+          <p class="about-copy">© 2026 LLM Gateway contributors · LLM Gateway · MIT License</p>
         </div>
       </section>
 

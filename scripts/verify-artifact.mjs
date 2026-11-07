@@ -272,6 +272,10 @@ if (JSON_OUT) {
     console.log('\n修复方向：');
     console.log('  · 产物与源码不一致 / 构建陈旧 → 重新构建：npm run pack && node scripts/build-portable.mjs ' + OUT_NAME);
     console.log('  · 工作区有未提交改动          → 先提交，再发布（发布必须可复现到某个 HEAD）');
+  } else if (NO_GIT) {
+    // ⚠ 2026-11-05：这里原先不分情况地喊"源码已提交到 HEAD"。加了 --no-git 时那句是**假的**，
+    // 而这句话正是发布前最后一眼看到的东西 —— 说假话比不说更糟，所以分开打印。
+    console.log('\n✓ 产物 == 源码（已跳过 git 检查，**未**验证"源码 == HEAD"）。');
   } else {
     console.log('\n✓ 三方一致：产物就是当前源码，且源码已提交到 HEAD —— 可以发布。');
   }

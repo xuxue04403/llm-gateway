@@ -273,11 +273,172 @@ function getJson(urlStr, opts) {
   });
 }
 
+// ── 失败归因 ────────────────────────────────────────────────────────────────
+//
+// 「测试」按钮要回答的其实是三个**不同**的问题：
+//   ① 这台机器能不能连上这家（网络/代理）；
+//   ② 这把凭据能不能用（401/403）；
+//   ③ 这个模型对这个账号能不能用（模型级/策略级限制）。
+// 旧实现只分"通/不通"，把 ②③ 和限流全都算成"凭据不可用"，于是把**能用**的家报成红的。
+// 实测（2026-11-03 用户反馈 + 逐家复核）：
+//   · sensenova：两把 Key 都回 `429 inference exceeds tpm/rpm limit` —— Key 明明是好的，
+//     只是被限流了；报成"2 把被拒"会让用户去换 Key，方向完全错；
+//   · cline：`403 … is only available via Cline product surfaces` —— 产品面限制，与凭据无关；
+//   · x666 / windhub：`503 No available channel for model X under group Y` ——
+//     该模型在这个账号的分组里没有渠道，**同一家的别的模型照样能用**（实测 37/37 成功）；
+//   · 本机代理没开时：`connect ECONNREFUSED 127.0.0.1:7890` —— 是本机环境问题，
+//     与供应商毫无关系，却被打成"连不上（代理）"的红色结论。
+// 这四类必须分开说，否则"测试"比不测更误导。
+const RATE_LIMIT_RE = /(?:\b429\b|rate limit|rate-limit|tpm|rpm|too many requests|concurrenc|exceeds .{0,24}limit|限流|请求过于频繁)/i;
+const MODEL_SCOPED_RE = new RegExp([
+  'not found for account',
+  'not found for',
+  'model.*not.*(?:support|available|found)',
+  'no available channel',            // new-api / one-api 系：分组里没有这个模型的渠道
+  'under group',
+  'free tier',
+  'contributor',
+  'only available via',              // cline：只在自家产品面可用
+  'product surface',
+  'not available in the current token plan',  // sensenova 系：当前套餐不含该模型
+  'deprecated',
+  'ModelDeprecated',
+  'ModelProtocolUnsupported',
+  'MissingSessionID',
+].join('|'), 'i');
+// 代理连不上：这是**本机**的事，绝不能算到供应商头上。
+const PROXY_DOWN_RE = /连接代理失败|连接代理超时|代理拒绝 CONNECT|代理地址无法解析/;
+
+/**
+ * 这次失败是不是"代理那条腿断了"。
+ *
+ * ⚠ 判据的核心是：**走代理时，TCP 连的是代理**，所以 `ECONNREFUSED`/`ETIMEDOUT`
+ * 这类传输层错误必然是代理侧的问题（代理开着但目标不通时，代理会回一个 HTTP 502，
+ * 那种情况有 status，不会走到这里）。旧实现只认自造的"连接代理失败"文案，
+ * 于是 http 目标走代理失败时会包装成一句 `connect ECONNREFUSED 127.0.0.1:7890`，
+ * 被判成"供应商连不上"（实测 2026-11-03）。
+ */
+/**
+ * 「代理侧自己就连不上」的判据（与"代理通了、目标没回话"必须分开）。
+ *
+ * 2026-11-03 实测踩坑：nvidia 走代理时**探测超时**，旧判据把任何传输层错误都算
+ * `proxyDown`，界面于是写「本机代理连不上 … 把代理开起来再测」—— 而代理明明是好的，
+ * 用户被指去修一个没坏的东西。区分办法：
+ *   · 连接代理本身被拒 / 代理拒绝 CONNECT / 代理地址解析不了 → **代理挂了**；
+ *   · 隧道建好之后超时、被 RST、TLS 握手失败 → **上游/链路的问题**，代理没坏。
+ */
+function proxyLinkDown(errorText) {
+  const s = String(errorText || '');
+  if (PROXY_DOWN_RE.test(s)) return true;
+  return /ECONNREFUSED|EAI_AGAIN|ENOTFOUND/i.test(s);
+}
+
+function isProxyFailure(r) {
+  if (!r || r.via !== '代理' || r.status) return false;
+  return proxyLinkDown(r.error);
+}
+
+/** 把一次失败的生成请求归因：conn / proxy / rate / model / cred / pay / busy / limit / other。 */
+function classifyGenFailure(status, blob, via) {
+  const s = String(blob || '');
+  const code = Number(status) || 0;
+  // 走代理时：只有"代理侧自己连不上"才算 proxy，隧道通了之后的超时/RST 算 conn。
+  // 直连时 ECONNREFUSED 是目标端口不通，仍是 conn。文案自带"连接代理失败"的直接认。
+  if (!status) return (PROXY_DOWN_RE.test(s) || (via === '代理' && proxyLinkDown(s))) ? 'proxy' : 'conn';
+  // 试生成被"输出额度"卡住 —— 这是我们发 `max_tokens:16` 的副作用（带推理的模型会把它
+  // 全花在思考上），不是凭据问题，也不是渠道问题。必须排在 429/模型级之前判，
+  // 因为上游常把它写在 400 里，旧实现会落到 `upstream` → 整家报红。
+  if (/max_tokens or model output limit|max_output_tokens|model output limit was reached/i.test(s)) return 'limit';
+  if (code === 429 || RATE_LIMIT_RE.test(s)) return 'rate';
+  // 模型级限制要排在 401/403 之前：上游常把"这个模型对你的套餐不可用"写成 403
+  //（实测 cline `only available via Cline product surfaces`、sensenova `model is not
+  // available in the current token plan`）—— 判成凭据问题会让人白换 Key。
+  if (MODEL_SCOPED_RE.test(s)) return 'model';
+  // 凭据类：401/403 且没有命中模型级文案 → 这才是"该换 Key"。
+  if (code === 401 || code === 403) return 'cred';
+  // 402 / 余额为 0 / 额度耗尽 —— 真·用不了（换 Key 或充值才解决），判红是对的。
+  if (code === 402 || /insufficient balance|insufficient credit|quota exceeded|exceeded your current quota|余额不足|额度已用尽|欠费/i.test(s)) return 'pay';
+  // 5xx / "繁忙"：上游过载、维护、临时无渠道 —— 换一刻钟再试就好，不能判成"这家不可用"。
+  // 实测 gemini 2026-11-03：503 `This model is currently experiencing high demand`。
+  if (code >= 500 || /high demand|overloaded|temporarily unavailable|service unavailable|try again later|请稍后重试/i.test(s)) return 'busy';
+  return 'other';
+}
+
+/** 每种归因对应的一句人话（`ok` 语义：true 可用 / false 不可用 / null 判不出来）。 */
+function kindOfGen(kind) {
+  if (kind === 'rate') return { ok: null, label: '被限流（TPM/RPM）' };
+  if (kind === 'model') return { ok: null, label: '该模型对这个账号不可用' };
+  if (kind === 'proxy') return { ok: null, label: '本机代理连不上' };
+  if (kind === 'conn') return { ok: null, label: '连接失败' };
+  if (kind === 'limit') return { ok: null, label: '试生成被输出额度卡住（模型把 token 花在推理上）' };
+  if (kind === 'busy') return { ok: null, label: '上游繁忙/临时故障' };
+  if (kind === 'other') return { ok: null, label: '没看懂原因的拒绝（请以真实调用为准）' };
+  if (kind === 'pay') return { ok: false, label: '余额/额度不足' };
+  return { ok: false, label: '凭据被上游拒绝' };
+}
+
+/**
+ * 多 Key 体检结果的聚合（纯函数 —— 逻辑都在这里，主进程只负责发请求）。
+ *
+ * ⚠ 必须分清三档，否则会把能用的家报成红的（实测 2026-11-03）：
+ *   · `ok === true`  —— 真的出字了；
+ *   · `ok === false` —— 上游**因凭据**拒绝（401/403 之类）→ 这才是"该换 Key"；
+ *   · `ok === null`  —— 判不出来：限流（429 tpm/rpm）、模型级限制、本机代理没开、超时。
+ * sensenova 现场：两把 Key 都回 `429 inference exceeds tpm/rpm limit`，
+ * 旧实现归到"被拒"→ 界面写「0 把可用于生成，2 把被拒」→ 用户去换 Key 换到天亮也没用。
+ *
+ * @param {number} total  Key 总数
+ * @param {Array} rows    每把的结果 [{index,status,ms,ok,kind,err,skipped}]
+ * @param {number|null} modelCount 目录里的模型数（可为 null）
+ * @returns {{ok: boolean|null, keySummary: string, verdict: string}}
+ */
+function summarizeKeyResults(total, rows, modelCount) {
+  const tested = (Array.isArray(rows) ? rows : []).filter((x) => x && !x.skipped);
+  const good = tested.filter((x) => x.ok === true);
+  const bad = tested.filter((x) => x.ok === false);
+  const throttled = tested.filter((x) => x.ok === null && x.kind === 'rate');
+  const unknown = tested.filter((x) => x.ok === null && x.kind !== 'rate');
+  const list = (arr) => arr.map((x) => x.index).join('、');
+  const parts = [`${total} 把 Key：${good.length} 把可用于生成`];
+  if (throttled.length) parts.push(`${throttled.length} 把被限流（第 ${list(throttled)} 把：${throttled[0].err || 'TPM/RPM'}）`);
+  if (bad.length) parts.push(`${bad.length} 把被拒（第 ${list(bad)} 把：${bad[0].err || 'HTTP ' + bad[0].status}）`);
+  if (unknown.length) parts.push(`${unknown.length} 把无法判定（第 ${list(unknown)} 把：${unknown[0].err || '连接失败'}）`);
+  const keySummary = parts.join('，');
+  const catalog = modelCount === null || modelCount === undefined ? '?' : modelCount;
+
+  if (good.length) {
+    return { ok: true, keySummary, verdict: `凭据可用于生成（${keySummary}）；目录 ${catalog} 个模型` };
+  }
+  if (!bad.length && throttled.length && !unknown.length) {
+    // 全部只是被限流：限流是**用量**问题，不是凭据坏了，也不是渠道坏了。
+    return {
+      ok: null, keySummary,
+      verdict: `**${total} 把 Key 全部被限流**（TPM/RPM 或并发上限），不是凭据问题 —— 过一两分钟再测，或降低并发`,
+    };
+  }
+  if (!bad.length) {
+    return {
+      ok: null, keySummary,
+      verdict: `无法判定这几把 Key 是否可用（${keySummary}）—— 多是限流/连接/模型级限制，请以网关日志里的真实调用为准`,
+    };
+  }
+  // 有 Key 被拒，但另外几把没测出结果（超时/限流/模型级）→ 只能说"这几把里有坏的"，
+  // 不能断言"整家不可用"。实测 nvidia（2026-11-03）：4 把里 2 把 403、2 把超时，
+  // 报成整家红是过度断言。
+  if (throttled.length || unknown.length) {
+    return {
+      ok: null, keySummary,
+      verdict: `**有 Key 确实被拒，但整家还不能判死** —— ${keySummary}。先把被拒的换掉，剩下的过一会儿再测`,
+    };
+  }
+  return { ok: false, keySummary, verdict: `**${total} 把 Key 都无法生成** —— ${keySummary}` };
+}
+
 /**
  * 探测一个供应商是否可达 + 凭据是否被接受。
  *
  * @param {object} provider - 网关配置里的供应商条目
- * @param {object} ctx - { proxy, noProxy[], timeoutMs }
+ * @param {object} ctx - { proxy, noProxy[], timeoutMs, genModel, genModels[], deepProbe, headers, genTimeoutMs }
  * @returns {Promise<object>} 结构化结果（含人话结论）
  */
 async function probeProvider(provider, ctx) {
@@ -355,6 +516,16 @@ async function probeProvider(provider, ctx) {
   });
 
   if (!res.status) {
+    // 代理自己连不上 ≠ 供应商不可用。这类结论必须给 **null**（界面黄色"判不出来"），
+    // 否则用户会以为渠道坏了，去改配置、换 Key，全都没用 —— 真正要做的只是把代理开起来。
+    if (isProxyFailure(res)) {
+      return {
+        id, ok: null, via: res.via, ms: res.ms, baseUrl: base, proxyDown: true,
+        verdict: `本机代理连不上（${res.error}）—— 这是**本机网络环境**问题，不代表这家不可用：`
+          + '代理没启动/端口写错/被防火墙挡住时都会这样。把代理开起来（或在这家条目里勾"直连"）再测一次。',
+        hint: '检查「设置 → 网络代理」里的地址与端口，或在本供应商条目里声明 proxy:false 直连',
+      };
+    }
     return {
       id, ok: false, via: res.via, ms: res.ms,
       baseUrl: base,
@@ -382,8 +553,9 @@ async function probeProvider(provider, ctx) {
     verdict = `HTTP 404 —— 该地址没有 /models 端点（有些中转不提供）；**这不一定代表不可用**，请以网关日志里的真实调用结果为准`;
     ok = null;
   } else if (res.status >= 500) {
-    verdict = `上游故障（HTTP ${res.status}）`;
-    ok = false;
+    // 目录端点 5xx 通常是临时过载/维护：判"判不出来"，别让一次抖动就把整家标红。
+    verdict = `上游故障（HTTP ${res.status}）—— 多半是临时的（过载/维护），过几分钟再测`;
+    ok = null;
   } else if (res.ok) {
     verdict = modelCount === null
       ? `可达（HTTP ${res.status}，${res.ms}ms）`
@@ -408,49 +580,105 @@ async function probeProvider(provider, ctx) {
   //     `space-bunny-free` 实测 200，属于**免费层的客户端校验**，同样与凭据无关。
   // 拿这种结果去判"这家不可用"，会比不测**更误导**。
   //
-  // 所以：**只用调用方显式给的模型**（`o.genModel`，通常取该供应商配置里已声明的
-  // 上游模型 ID —— 那是用户已经验证过能用的），拿不到就**不做**试生成。
-  const genModelId = String(o.genModel || '').trim();
+  // 所以：**只用调用方显式给的模型**（`o.genModel` / `o.genModels[]`，通常取该供应商
+  // 配置里已声明的上游模型 ID —— 那是用户已经验证过能用的），拿不到就**不做**试生成。
+  //
+  // ⚠ 2026-11-03 追加：**第一个模型不可用 ≠ 这家不可用**。
+  // 实测 x666：声明的第一个模型 `deepseek-v4.1-flash` 回
+  // `503 No available channel for model … under group level3`（该分组没这个渠道），
+  // 而这家在真实流量里 37 次调用**全部成功**（走的是别的模型）。
+  // 所以遇到"模型级"失败时，把配置里其余已声明模型再试一两个：
+  // 只要有一个能出字，这家的凭据就是好的 —— 用户需要知道的是"这家能用、那个模型不行"。
+  const genCandidates = (() => {
+    const first = String(o.genModel || '').trim();
+    const rest = Array.isArray(o.genModels)
+      ? o.genModels.map((m) => String(typeof m === 'string' ? m : (m && (m.id || m.up)) || '').trim()).filter(Boolean)
+      : [];
+    const all = [first, ...rest].filter(Boolean);
+    return [...new Set(all)].slice(0, 3);   // 最多试 3 个，别把 90 秒预算吃光
+  })();
+  const genTried = [];
   let gen = null;
-  if (res.ok && o.deepProbe !== false && genModelId) {
+  if (res.ok && o.deepProbe !== false && genCandidates.length) {
     const path = genPathFor(provider);
-    const r2 = await getJson(base + path, {
-      method: 'POST',
-      body: genBodyFor(provider, path, genModelId),
-      headers: Object.assign({}, o.headers || {}, { 'content-type': 'application/json' }),
-      apiKey: key,
-      proxy: directOnly ? null : o.proxy,
-      noProxy: o.noProxy || [],
-      // 生成比目录慢得多（nvidia 实测 25–29 秒），给足时间；仍受"整体墙钟"兜底保护
-      timeoutMs: o.genTimeoutMs || 45000,
-      limit: 256 * 1024,
-    });
-    const detail = extractUpstreamError(r2.body);
-    gen = { path, model: genModelId, status: r2.status, ms: r2.ms, ok: r2.ok, body: String(r2.body || r2.error || '').slice(0, 200), via: r2.via, detail };
+    for (const genModelId of genCandidates) {
+      // eslint-disable-next-line no-await-in-loop
+      const r2 = await getJson(base + path, {
+        method: 'POST',
+        body: genBodyFor(provider, path, genModelId),
+        headers: Object.assign({}, o.headers || {}, { 'content-type': 'application/json' }),
+        apiKey: key,
+        proxy: directOnly ? null : o.proxy,
+        noProxy: o.noProxy || [],
+        // 生成比目录慢得多（nvidia 实测 25–29 秒），给足时间；仍受"整体墙钟"兜底保护
+        timeoutMs: o.genTimeoutMs || 45000,
+        limit: 256 * 1024,
+      });
+      const detail = extractUpstreamError(r2.body);
+      const blob = String(r2.body || '') + ' ' + String(r2.error || '');
+      const kind = r2.ok ? 'ok' : classifyGenFailure(r2.status, blob, r2.via);
+      genTried.push({ model: genModelId, status: r2.status, ms: r2.ms, kind, detail });
+      gen = { path, model: genModelId, status: r2.status, ms: r2.ms, ok: r2.ok, body: String(r2.body || r2.error || '').slice(0, 200), via: r2.via, detail, kind };
 
-    // 分类：**凭据问题**才算 ok=false；**模型/策略问题**只能判"不确定"。
-    // 这个区分是这次修复的核心 —— 旧实现只有"通/不通"，把模型级问题也算到凭据头上。
-    const blob = String(r2.body || '') + ' ' + String(r2.error || '');
-    const modelScoped = /not found for account|not found for|model.*not.*(support|available|found)|free tier|contributor|deprecated|ModelDeprecated|ModelProtocolUnsupported|MissingSessionID/i.test(blob);
-    if (r2.ok) {
-      ok = true;
-      verdict = `凭据可用于生成（目录 ${modelCount === null ? '?' : modelCount} 个模型；试生成 ${genModelId} 成功，HTTP ${r2.status}，${r2.ms}ms）`;
-    } else if (!r2.status) {
-      ok = null;
-      verdict = `目录可读（HTTP ${res.status}）但**试生成超时/连接失败**（${r2.via}）：${r2.error} —— 无法据此判断凭据好坏，请以网关日志里的真实调用为准`;
-    } else if (modelScoped) {
-      ok = null;
-      verdict = `目录可读、凭据格式有效；试生成 ${genModelId} 被拒（HTTP ${r2.status}）：${detail}`
-        + ' —— 这看着是**该模型对这个账号/这条链路**的限制，**不是凭据问题**';
-    } else {
-      ok = false;
-      verdict = `目录可读（HTTP ${res.status}）但**试生成被拒**（HTTP ${r2.status}）：${detail}`;
+      if (r2.ok) {
+        ok = true;
+        const others = genTried.slice(0, -1).map((t) => `${t.model}（${t.kind === 'model' ? '该模型不可用' : 'HTTP ' + t.status}）`);
+        verdict = `凭据可用于生成（目录 ${modelCount === null ? '?' : modelCount} 个模型；试生成 ${genModelId} 成功，HTTP ${r2.status}，${r2.ms}ms）`
+          + (others.length ? ` —— 注意：${others.join('、')} 用不了，与凭据无关` : '');
+        break;
+      }
+
+      // 模型级失败 → 换下一个已声明模型再试；限流/网络/凭据问题换模型也没用，立刻停。
+      if (kind === 'model' && genTried.length < genCandidates.length) {
+        verdict = `试生成 ${genModelId} 是模型级限制（HTTP ${r2.status}：${detail}），换下一个已声明模型再试…`;
+        continue;
+      }
+
+      if (kind === 'rate') {
+        ok = null;
+        verdict = `目录可读、凭据有效，但试生成 ${genModelId} **被限流**（HTTP ${r2.status}：${detail}）`
+          + ' —— 这是 TPM/RPM 或并发上限，**不是凭据问题**，过一两分钟单独重测这一家即可';
+      } else if (kind === 'model') {
+        ok = null;
+        verdict = `目录可读、凭据格式有效；试生成 ${genModelId} 被拒（HTTP ${r2.status}）：${detail}`
+          + ' —— 这看着是**该模型对这个账号/这条链路**的限制，**不是凭据问题**'
+          + (genCandidates.length > 1 ? '（配置里声明的模型都试过了）' : '；建议在编辑抽屉里换一个该账号能用的模型');
+      } else if (kind === 'proxy') {
+        ok = null;
+        verdict = `目录可读（HTTP ${res.status}）但试生成时**本机代理连不上**：${r2.error}`
+          + ' —— 这是**本机网络环境**问题，不等于凭据不可用；把代理开起来再测';
+      } else if (kind === 'conn') {
+        ok = null;
+        verdict = `目录可读（HTTP ${res.status}）但**试生成超时/连接失败**（${r2.via}）：${r2.error} —— 无法据此判断凭据好坏，请以网关日志里的真实调用为准`;
+      } else if (kind === 'limit') {
+        // 上游把错误写成"max_tokens 到了"：是我们自己发的 body 太抠（带推理的模型
+        // 会把 16 个 token 全花在思考上）。这不是凭据问题，也不是渠道问题。
+        ok = null;
+        verdict = `目录可读、凭据有效；试生成 ${genModelId} 回了「输出额度到顶」（HTTP ${r2.status}：${detail}）`
+          + ' —— 这是**探测请求本身太小**（带推理的模型把 token 花在思考上），不是凭据或渠道问题；'
+          + '请以网关日志里的真实调用为准';
+      } else if (kind === 'busy') {
+        ok = null;
+        verdict = `目录可读，但试生成时**上游繁忙/临时故障**（HTTP ${r2.status}：${detail}）`
+          + ' —— 这类 5xx 通常是过载或维护，与凭据无关，过几分钟再测一次';
+      } else if (kind === 'other') {
+        ok = null;
+        verdict = `目录可读，但试生成被拒（HTTP ${r2.status}：${detail}）—— 这条拒绝没看懂属于哪一类，`
+          + '**不据此判这家不可用**，请以网关日志里的真实调用结果为准';
+      } else if (kind === 'pay') {
+        ok = false;
+        verdict = `目录可读，但试生成被拒（HTTP ${r2.status}：${detail}）—— 这家**余额/额度不足**，充值或换 Key 才能用`;
+      } else {
+        ok = false;
+        verdict = `目录可读（HTTP ${res.status}）但**试生成被拒**（HTTP ${r2.status}）：${detail}`;
+      }
+      break;
     }
   }
 
   return {
     id, ok, via: res.via, ms: res.ms, status: res.status, baseUrl: base,
-    modelCount, sample, verdict, gen,
+    modelCount, sample, verdict, gen, genTried,
   };
 }
 
@@ -464,8 +692,15 @@ function genPathFor(provider) {
 
 /** 试生成的最小请求体（按端点形状给，尽量便宜：1 个 token）。 */
 function genBodyFor(provider, path, model) {
+  // ⚠ `max_tokens` 不能是 1（2026-11-03 实测 agentrouter）。
+  // 带推理的模型（thinking / reasoner）会把这 1 个 token 花在推理上，正文被截断，
+  // 上游回 **HTTP 400 `Could not finish the message because max_tokens or model output
+  // limit was reached.`** —— 那是**我们自己发的 body 太抠**，不是凭据坏了、也不是渠道坏了。
+  // 实测：agentrouter 两把 Key 因此被报成「2 把被拒」，而它的真实调用 137/140 成功。
+  // 16 个 token 的成本可以忽略，却能让这类模型正常吐字。
+  const probeMaxTokens = 16;
   if (path === '/messages') {
-    return { model, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] };
+    return { model, max_tokens: probeMaxTokens, messages: [{ role: 'user', content: 'hi' }] };
   }
   if (path === '/responses') {
     // ⚠ `input` 必须是**数组**。标准 Responses API 两种都收（字符串会被当成一条用户消息），
@@ -484,7 +719,7 @@ function genBodyFor(provider, path, model) {
       stream: true,
     };
   }
-  return { model, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] };
+  return { model, max_tokens: probeMaxTokens, messages: [{ role: 'user', content: 'hi' }] };
 }
 
 /**
@@ -495,10 +730,13 @@ function genBodyFor(provider, path, model) {
 function extractUpstreamError(bodyText) {
   const s = String(bodyText || '').replace(/\s+/g, ' ').trim();
   if (!s) return '(上游未给原因)';
+  // ⚠ 有些上游把 message 写成**对象**（例如 amd 的 429：`{"error":{"message":{...}}}`）。
+  // 直接 join 会得到 `[object Object]`，界面上一句人话都不是（2026-11-03 实测）。
+  const str = (v) => (typeof v === 'string' ? v : (v && typeof v === 'object' ? JSON.stringify(v) : (v == null ? '' : String(v))));
   try {
     const j = JSON.parse(s);
-    const cand = (j && (j.detail || (j.error && (j.error.message || j.error.type)) || j.message || j.title)) || '';
-    const title = (j && j.title) || '';
+    const cand = str((j && (j.detail || (j.error && (j.error.message || j.error.type)) || j.message || j.title)) || '');
+    const title = str((j && j.title) || '');
     const parts = [title, cand].filter(Boolean).filter((x, i, a) => a.indexOf(x) === i);
     if (parts.length) return parts.join(' — ').slice(0, 160);
   } catch (_) { /* 不是 JSON：下面回原文 */ }
@@ -529,11 +767,16 @@ async function probeOneKeyGen(provider, ctx) {
     limit: 256 * 1024,
   });
   const detail = extractUpstreamError(r.body || r.error);
-  if (r.ok) return { ok: true, status: r.status, ms: r.ms, detail: '' };
-  if (!r.status) return { ok: null, status: 0, ms: r.ms, detail: r.error || '连接失败' };
+  if (r.ok) return { ok: true, status: r.status, ms: r.ms, detail: '', kind: 'ok' };
   const blob = String(r.body || '') + ' ' + String(r.error || '');
-  const modelScoped = /not found for account|not found for|model.*not.*(support|available|found)|free tier|contributor|deprecated|ModelProtocolUnsupported|MissingSessionID/i.test(blob);
-  return { ok: modelScoped ? null : false, status: r.status, ms: r.ms, detail, body: String(r.body || '').slice(0, 200) };
+  const kind = classifyGenFailure(r.status, blob, r.via);
+  const ko = kindOfGen(kind);
+  // `ok:null` 表示"判不出来 / 不是凭据的事"（限流、模型级限制、本机代理、连接失败），
+  // 与 `ok:false`（上游明确因凭据拒绝）必须分开 —— 多 Key 聚合时全靠这个区分。
+  return {
+    ok: ko.ok, status: r.status, ms: r.ms, detail, kind, label: ko.label,
+    body: String(r.body || r.error || '').slice(0, 200),
+  };
 }
 
 /**
@@ -606,4 +849,7 @@ function codexProbeHeaders(cred) {
   };
 }
 
-module.exports = { probeProvider, getJson, upstreamBase, hostInList, connectViaProxy, extractUpstreamError, genPathFor, probeOneKeyGen, readCodexCredForProbe };
+module.exports = {
+  probeProvider, getJson, upstreamBase, hostInList, connectViaProxy, extractUpstreamError,
+  genPathFor, probeOneKeyGen, readCodexCredForProbe, classifyGenFailure, kindOfGen, summarizeKeyResults,
+};

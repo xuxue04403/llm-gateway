@@ -513,6 +513,13 @@ function registerIpc() {
       if (a === 'get-config') return { ok: true, text: gateway.configText() };
       if (a === 'load-example') return { ok: true, text: gateway.exampleText() };
       if (a === 'clear-log') { gateway.clearLog(); return { ok: true }; }
+      // 一键恢复（2026-10-29）：把引擎里所有冷却/熔断状态清空。
+      // 网关没运行时**不能**假装成功：那些状态在引擎进程内存里，而进程已经没了 ——
+      // 下次启动本来就是干净的。"什么都没做却回 ok"会让用户以为按钮坏了。
+      if (a === 'reset-cooldowns') {
+        if (!gateway.running) return { ok: false, error: '网关未运行（冷却状态在网关进程内存里，进程没了就是干净的，无需恢复）' };
+        return await gateway.resetCooldowns();
+      }
       return { ok: false, error: '未知动作：' + a };
     } catch (e) {
       return { ok: false, error: e && e.message ? e.message : String(e) };
@@ -653,7 +660,10 @@ function registerIpc() {
       // 而不是目录里第一个 —— 后者常常是"这个账号根本无权访问"的模型，
       // 拿它试会得出假失败（实测 nvidia 的 01-ai/yi-large、opencode-zen 的 big-pickle）。
       const declared = Array.isArray(p.models) ? p.models : [];
-      const genModel = (declared.map((m) => (typeof m === 'string' ? m : (m && (m.id || m.up)))).filter(Boolean))[0] || '';
+      const declaredModels = declared
+        .map((m) => (typeof m === 'string' ? m : (m && (m.id || m.up))))
+        .filter(Boolean);
+      const genModel = declaredModels[0] || '';
       // eslint-disable-next-line no-await-in-loop
       const r = await probe.probeProvider(p, {
         proxy,
@@ -662,6 +672,9 @@ function registerIpc() {
         // 预算不够、或这家没声明任何模型 → 不做试生成（结论里会标注"未验证生成"）
         deepProbe: doGen && !!genModel,
         genModel,
+        // 第一个声明模型不可用≠这家不可用（实测 x666：首个模型回"分组里没有这个渠道"，
+        // 而这家真实流量 37/37 全成功）。把其余已声明模型也给它，由 probe 决定要不要换着试。
+        genModels: declaredModels,
         genTimeoutMs: Math.max(GEN_MIN_MS, Math.min(GEN_TIMEOUT_MS, remaining - 2000)),
         // 必须带上仿真头：有些上游（如 cline）不带自家头一律 403，
         // 用它做探测会把能用的家报成失败。
@@ -689,6 +702,9 @@ function registerIpc() {
         ? p.apiKeys.map((k) => String(k || '').trim()).filter(Boolean)
         : [];
       if (r && r.gen && keys.length > 1) {
+        // 逐把体检用**刚刚验证过能出字**的那个模型：上面 probe 可能在模型级失败后换过模型，
+        // 拿第一个声明模型逐把打分会让每家都变成"模型级不可用"（凭据好坏反而看不出来）。
+        const keyGenModel = (r.gen && r.gen.ok && r.gen.model) ? r.gen.model : genModel;
         const perKey = [];
         for (let ki = 0; ki < keys.length; ki++) {
           // 每把都做一次最小生成；预算见底就停手并如实标注
@@ -696,28 +712,33 @@ function registerIpc() {
           const pOne = Object.assign({}, p, { apiKey: keys[ki], apiKeys: undefined });
           // eslint-disable-next-line no-await-in-loop
           const g = await probe.probeOneKeyGen(pOne, {
-            key: keys[ki], model: genModel, path: probe.genPathFor(p),
+            key: keys[ki], model: keyGenModel, path: probe.genPathFor(p),
             proxy, noProxy, headers: clientHeaders.probeHeaders(cfg, p, keys[ki]),
             timeoutMs: Math.max(GEN_MIN_MS, Math.min(GEN_TIMEOUT_MS, BUDGET_MS - (Date.now() - startedAt) - 2000)),
           });
-          perKey.push({ index: ki + 1, status: g.status, ms: g.ms, ok: g.ok, err: g.detail || '' });
+          perKey.push({ index: ki + 1, status: g.status, ms: g.ms, ok: g.ok, kind: g.kind, err: g.detail || '' });
         }
-        const good = perKey.filter((x) => x.ok === true).length;
-        const bad = perKey.filter((x) => x.ok === false);
+        // 分档聚合交给 probe.summarizeKeyResults（纯函数、有回归用例）：
+        // 它区分"真的出字 / 凭据被拒 / 判不出来（限流·模型级·连接）"三档。
+        // 旧实现把限流也算"被拒"，sensenova 两把 Key 都撞 429 时界面写「2 把被拒」——
+        // 用户去换 Key 也换不出结果。
         r.perKey = perKey;
-        r.keySummary = `${keys.length} 把 Key：${good} 把可用于生成`
-          + (bad.length ? `，${bad.length} 把被拒（第 ${bad.map((x) => x.index).join('、')} 把：${bad[0].err || 'HTTP ' + bad[0].status}）` : '');
-        if (good === 0 && bad.length) {
-          r.ok = false;
-          r.verdict = `**所有 ${keys.length} 把 Key 都无法生成** —— ${r.keySummary}`;
-        } else if (good > 0) {
-          r.ok = true;
-          r.verdict = `凭据可用于生成（${r.keySummary}）；目录 ${r.modelCount === null ? '?' : r.modelCount} 个模型`;
-        }
+        const sum = probe.summarizeKeyResults(keys.length, perKey, r.modelCount);
+        r.ok = sum.ok;
+        r.keySummary = sum.keySummary;
+        r.verdict = sum.verdict;
       }
       results.push(r);
     }
-    return { ok: true, proxy: proxy || '', results };
+    // ⚠ 把**代理决策**一起回给界面。
+    //
+    // resolveProxy() 在"配置的代理连不上"时会**静默降级直连**（或换用自动探测到的代理）。
+    // 降级本身是对的（否则一个不存在的代理会让网关全局不可用），但探测结果会把
+    // "需要代理才能到的家"全报成"连不上（直连）" —— 用户看到一片红，自然以为渠道全挂。
+    // 实测（2026-11-03）：本机代理没启动时，agentrouter/x666/windhub/nvidia 四家齐刷刷
+    // 报"连不上"，而它们的真实调用成功率分别是 137/140、37/37、9/9 —— 全是假失败。
+    // 所以这里必须把"本次是直连还是走代理、为什么"如实带出去，由界面写在列表上方。
+    return { ok: true, proxy: proxy || '', proxyNote: gateway.proxyNote(), results };
   });
 
   // 拉取某个（可能是"还没保存的"）供应商的模型目录 —— 编辑抽屉里"拉取上游模型目录"用。

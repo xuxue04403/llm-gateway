@@ -1185,6 +1185,59 @@ class GatewayManager extends EventEmitter {
     return String((cfg && cfg.apiKey) || '').trim();
   }
 
+  /**
+   * 一键恢复：POST /reset-cooldowns（2026-10-29）。
+   *
+   * 走 HTTP 而不是"主进程直接改引擎内存"——引擎是**子进程**，主进程碰不到它的 Map。
+   * 这也是本项目一贯的口径：进程边界只用一个东西穿透，就是那个已经存在的小 HTTP 面。
+   *
+   * ⚠ 必须带统一 Key。该端点改状态，不像 `/health` 那样免鉴权（理由见引擎里的注释）。
+   * ⚠ `body` 空也要显式给 `content-length: 0`：不带长度且不带 chunked 的 POST 会让
+   *   Node 服务端一直等请求体，表现为"点了恢复，界面转圈到超时"。
+   *
+   * @returns {Promise<{ok:boolean, cleared?:object, error?:string}>}
+   */
+  resetCooldowns(timeoutMs = 6000) {
+    return new Promise((resolve) => {
+      const key = this.apiKey();
+      if (!key) return resolve({ ok: false, error: '配置里没有统一 Key，无法调用恢复接口' });
+      let req;
+      try {
+        req = http.request({
+          host: '127.0.0.1', port: this.port, path: '/reset-cooldowns', method: 'POST',
+          timeout: timeoutMs,
+          headers: {
+            'content-type': 'application/json',
+            'content-length': 0,
+            // 两种写法都给：引擎认 Bearer 也认 x-api-key（见 authorized()）
+            authorization: 'Bearer ' + key,
+            'x-api-key': key,
+          },
+        }, (res) => {
+          let body = '';
+          res.setEncoding('utf8');
+          res.on('data', (c) => { if (body.length < 64 * 1024) body += c; });
+          res.on('end', () => {
+            let parsed = null;
+            try { parsed = JSON.parse(body); } catch (_) { parsed = null; }
+            if (res.statusCode !== 200) {
+              const msg = (parsed && parsed.error && parsed.error.message) || ('HTTP ' + res.statusCode);
+              return resolve({ ok: false, error: msg });
+            }
+            if (!parsed || typeof parsed !== 'object') return resolve({ ok: false, error: '响应不是 JSON' });
+            resolve(parsed);
+          });
+          res.on('error', (e) => resolve({ ok: false, error: String(e && e.message) }));
+        });
+      } catch (e) {
+        return resolve({ ok: false, error: String((e && e.message) || e) });
+      }
+      req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: '恢复请求超时' }); });
+      req.on('error', (e) => resolve({ ok: false, error: String(e && e.message) }));
+      req.end();
+    });
+  }
+
   getState() {
     // port 用 **configPort()**（磁盘上的权威值）而不是 this.port（只在 _doStart 时更新）。
     // 旧写法下"停止状态下改了端口"，界面（概览的接入信息、复制出去的 Base URL）会继续显示

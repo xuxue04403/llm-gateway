@@ -1095,6 +1095,135 @@ let upstreamPort = 0;
     }
   });
 
+  t('网关：chat 上游的 prompt_tokens 含缓存 → 报给 Anthropic 客户端前必须减掉（否则命中率腰斩）', async () => {
+    // 2026-11-04 用户实测：真实命中 97%（账本 inTok=4386/缓存 4224）被显示成 **49%**。
+    //
+    // 根因：Anthropic 的 usage 是**三桶互斥**（input_tokens + cache_read + cache_creation
+    // = 总输入，客户端正是拿这三者算命中率）；而 OpenAI chat 的 `prompt_tokens`
+    // **包含** `prompt_tokens_details.cached_tokens`。直接把 prompt_tokens 当
+    // input_tokens 报出去，缓存段被算两遍 → 4224/(4386+4224) ≈ 49%。
+    //
+    // 这条用例同时守两个方向的错：
+    //   · 不减（旧行为）→ 报 1000，分母虚高；
+    //   · **减两次**（Anthropic 直通的 input_tokens 本身就不含缓存）→ 报 0。
+    const usageChat = { prompt_tokens: 1000, completion_tokens: 50, total_tokens: 1050, prompt_tokens_details: { cached_tokens: 900 } };
+    const upChat = http.createServer((q, s) => {
+      let b = '';
+      q.on('data', (c) => { b += c; });
+      q.on('end', () => {
+        if (!/"stream"\s*:\s*true/.test(b)) {
+          s.writeHead(200, { 'content-type': 'application/json' });
+          s.end(JSON.stringify({ id: 'c1', object: 'chat.completion', model: 'test-model', choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }], usage: usageChat }));
+          return;
+        }
+        s.writeHead(200, { 'content-type': 'text/event-stream' });
+        s.write('data: ' + JSON.stringify({ id: 'c1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { role: 'assistant', content: 'hi' } }] }) + '\n\n');
+        s.write('data: ' + JSON.stringify({ id: 'c1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: usageChat }) + '\n\n');
+        s.write('data: [DONE]\n\n');
+        s.end();
+      });
+    });
+    // Anthropic 原生上游：input_tokens 本身就不含缓存 —— 再加一遍减法就会变 0
+    const upAnth = http.createServer((q, s) => {
+      q.resume();
+      q.on('end', () => {
+        s.writeHead(200, { 'content-type': 'application/json' });
+        s.end(JSON.stringify({
+          id: 'msg_1', type: 'message', role: 'assistant', model: 'test-anth',
+          content: [{ type: 'text', text: 'hi' }], stop_reason: 'end_turn',
+          usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 900 },
+        }));
+      });
+    });
+    // 混合形状：2026-11-04 workbuddy → DeepSeek-V4.1-Flash 的**真实**返回。
+    // 它同时挂 OpenAI 的 prompt_tokens（含缓存）和 Anthropic 的两个桶字段（**恒为 0**）。
+    // 旧判据"看到 cache_read_input_tokens 就当 Anthropic"→ 不减 → 5162 报给客户端，
+    // 缓存段被算两遍（客户端口径 4224/(5162+4224)=45%，真实 96%）。
+    const usageMixed = {
+      prompt_tokens: 4386, completion_tokens: 1, total_tokens: 4387,
+      prompt_tokens_details: { cached_tokens: 4224 },
+      prompt_cache_hit_tokens: 4224, prompt_cache_miss_tokens: 162,
+      cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+      prompt_cache_write_tokens: 0, cached_tokens: 0, credit: 0.01,
+    };
+    const upMixed = http.createServer((q, s) => {
+      q.resume();
+      q.on('end', () => {
+        s.writeHead(200, { 'content-type': 'application/json' });
+        s.end(JSON.stringify({ id: 'c2', object: 'chat.completion', model: 'test-mixed', choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }], usage: usageMixed }));
+      });
+    });
+    await new Promise((r) => upChat.listen(0, '127.0.0.1', r));
+    await new Promise((r) => upAnth.listen(0, '127.0.0.1', r));
+    await new Promise((r) => upMixed.listen(0, '127.0.0.1', r));
+    const dir = fs.mkdtempSync(path.join(tmp, 'cacheusage-'));
+    const port = await freePort();
+    const mkProv = (id, srv, protocol, model, priority) => ({
+      id, baseURL: 'http://127.0.0.1:' + srv.address().port + '/v1', protocol,
+      apiKey: 'sk-' + 'a'.repeat(20), models: [model], priority, enabled: true, timeoutMs: 20000,
+    });
+    fs.writeFileSync(path.join(dir, 'c.json'), JSON.stringify({
+      port, apiKey: GATEWAY_KEY,
+      providers: [
+        mkProv('p-chat', upChat, 'openai-chat', 'test-chat', 1),
+        mkProv('p-anth', upAnth, 'anthropic-messages', 'test-anth', 1),
+        mkProv('p-mixed', upMixed, 'openai-chat', 'test-mixed', 1),
+      ],
+    }), 'utf8');
+    const proc = spawn(process.execPath,
+      [MJS, '--config', path.join(dir, 'c.json'), '--log', path.join(dir, 'g.log'), '--port', String(port)],
+      { stdio: 'ignore', windowsHide: true });
+    try {
+      const ready = await waitHealth(port, 20000);
+      if (!ready) { console.log('    [SKIP] 缓存口径用例的网关未就绪'); return; }
+
+      // ① 非流式：chat 上游 → Anthropic 客户端
+      const r1 = await call({ port, p: '/v1/messages', body: { model: 'test-chat', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r1.status, 200, '应 200，实际 ' + r1.status + ' ' + r1.text.slice(0, 200));
+      const j1 = JSON.parse(r1.text);
+      assert.strictEqual(j1.usage.input_tokens, 100,
+        'chat 上游 prompt_tokens=1000 内含 cached 900 → 非缓存输入必须报 100，实际 ' + j1.usage.input_tokens
+        + '（1000=没减；0=减了两次）');
+      assert.strictEqual(j1.usage.cache_read_input_tokens, 900, '缓存命中数应原样给出 900');
+      assert.strictEqual(j1.usage.input_tokens + j1.usage.cache_read_input_tokens, 1000,
+        '客户端算命中率用的分母（三桶之和）必须等于真实总输入 1000');
+
+      // ② 流式：message_delta 里的 input_tokens 同样要减
+      const r2 = await call({ port, p: '/v1/messages', body: { model: 'test-chat', max_tokens: 16, stream: true, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r2.status, 200, '流式应 200，实际 ' + r2.status);
+      const md = r2.text.split('\n\n').find((chunk) => /event:\s*message_delta/.test(chunk)) || '';
+      const mdu = JSON.parse((md.split('\n').find((l) => l.startsWith('data: ')) || 'data: {}').slice(6) || '{}');
+      assert.strictEqual(mdu.usage.input_tokens, 100,
+        '流式 message_delta 的非缓存输入应为 100，实际 ' + mdu.usage.input_tokens);
+      assert.strictEqual(mdu.usage.cache_read_input_tokens, 900, '流式 message_delta 的缓存读应为 900');
+
+      // ③ 反面：Anthropic 直通不得再减一次（input_tokens 本来就不含缓存）
+      const r3 = await call({ port, p: '/v1/messages', body: { model: 'test-anth', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r3.status, 200, '直通应 200，实际 ' + r3.status + ' ' + r3.text.slice(0, 200));
+      const j3 = JSON.parse(r3.text);
+      assert.strictEqual(j3.usage.input_tokens, 100,
+        'Anthropic 直通的 input_tokens 不得被再减一次（应为 100，实际 ' + j3.usage.input_tokens + '）');
+      assert.strictEqual(j3.usage.cache_read_input_tokens, 900, '直通的缓存读应原样透传 900');
+
+      // ④ 混合形状（真实 workbuddy 形态）：Anthropic 的两个桶字段恒为 0，
+      //    判据必须看 prompt_tokens 在不在，而不是看有没有 cache_read_input_tokens。
+      const r4 = await call({ port, p: '/v1/messages', body: { model: 'test-mixed', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r4.status, 200, '混合形状应 200，实际 ' + r4.status + ' ' + r4.text.slice(0, 200));
+      const j4 = JSON.parse(r4.text);
+      assert.strictEqual(j4.usage.input_tokens, 162,
+        '混合形状的 prompt_tokens=4386 内含 cached 4224 → 非缓存输入必须报 162，实际 ' + j4.usage.input_tokens
+        + '（4386=被 0 值的 cache_read_input_tokens 骗了没减）');
+      assert.strictEqual(j4.usage.cache_read_input_tokens, 4224, '混合形状的缓存读应取 details.cached_tokens = 4224');
+      assert.strictEqual(j4.usage.input_tokens + j4.usage.cache_read_input_tokens, 4386, '三桶之和须等于真实总输入 4386');
+    } finally {
+      try { proc.kill(); } catch { /* 忽略 */ }
+      try { upChat.close(); } catch { /* 忽略 */ }
+      try { upAnth.close(); } catch { /* 忽略 */ }
+      try { upMixed.close(); } catch { /* 忽略 */ }
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    }
+  });
+
   // ---- 7) write-dsh 的 YAML 定位（P1-7）----
   const writeDsh = (settingsText) => {
     const dir = fs.mkdtempSync(path.join(tmp, 'wd-'));
@@ -2708,6 +2837,18 @@ let upstreamPort = 0;
           res.end(JSON.stringify({ status: 403, title: 'Forbidden', detail: opts.authMsg || 'Authorization failed' }));
           return;
         }
+        // 2026-10-30：WorkBuddy 渠道校验拒绝的真实形态（HTTP 400 + body 里的 code:11128）。
+        // 与 401/403 的区别：不是凭据坏了，而是"上游认为这个客户端/这份提示词不是官方客户端"。
+        if (behavior === 'channel11128') {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({
+            code: 11128,
+            msg: 'Illegal API invocation from an unapproved channel',
+            requestId: 'test-request-id',
+            retry_policy: { retry: false },
+          }));
+          return;
+        }
         // 2026-10-14：商汤 sensenova 对 RPM/TPM 限流的**真实形态** ——
         // 措辞里写着额度类的 `insufficient_quota`，但语义是瞬时限流。
         // 旧实现被 WORKBUDDY_CREDIT_RE 里的 `insufficient[_a-z]*quota` 抓成"欠费"→ 锁 1800 秒。
@@ -3040,6 +3181,143 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(upPool); closeUp(upFallback); }
   });
 
+  t('WorkBuddy 凭据自愈（直通路径）：403 → 强制刷新 token 后**原地重试同一账户**，不把账号冷却 60 分钟', async () => {
+    // 2026-10-30（用户原话："我需要的是连接 workbuddy 的稳定性，可用性"）。
+    // 现场成因：WorkBuddy 的 access token 会被桌面端和网关各自刷新，任一方刷新后另一方的旧 token
+    // 立刻失效 → 上游回 401/403。旧实现把这种**完全正常的账号**直接 `markAccountFailure(...,'session')`
+    // 冷却 60 分钟，用户看到的就是"整家 WorkBuddy 时不时挂一小时"。正确处置是刷新凭据重发一次。
+    const up = await startFakeOpenAIUpstream({ script: ['auth403', 'ok', 'ok'], json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-cred-'));
+    const authFile = writeWorkBuddyAuth(dir, 'wb-s1.info', { token: 'AT-STALE', uid: 'uid-s1', refreshToken: 'RT-S1' });
+    const gw = await startGatewayWith([
+      openaiProvider('wbs', up, { auth: 'workbuddy', accounts: [{ id: 's1', authFile }] }),
+    ], 'wbcred');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200, '第二次（带新 token）应成功，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      // 注意：刷新请求也打在同一个假上游上，`st.calls` 会把刷新算进去 —— 只数 chat 调用。
+      const chatHdrs = up.st.headers.filter((h, i) => /chat\/completions$/.test(up.st.paths[i]));
+      assert.strictEqual(chatHdrs.length, 2, '同一账户应被重发一次（chat 调用 2 次），实际 ' + chatHdrs.length
+        + '｜路径 ' + JSON.stringify(up.st.paths));
+      assert.ok((up.st.refreshCalls || 0) >= 1, '被拒后应走 token 刷新端点，实际 ' + (up.st.refreshCalls || 0));
+      assert.strictEqual(chatHdrs[0].authorization, 'Bearer AT-STALE', '第一次用的是旧 token：' + JSON.stringify(chatHdrs[0]));
+      assert.strictEqual(chatHdrs[1].authorization, 'Bearer AT-REFRESHED', '重试必须换成刷新后的 token：' + JSON.stringify(chatHdrs[1]));
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/原地重试同一账户/.test(logText), '日志应说明是换凭据重试：' + logText.slice(-800));
+      assert.ok(!/标记为 session/.test(logText), '凭据类拒绝不得把账户标成 session 冷却：' + logText.slice(-800));
+      // 关键回归点：账户必须仍是可用状态。旧实现下这里会命中"1 个账户全部冷却中 → 交给下一家"。
+      const r2 = await call({ port: gw.port });
+      assert.strictEqual(r2.status, 200, '账户不得因一次 token 过期被冷却，第二次请求应照常成功，实际 ' + r2.status);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('WorkBuddy 凭据自愈（翻译路径 /v1/messages）：403 → 强制刷新后原地重试同一账户', async () => {
+    // 与上一条同一判据，但走 Anthropic 客户端 → openai-chat 上游的翻译路径（DSH 最常用的链路）。
+    // 这条路径有独立的重试循环，漏改它 = 只修一半。
+    const up = await startFakeOpenAIUpstream({ script: ['auth403', 'ok', 'ok'], json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-cred-anthropic-'));
+    const authFile = writeWorkBuddyAuth(dir, 'wb-t1.info', { token: 'AT-T1', uid: 'uid-t1', refreshToken: 'RT-T1' });
+    const gw = await startGatewayWith([
+      openaiProvider('wbt', up, { auth: 'workbuddy', accounts: [{ id: 't1', authFile }] }),
+    ], 'wbcred-anthropic');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '刷新后应成功，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const chatHdrs = up.st.headers.filter((h, i) => /chat\/completions$/.test(up.st.paths[i]));
+      assert.strictEqual(chatHdrs.length, 2, '同一账户应被重发一次（chat 调用 2 次），实际 ' + chatHdrs.length
+        + '｜路径 ' + JSON.stringify(up.st.paths));
+      assert.strictEqual(chatHdrs[1].authorization, 'Bearer AT-REFRESHED', '重试必须换成刷新后的 token');
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/原地重试同一账户/.test(logText), '日志应说明是换凭据重试：' + logText.slice(-800));
+      assert.ok(!/标记为 session/.test(logText), '凭据类拒绝不得把账户标成 session 冷却：' + logText.slice(-800));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('WorkBuddy 凭据自愈的反面：同样是 403，但账户确实没救了（刷新也拿不到新 token）→ 才冷却账户', async () => {
+    // 自愈必须有限度：没有 refreshToken 时刷新无从谈起，此时仍应走原有的"冷却账户 + 换家"，
+    // 而不是无限重发同一个死凭据把请求拖死。
+    const up = await startFakeOpenAIUpstream({ script: ['auth403', 'auth403'], json: true });
+    const upFallback = await startFakeUpstream({ status: 200 });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-cred-dead-'));
+    const authFile = writeWorkBuddyAuth(dir, 'wb-d1.info', { token: 'AT-DEAD', uid: 'uid-d1' });   // 刻意不给 refreshToken
+    const gw = await startGatewayWith([
+      openaiProvider('wbd', up, { auth: 'workbuddy', accounts: [{ id: 'd1', authFile }] }),
+      providerOf('fallback3', upFallback, { models: ['test-model'] }),
+    ], 'wbcred-dead');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '刷新不了应交给下一家，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(upFallback.st.calls, 1, '应切到备用供应商，实际 ' + upFallback.st.calls);
+      const chatCalls = up.st.paths.filter((p) => /chat\/completions$/.test(p)).length;
+      assert.ok(chatCalls <= 2, '重发必须有上限（每账户最多一次），实际 chat 调用 ' + chatCalls
+        + '｜路径 ' + JSON.stringify(up.st.paths));
+    } finally { killGw(gw); closeUp(up); closeUp(upFallback); }
+  });
+
+  t('WorkBuddy 句式指纹：system 里那两句 Claude-Code 句式被换成等价说法（2026-10-30 实测的 11128 触发面）', async () => {
+    // 现场（用户报"WorkBuddy 不可用"）：身份句改写**已经生效**（出站是 `You are an AI agent.`），
+    // 上游照样回 11128。二分实验把触发面缩到两句连写：
+    //   "Tokens prefixed with @ are paths the user explicitly referenced."
+    //   + "Relative paths resolve from the workspace root; absolute paths identify files or directories on the host."
+    // 单发任一句 → 200；两句连写 → 11128；只删掉那个 `@` → 200。
+    // 处置：换成等价说法（语义不动），本用例盯"出站 body 里不能再有原句"。
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-fp-'));
+    const authFile = writeWorkBuddyAuth(dir, 'wb-fp.info', { token: 'AT-FP', uid: 'uid-fp' });
+    const gw = await startGatewayWith([
+      openaiProvider('wbfp', up, { auth: 'workbuddy', accounts: [{ id: 'fp1', authFile }] }),
+    ], 'wbfp');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const sys = 'You are an AI agent.\n\n'
+        + 'Tokens prefixed with @ are paths the user explicitly referenced. '
+        + 'Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.';
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 16, system: sys, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const sent = JSON.stringify(up.st.bodies[0] || {});
+      assert.ok(!/Tokens prefixed with @/.test(sent), '原句式必须被改写，出站：' + sent.slice(0, 400));
+      assert.ok(!/paths resolve from the workspace root/.test(sent), '第二句也必须被改写，出站：' + sent.slice(0, 400));
+      assert.ok(/Items beginning with @ name files or directories/.test(sent), '应换成等价说法，出站：' + sent.slice(0, 400));
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/渠道\*\*句式\*\*改写/.test(logText), '日志应说明改了句式：' + logText.slice(-800));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('WorkBuddy 11128 自救：句式改写仍被拒 → 换中性 system 原地重试一次（不让这家整家失效）', async () => {
+    // 身份句 + 句式两道改写都做完还是 11128 → 说明上游认的是我们还不认识的提示词特征。
+    // 此时必须再给一次机会（换一份"没有任何客户端特征"的 system），
+    // 否则 DSH 每轮都带同一份 system → 这家**永远**用不上，只能落到 amd 等更贵的候选。
+    const up = await startFakeOpenAIUpstream({ script: ['channel11128', 'ok'], json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-11128-'));
+    const authFile = writeWorkBuddyAuth(dir, 'wb-n1.info', { token: 'AT-N1', uid: 'uid-n1', refreshToken: 'RT-N1' });
+    const gw = await startGatewayWith([
+      openaiProvider('wbn', up, { auth: 'workbuddy', accounts: [{ id: 'n1', authFile }] }),
+    ], 'wb11128');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 16, system: 'You are a helpful assistant with a long persona.', messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '换中性 system 后应成功，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const chatBodies = up.st.bodies.filter((_b, i) => /chat\/completions$/.test(up.st.paths[i]));
+      assert.strictEqual(chatBodies.length, 2, '应原地重发一次（chat 调用 2 次），实际 ' + chatBodies.length
+        + '｜路径 ' + JSON.stringify(up.st.paths));
+      const second = JSON.stringify(chatBodies[1] || {});
+      assert.ok(/Follow the user request and the tool descriptions/.test(second),
+        '第二次必须换成中性 system，实际：' + second.slice(0, 300));
+      assert.ok(!/helpful assistant with a long persona/.test(second), '原 system 不得再发出去：' + second.slice(0, 300));
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/把 system 换成中性说明/.test(logText), '日志应说明换了中性 system：' + logText.slice(-800));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
   t('WorkBuddy 凭据：access token 临期 → 自动刷新（X-Refresh-Token）并用新 token 请求', async () => {
     const up = await startFakeOpenAIUpstream({ json: true });
     const dir = fs.mkdtempSync(path.join(tmp, 'wb-refresh-'));
@@ -3132,6 +3410,57 @@ let upstreamPort = 0;
       // ③ 日志里应能看到实际服务的账户
       const logText = fs.readFileSync(gw.logPath, 'utf8');
       assert.ok(/via=wbv#d2/.test(logText), '日志应标注实际账户（via=wbv#d2）：' + logText.slice(-500));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // 2026-10-29 用户需求（原话）："增加『恢复』按钮，用于一键将冷却或受限的供应商恢复正常使用"。
+  // 冷却/熔断状态全是**引擎进程内存**，主进程与界面都碰不到 —— 唯一穿透路径就是这个端点。
+  // 本条钉住四件事：① 真能清掉；② 无 Key → 401（它是**改状态**的端点，不能像只读的 /health 那样免鉴权）；
+  // ③ GET → 405（地址栏/预取不该能改状态）；④ 被拒的请求绝不能有副作用。
+  t('一键恢复：POST /reset-cooldowns 清空账户冷却，且无 Key→401 / GET→405 都不产生副作用', async () => {
+    const up = await startFakeOpenAIUpstream({ script: ['credit', 'ok'], json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-reset-'));
+    const a1 = writeWorkBuddyAuth(dir, 'wb-z1.info', { token: 'AT-Z1', uid: 'uid-z1' });
+    const a2 = writeWorkBuddyAuth(dir, 'wb-z2.info', { token: 'AT-Z2', uid: 'uid-z2' });
+    const gw = await startGatewayWith([
+      openaiProvider('wbz', up, { auth: 'workbuddy', accounts: [{ id: 'z1', authFile: a1 }, { id: 'z2', authFile: a2 }] }),
+    ], 'resetcd');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const health = async () => JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
+      const coolingCount = async () => (await health()).accounts.filter((a) => a.state !== 'ok').length;
+
+      // ① 造一次真实冷却（第 1 把 Key 额度耗尽 → 30 分钟冷却，正常手段根本等不到）
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '应换到第 2 把 Key 后成功，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(await coolingCount(), 1, '应有 1 个账户处于冷却：' + JSON.stringify((await health()).accounts));
+
+      // ② 无 Key → 401，且**状态不变**
+      const noKey = await call({ port: gw.port, method: 'POST', p: '/reset-cooldowns', body: {}, key: '' });
+      assert.strictEqual(noKey.status, 401, '恢复端点必须鉴权（旧 /health 免鉴权是因为它只读），实际 ' + noKey.status);
+      assert.strictEqual(await coolingCount(), 1, '401 的请求绝不能顺手把冷却清掉');
+
+      // ③ GET → 405
+      const asGet = await call({ port: gw.port, method: 'GET', p: '/reset-cooldowns', body: null, key: GATEWAY_KEY });
+      assert.strictEqual(asGet.status, 405, '改状态的端点不该接受 GET，实际 ' + asGet.status);
+      assert.strictEqual(await coolingCount(), 1, '405 的请求同样不得有副作用');
+
+      // ④ 正常恢复：清掉 + 计数回显（界面靠这几个数说"恢复了几个"）
+      const ok = await call({ port: gw.port, method: 'POST', p: '/reset-cooldowns', body: {}, key: GATEWAY_KEY });
+      assert.strictEqual(ok.status, 200, '带 Key 的 POST 应成功，实际 ' + ok.status + ' ' + ok.text.slice(0, 200));
+      const j = JSON.parse(ok.text);
+      assert.strictEqual(j.ok, true, '应回 ok:true：' + ok.text);
+      for (const k of ['accounts', 'modelAccounts', 'providers', 'models', 'notOffered', 'egress']) {
+        assert.strictEqual(typeof j.cleared[k], 'number', 'cleared.' + k + ' 必须是数字（界面按键名回显）：' + ok.text);
+      }
+      assert.ok(j.cleared.accounts >= 1, 'cleared.accounts 应数到刚被冷却的那把 Key：' + ok.text);
+      const h3 = await health();
+      assert.ok(h3.accounts.every((a) => a.state === 'ok'),
+        '恢复后所有账户都应回到可用（这才是"一键恢复正常使用"）：' + JSON.stringify(h3.accounts));
+
+      // ⑤ 日志留痕：这一步放行了上游本来还在限制的账号，事后必须查得到
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/\[reset\] 一键恢复/.test(logText), '日志应记录这次恢复：' + logText.slice(-400));
     } finally { killGw(gw); closeUp(up); }
   });
 
@@ -4598,7 +4927,10 @@ let upstreamPort = 0;
       assert.strictEqual(up.st.calls - 2, 1, '第二次必须一次成功（已学习，不再先失败），实际 ' + (up.st.calls - 2) + ' 次');
       assert.ok(!up.st.bodies[2].thinking, '已学习后首次即不得带 thinking');
       const log2 = fs.readFileSync(gw.logPath, 'utf8');
-      assert.ok(/（不支持 thinking）→ 去掉顶层 thinking 参数后发送/.test(log2), '日志应记录预先剥离：' + log2.slice(-400));
+      assert.ok(/不支持 extended thinking（配置已声明 drop-thinking）/.test(log2), '日志应记录预先剥离：' + log2.slice(-400));
+      // 2026-10-29：这行必须**每个供应商只记一次**。用户正是因为"每个请求刷一行"才把它读成"一直报错"。
+      const hits = (log2.match(/不支持 extended thinking/g) || []).length;
+      assert.strictEqual(hits, 1, '同一供应商重复请求不应重复刷这行，实际 ' + hits + ' 行');
     } finally { killGw(gw); closeUp(up); }
   });
 
@@ -4622,7 +4954,7 @@ let upstreamPort = 0;
       const r2 = await call({ port: gw2.port, p: '/v1/messages', body });
       assert.strictEqual(r2.status, 200, '声明 quirk 后应一次成功，实际 ' + r2.status);
       assert.strictEqual(upQ.st.calls, 1, '显式 quirk 应首次就剥离（只打一次上游），实际 ' + upQ.st.calls);
-      assert.ok(/（不支持 thinking）→ 去掉顶层 thinking 参数后发送/.test(fs.readFileSync(gw2.logPath, 'utf8')));
+      assert.ok(/不支持 extended thinking（配置已声明 drop-thinking）/.test(fs.readFileSync(gw2.logPath, 'utf8')));
     } finally { killGw(gw2); closeUp(upQ); }
   });
 
@@ -4633,8 +4965,84 @@ let upstreamPort = 0;
       const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }] } });
       assert.strictEqual(r.status, 200, '普通请求应一次成功，实际 ' + r.status);
       assert.strictEqual(up.st.calls, 1, '不得触发任何重试，实际 ' + up.st.calls);
-      assert.ok(!/不支持 thinking/.test(fs.readFileSync(gw.logPath, 'utf8')), '不应记录 thinking 相关处理');
+      assert.ok(!/不支持 extended thinking/.test(fs.readFileSync(gw.logPath, 'utf8')), '不应记录 thinking 相关处理');
     } finally { killGw(gw); closeUp(up); }
+  });
+
+  // ---- 2026-10-29：「这家不提供该模型」的短期记忆（现场：sensenova 403 / x666 503 每轮白试）----
+  // 要求：① 第一次照样按 priority 先试它（不能未卜先知）；
+  //      ② 记住之后**下一个请求起排到队尾**，不再白花一次往返；
+  //      ③ 一旦它成功服务该模型，立刻清除记忆（配置改好/上游补货能自愈，不会被永久降级）。
+  t('某家回过"不提供该模型"→ 后续请求排到队尾（不删除）；它一旦成功就立即恢复原序', async () => {
+    const bad = await startFakeUpstream({
+      status: 403,
+      errorBody: { error: { message: 'model is not available in the current token plan' } },
+    });
+    const good = await startFakeUpstream({});
+    const gw = await startGatewayWith([
+      providerOf('nooffer', bad, { priority: 1 }),
+      providerOf('good', good, { priority: 2 }),
+    ], 'notoff1');
+    const body = { model: 'test-model', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }] };
+    try {
+      const r1 = await call({ port: gw.port, p: '/v1/chat/completions', body });
+      assert.strictEqual(r1.status, 200, 'failover 后应成功，实际 ' + r1.status + ' ' + r1.text.slice(0, 200));
+      assert.strictEqual(bad.st.calls, 1, '第一次请求必须先试 priority=1 那家，实际 ' + bad.st.calls);
+
+      // ② 第二个请求：记忆生效 → 直接问 good，一次都不再碰 bad
+      const r2 = await call({ port: gw.port, p: '/v1/chat/completions', body });
+      assert.strictEqual(r2.status, 200, '第二次应成功，实际 ' + r2.status);
+      assert.strictEqual(bad.st.calls, 1, '记住之后不应再白试 bad，实际 ' + bad.st.calls);
+      const log2 = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/不提供该模型/.test(log2), '日志应记录"这家不提供该模型"：' + log2.slice(-500));
+      assert.ok(/先前明确回过"这家不提供该模型"（记忆 \d+ 分钟）→ 排到最后/.test(log2),
+        '日志应说明被降级排序：' + log2.slice(-500));
+
+      // ③ 自愈：好家临时 500、坏家已补货 → 坏家被轮到并成功 → 记忆清除
+      good.st.status = 500; good.st.errorBody = { error: { message: 'upstream error' } };
+      bad.st.status = 200;
+      const r3 = await call({ port: gw.port, p: '/v1/chat/completions', body });
+      assert.strictEqual(r3.status, 200, '第三轮应能靠 bad 成功，实际 ' + r3.status + ' ' + r3.text.slice(0, 200));
+      assert.strictEqual(bad.st.calls, 2, '降级后仍要轮得到它（不删除），实际 ' + bad.st.calls);
+
+      // ④ 清除后回到配置顺序：bad 又是第一个
+      good.st.status = 200;
+      const r4 = await call({ port: gw.port, p: '/v1/chat/completions', body });
+      assert.strictEqual(r4.status, 200, '第四轮应成功，实际 ' + r4.status);
+      assert.strictEqual(bad.st.calls, 3, '成功应清除记忆 → 恢复"priority=1 先上场"，实际 ' + bad.st.calls);
+    } finally { killGw(gw); closeUp(bad); closeUp(good); }
+  });
+
+  // 2026-11-03：分销商（new-api / one-api 系）常用 503 表达"这个模型的渠道在本分组里没有"。
+  // 现场：x666 `No available channel for model deepseek-v4.1-flash under group level3 (distributor)`、
+  //       windhub `… for model kimi-k3 under group auto`。
+  // 这两家真实流量分别 37/37、9/9 全成功（走的是分组里有渠道的别的模型），
+  // 旧实现把 503 当"供应商失败" → 3 次就熔断整家 2 分钟，把模型级问题升级成整家不可用。
+  t('503「No available channel for model … under group …」只算模型级：继续 failover、不熔断整家', async () => {
+    const bad = await startFakeUpstream({
+      status: 503,
+      errorBody: { error: { message: 'No available channel for model test-model under group level3 (distributor)' } },
+    });
+    const good = await startFakeUpstream({});
+    const gw = await startGatewayWith([
+      providerOf('nochan', bad, { priority: 1 }),
+      providerOf('okchan', good, { priority: 2 }),
+    ], 'nochan1');
+    const body = { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] };
+    try {
+      const r1 = await call({ port: gw.port, p: '/v1/chat/completions', body });
+      assert.strictEqual(r1.status, 200,
+        '模型级 503 应继续 failover 到下一家，实际 ' + r1.status + ' ' + String(r1.text).slice(0, 300));
+      const log1 = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/不提供该模型/.test(log1), '日志应判定为"这家不提供该模型"：' + log1.slice(-500));
+      assert.ok(/不熔断该家/.test(log1), '应明确说明不熔断该家：' + log1.slice(-500));
+      assert.ok(!/breaker open/.test(log1), '模型级 503 不得打开整家熔断：' + log1.slice(-500));
+
+      // 记忆生效：第二个请求不再白试它
+      const r2 = await call({ port: gw.port, p: '/v1/chat/completions', body });
+      assert.strictEqual(r2.status, 200, '第二轮应成功，实际 ' + r2.status);
+      assert.strictEqual(bad.st.calls, 1, '记住之后不应再白试 nochan，实际 ' + bad.st.calls);
+    } finally { killGw(gw); closeUp(bad); closeUp(good); }
   });
 
   t('同一逻辑名映射普通 + vision 两个上游 ID：带图片走 vision 变体，纯文本走普通变体', async () => {

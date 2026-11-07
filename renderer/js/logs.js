@@ -22,6 +22,11 @@ function logLineClass(line) {
   //    按下面的 err 规则会把整行标红 —— 可它描述的恰恰是"抖动已自动恢复"。
   //    这类行多了会让用户以为网关不稳，去改配置/换供应商。
   if (/原地重试一次|重试成功|已降敏重试/.test(s)) return 'warn';
+  //    同类：`upstream amd 不支持 extended thinking（配置已声明 drop-thinking）→ 已剥掉…（预期行为）`。
+  //    上游只是不认这个**可选**参数，剥掉后照常成功 —— 这是配置声明的能力差异，不是故障。
+  //    （旧文案 `（不支持 thinking）→ 去掉顶层 thinking 参数后发送` 会被下面
+  //     `不支持 thinking` 那条 warn 规则判成警告色，已被这条接走。）
+  if (/不支持 extended thinking/.test(s)) return 'ok';
 
   // ② 判定顺序：错误 > 高亮 > 警告 > 正常。
   // 「一键写入」要排在"成功"前面，否则 `一键写入[claude-code]：成功` 会被当成普通成功行。

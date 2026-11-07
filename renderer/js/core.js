@@ -298,6 +298,9 @@ function renderTopbar() {
   $('#btnStop').disabled = !running;
   $('#btnRestart').disabled = !running;
   $('#brandVer').textContent = 'v' + st.app.version;
+  // 使用帮助页底部的"关于"也带版本号（2026-11-04）；元素不存在时静默跳过
+  const helpVer = $('#helpVer');
+  if (helpVer) helpVer.textContent = 'v' + st.app.version;
   $('#navCountProviders').textContent = String(enabledProviders().length);
   $('#navCountModels').textContent = String(modelNames().length);
 }

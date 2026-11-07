@@ -157,7 +157,7 @@ function makeSandbox() {
   }
   // core.js 里的 `$`/`LG`/`Modal` 是**词法常量**（const），读不到 sandbox 的属性上。
   // 在同一个 context 里再跑一小段，把它们挂出来供测试使用。
-  vm.runInContext('globalThis.__refs = { LG, Modal, esc, attr };', sandbox, { filename: 'expose-refs.js' });
+  vm.runInContext('globalThis.__refs = { LG, Modal, esc, attr, renderTopbar };', sandbox, { filename: 'expose-refs.js' });
   const refs = sandbox.__refs;
   // 只加载了 core.js + providers.js，其它视图的 render 函数不存在。
   // 这里补成空函数 —— 比让被测代码在 `LG.renders.models()` 上抛错要好：
@@ -391,6 +391,29 @@ t('渲染层：「添加供应商 → 取消」必须回滚，不能在配置里
   for (let i = 0; i < 3; i++) { S.sandbox.addProvider(); S.sandbox.closeEditor(); }
   assert.strictEqual(S.refs.LG.config.providers.length, 1, '连点 3 次也不该留下任何残留');
   assert.deepStrictEqual(S.refs.LG.config.providers.map((p) => p.id), ['x1']);
+});
+
+t('渲染层：代理降级必须在列表上方说出来（否则「连不上」会被当成渠道坏了）', () => {
+  // 2026-11-03 现场：代理没开时 4 家齐刷刷"连不上（直连）"，而它们的真实调用几乎全成功。
+  // 主进程 resolveProxy 早就静默降级了，但界面从不显示 —— 用户只会去改配置/换 Key。
+  const S = makeSandbox();
+  S.refs.LG.config = { providers: [{ id: 'p1', baseURL: 'https://a/v1', models: [] }] };
+  S.refs.LG.testResults = {};
+  S.sandbox.window.lgw = {
+    gwTestProviders: () => Promise.resolve({
+      ok: true,
+      proxyNote: { warn: true, configured: 'http://127.0.0.1:7890', used: '', mode: 'fallback' },
+      results: [{ id: 'p1', ok: null, verdict: '连不上（直连）：AggregateError' }],
+    }),
+  };
+  return S.sandbox.testAll().then(() => {
+    const box = S.nodeById.get('#provList');
+    assert.ok(/本次测试时本机代理/.test(String(box.innerHTML)),
+      '降级事实必须写在列表上方。实际：' + String(box.innerHTML).slice(0, 200));
+    const said = S.captured.toasts.map((t) => t.msg).join('｜');
+    assert.ok(/1 家判不出来/.test(said), '判不出来要单独报，不能混进异常。实际：' + said);
+    assert.ok(!/1 家异常/.test(said), 'ok:null 不得算成"异常"。实际：' + said);
+  });
 });
 
 t('渲染层：testAll 在 IPC 返回 null / {ok:false} 时不得谎报成功，且要清掉 busy', () => {
@@ -906,3 +929,186 @@ t('渲染层（设置页）：工具裁剪上限越界必须拦下；开关关�
 });
 
 
+
+/* ================================================================
+ * 日志分级（renderer/js/logs.js 的 logLineClass）
+ *
+ * 2026-10-29 现场：amd 的 DeepSeek-V4.1-Flash 不认顶层 thinking 参数，
+ * 配置里就写了 `quirks: ["drop-thinking"]` —— 网关按配置**在发送前**剥掉该参数，
+ * 请求照常成功。可这行日志原来每个请求刷一遍、措辞又像报错，用户读成"一直报错"。
+ * 修法有两半：引擎侧改文案 + 每供应商只记一次；界面侧必须把新文案判成正常色。
+ * 这里钉住第二半 —— 分级函数是最容易被后续改文案悄悄改坏的一点。
+ * ================================================================ */
+t('渲染层（日志分级）：drop-thinking 说明行是正常色，不能显示成错误/警告', () => {
+  const sb = {
+    console, setTimeout, clearTimeout,
+    JSON, Math, Number, String, Array, Object, RegExp, Date, Set, Map, Error, Promise,
+    parseInt, parseFloat, isNaN, Boolean,
+    document: { querySelector: () => null, querySelectorAll: () => [] },
+    window: {},
+    $: () => null,
+    $$: () => [],
+  };
+  sb.globalThis = sb;
+  vm.createContext(sb);
+  // logs.js 末尾会把自己挂到 `LG.renders.logs` 上，所以先给一个最小 LG（真 core.js 太大，与本用例无关）。
+  vm.runInContext('var LG = { renders: {}, logText: "", activeView: "logs" }; var LOG_MAX_LINES = 2000;', sb, { filename: 'log-stubs.js' });
+  vm.runInContext(fs.readFileSync(path.join(RJ, 'logs.js'), 'utf8'), sb, { filename: 'logs.js' });
+  const cls = (line) => vm.runInContext('logLineClass(' + JSON.stringify(line) + ')', sb);
+
+  // 新文案（预期行为）→ 正常色
+  assert.strictEqual(
+    cls('upstream amd 不支持 extended thinking（配置已声明 drop-thinking） → 已剥掉顶层 thinking 参数后发送（预期行为，本供应商只在首次命中时记这一行）'),
+    'ok',
+    'drop-thinking 是配置声明的能力差异，剥掉后照常成功，不能出现在告警/错误里',
+  );
+  // 学习路径那行仍是真实的"白跑一次"→ 警告（别一起洗白）
+  assert.strictEqual(
+    cls('upstream amd 不支持 thinking（HTTP 200 + SSE 首事件错误） → 去掉顶层 thinking 参数后重试成功（已记住该家）'),
+    'warn',
+    '学习到之前白跑的那一次仍应提醒',
+  );
+  // 真失败必须还是红的
+  assert.strictEqual(cls('[call] chat POST /v1/chat/completions status=502'), 'err');
+});
+
+/* ================================================================
+ * 概览页「恢复」按钮（2026-10-29 用户需求）
+ *
+ * 用户原话："增加『恢复』按钮，用于一键将冷却或受限的供应商恢复正常使用"。
+ * 冷却状态在引擎进程内存里，界面只能通过 gwAction('reset-cooldowns') 触达。
+ *
+ * 这条用例钉的是**界面这一半**（引擎那一半在 gateway.test.js）：
+ *   ① 按钮真的存在并且挂上了监听 —— index.html 漏写 id 时 $() 拿到的是空桩，
+ *      表现为"点了没反应"，而这正是本项目反复踩过的形态。
+ *   ② 点它**不会**直接清 —— 先弹确认：清空等于忘掉"上游刚把我限流"，紧接着很可能再撞一次。
+ *   ③ 确认后必须回显**恢复了几个**（全部本来就可用时，画面必须与"恢复了 12 个"不同）。
+ *   ④ 失败必须说出来（静默 return = 用户分不清"没点到"与"真失败"）。
+ * ================================================================ */
+t('渲染层（概览页）：「恢复」按钮 → 二次确认 → 回显恢复数量；失败必须说出来', async () => {
+  const S = makeSandbox();
+  const { refs, captured, nodeById } = S;
+  const calls = [];
+  let nextResult = { ok: true, cleared: { accounts: 2, modelAccounts: 1, providers: 1, models: 0, notOffered: 3, egress: 0 } };
+  S.sandbox.window.lgw = {
+    gwAction: async (name) => { calls.push(name); return nextResult; },
+    gwHealth: async () => ({ ok: true, accounts: [], guards: { loopGuard: 0, toolLoop: 0, roomy: 0, enabled: {} } }),
+  };
+  refs.LG.state = { gateway: { running: true, ready: true, port: 3091, configPath: 'C:\\x\\gateway.config.json' }, dataDir: 'C:\\x' };
+  refs.LG.config = { providers: [], apiKey: 'k' };
+  refs.LG.health = {
+    ok: true,
+    accounts: [{ key: 'amd#key1', provider: 'amd', id: 'key1', state: 'rate', remainMs: 40_000 }],
+    guards: { loopGuard: 0, toolLoop: 0, roomy: 0, enabled: {} },
+  };
+
+  // ① 模板里必须有这个按钮（id 写错 = 点了没反应，且测试很难发现）
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
+  assert.ok(/id="btnResetCooldowns"/.test(html), 'index.html 必须存在 #btnResetCooldowns（恢复按钮）');
+
+  refs.LG.initDashboard();
+  const btn = nodeById.get('#btnResetCooldowns');
+  assert.ok(btn, 'initDashboard 必须取到 #btnResetCooldowns');
+  assert.strictEqual((btn._listeners.click || []).length, 1, '恢复按钮应恰好挂 1 个 click 监听');
+
+  // ② 点一下：只弹确认，**不能**已经发出恢复请求
+  btn._fire('click');
+  assert.strictEqual(calls.length, 0, '确认之前不得真的执行恢复：' + JSON.stringify(calls));
+  assert.ok(S.isModalOpen(), '应弹出确认框');
+  const body = S.modalBody();
+  assert.ok(/冷却/.test(body) && /熔断/.test(body), '确认框要说清会清掉哪些状态：' + body);
+  assert.ok(/1/.test(body), '确认框要带上"当前有几个账户在冷却"：' + body);
+  const foot = S.modalFoot();
+  assert.strictEqual(foot.length, 2, '确认框应有 取消 / 确认恢复 两个按钮，实际 ' + foot.length);
+
+  // ③ 确认 → 真的调用，并把数量回显出来
+  foot[1]._fire('click');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepStrictEqual(calls, ['reset-cooldowns'], '应调用一次 gwAction("reset-cooldowns")：' + JSON.stringify(calls));
+  const okToast = captured.toasts[captured.toasts.length - 1];
+  assert.ok(okToast && /账户冷却 2/.test(okToast.msg), '应回显账户冷却条数：' + JSON.stringify(captured.toasts));
+  assert.ok(/模型级冷却 1/.test(okToast.msg) && /供应商熔断 1/.test(okToast.msg), '其余类别也要回显：' + okToast.msg);
+  assert.ok(/ok/.test(okToast.cls), '成功提示应是正常色：' + okToast.cls);
+
+  // ④ 全部本来可用（六个计数全 0）→ 必须说"没有冷却中的条目"，不能冒充"已恢复"
+  nextResult = { ok: true, cleared: { accounts: 0, modelAccounts: 0, providers: 0, models: 0, notOffered: 0, egress: 0 } };
+  captured.toasts.length = 0;
+  btn._fire('click');
+  S.modalFoot()[1]._fire('click');
+  await new Promise((r) => setTimeout(r, 20));
+  const zeroToast = captured.toasts[captured.toasts.length - 1];
+  assert.ok(zeroToast && /没有任何冷却中的条目/.test(zeroToast.msg), '零恢复必须如实说：' + JSON.stringify(captured.toasts));
+
+  // ⑤ 失败必须说出来（旧代码里这种 `{ok:false}` 常常被静默吞掉，界面表现为"点了没反应"）
+  nextResult = { ok: false, error: '网关未运行' };
+  captured.toasts.length = 0;
+  btn._fire('click');
+  S.modalFoot()[1]._fire('click');
+  await new Promise((r) => setTimeout(r, 20));
+  const errToast = captured.toasts[captured.toasts.length - 1];
+  assert.ok(errToast && /恢复失败/.test(errToast.msg) && /网关未运行/.test(errToast.msg),
+    '失败要带出主进程给的原因：' + JSON.stringify(captured.toasts));
+  assert.ok(/err/.test(errToast.cls), '失败提示应是错误色：' + errToast.cls);
+});
+
+
+/* ================================================================
+ * 使用帮助页底部的「关于与许可」（2026-11-04 用户要求）：
+ *   "使用帮助页面最下方增加版权说明，许可协议，github地址等"
+ *
+ * 钉四件事：
+ *   ① 版权行、许可协议、GitHub 仓库 / issues 两个入口都在；
+ *   ② 许可必须与 package.json 的 license **一致**（界面写 MIT、元数据写别的 = 法律信息漂移）；
+ *   ③ 每个外链都要 target="_blank" + rel="noopener" —— 主进程把 will-navigate
+ *      拦下来交给系统浏览器，但 window.opener 仍会被远端页面拿到，而这个窗口挂着 preload 桥；
+ *   ④ 版本号来自 st.app.version 而不是写死的字符串（升级后忘改版本是常见事故）。
+ * ================================================================ */
+t('渲染层（使用帮助）：底部必须有版权/许可/GitHub，外链一律 target=_blank + noopener，版本号走运行时', () => {
+  const S = makeSandbox();
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'index.html'), 'utf8');
+
+  const helpStart = html.indexOf('id="view-help"');
+  assert.ok(helpStart > 0, 'index.html 必须存在 #view-help');
+  const help = html.slice(helpStart);
+  const aboutStart = help.indexOf('help-about');
+  assert.ok(aboutStart > 0, '使用帮助页必须有一块 .help-about（关于与许可）');
+  const about = help.slice(aboutStart, help.indexOf('</section>', aboutStart));
+
+  // ① 内容
+  assert.ok(/版权说明|版权/.test(about), '要写版权说明');
+  assert.ok(new RegExp(String(pkg.author)).test(about),
+    '版权行要带 package.json 里的作者（现在是 ' + pkg.author + '）：' + about.slice(0, 200));
+  assert.ok(/MIT License/.test(about), '许可协议要写明 MIT License');
+  assert.ok(/github\.com\/xuxue04403\/llm-gateway/.test(about), '要给出 GitHub 项目地址');
+  assert.ok(/\/issues/.test(about), '要给出问题反馈入口');
+  assert.ok(/AS IS|不附带任何明示或暗示的担保/.test(about), '要带免责声明');
+
+  // ② 许可与元数据一致
+  assert.strictEqual(String(pkg.license), 'MIT',
+    'package.json 的 license 应与帮助页写的 MIT 一致，实际 ' + pkg.license);
+
+  // ③ 外链安全属性
+  const anchors = about.match(/<a\b[^>]*>/g) || [];
+  assert.ok(anchors.length >= 3, '至少要有 LICENSE / 仓库 / issues 三个外链，实际 ' + anchors.length);
+  for (const a of anchors) {
+    assert.ok(/href="https:\/\//.test(a), '外链必须是 https 绝对地址：' + a);
+    assert.ok(/target="_blank"/.test(a), '外链必须 target="_blank"：' + a);
+    assert.ok(/rel="noopener"/.test(a), '外链必须 rel="noopener"（否则远端页面能拿到 window.opener）：' + a);
+  }
+
+  // ④ 版本号由运行时填充
+  assert.ok(/id="helpVer"/.test(about), '版本号要有 id="helpVer" 供运行时填充');
+  S.refs.LG.state = {
+    app: { version: '9.9.9', name: 'LLM Gateway' },
+    gateway: { running: false, ready: false, port: 3091, configPath: 'C:\\x\\gateway.config.json' },
+    dataDir: 'C:\\x',
+  };
+  S.refs.LG.config = { providers: [], apiKey: 'k' };
+  // 注意：`sandbox.renderTopbar` 在 makeSandbox 末尾被替换成空桩（别的用例不需要真跑顶栏），
+  // 真实函数通过 __refs 暴露出来 —— 这里要验的是"版本号真的写进了 #helpVer"。
+  S.refs.renderTopbar();
+  const ver = S.nodeById.get('#helpVer');
+  assert.ok(ver, 'renderTopbar 必须取到 #helpVer');
+  assert.strictEqual(ver.textContent, 'v9.9.9', '帮助页版本号必须来自 st.app.version，实际 ' + ver.textContent);
+});

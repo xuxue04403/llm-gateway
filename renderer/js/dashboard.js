@@ -319,9 +319,83 @@ async function refreshHealth() {
 
 LG.dashboard = { refreshHealth };
 
+/**
+ * 真正发起"一键恢复"（2026-10-29）。与按钮接线分开，便于测试直接调它。
+ *
+ * 三条口径：
+ *   · 失败必须说出来 —— `{ok:false, error}` 是主进程 IPC 的标准失败形态，静默 return 的
+ *     结果是"点了没反应"，用户分不清是没点到还是真失败了。
+ *   · 成功要回显**恢复了几个** —— 只弹一句"已恢复"，用户无法判断到底有没有东西被清掉
+ *     （全部本来就可用时，两种结果的画面必须不一样）。
+ *   · 无论成败都刷新一次 /health：恢复后状态变了，面板必须立刻反映真实情况。
+ */
+async function doResetCooldowns() {
+  let r = null;
+  try {
+    r = await window.lgw.gwAction('reset-cooldowns');
+  } catch (e) {
+    toast('恢复失败：' + ((e && e.message) || e), 'err', 8000);
+    return;
+  }
+  if (!r || !r.ok) {
+    toast('恢复失败：' + ((r && r.error) || '未知错误'), 'err', 8000);
+    await refreshHealth();
+    return;
+  }
+  const c = (r && r.cleared) || {};
+  const n = (k) => Number(c[k] || 0);
+  const parts = [];
+  if (n('accounts')) parts.push(`账户冷却 ${n('accounts')}`);
+  if (n('modelAccounts')) parts.push(`模型级冷却 ${n('modelAccounts')}`);
+  if (n('providers')) parts.push(`供应商熔断 ${n('providers')}`);
+  if (n('models')) parts.push(`模型熔断 ${n('models')}`);
+  if (n('notOffered')) parts.push(`"不提供该模型"记忆 ${n('notOffered')}`);
+  if (n('egress')) parts.push(`出口冷却 ${n('egress')}`);
+  if (parts.length === 0) toast('没有任何冷却中的条目 —— 所有供应商本来就是可用的', 'ok', 4000);
+  else toast('已恢复：' + parts.join('、'), 'ok', 6000);
+  await refreshHealth();
+}
+LG.dashboard.doResetCooldowns = doResetCooldowns;
+
 /* 概览页的按钮接线（在 app.js 里统一调 init） */
 LG.initDashboard = function initDashboard() {
   $('#btnRefreshHealth').addEventListener('click', () => { refreshHealth(); toast('已刷新', 'ok', 1200); });
+  // 一键恢复（2026-10-29 用户需求）：把引擎里所有冷却/熔断状态清空。
+  // 刻意要二次确认：这一步会把"上游刚把我限流"的记录也一起忘掉，紧接着的请求很可能
+  // 立刻再撞一次同样的墙（而 429 连撞正是把短期限流升级成封禁的典型路径）。
+  // 但确认框必须说清"为什么值得点"——否则用户只会看到又一个拦路的弹窗。
+  $('#btnResetCooldowns').addEventListener('click', () => {
+    if (!LG.state || !LG.state.gateway.running) {
+      toast('网关未运行 —— 冷却状态存在网关进程内存里，进程没了就是干净的，无需恢复', 'warn', 5000);
+      return;
+    }
+    const cooling = (LG.health && Array.isArray(LG.health.accounts))
+      ? LG.health.accounts.filter((a) => isCooling(a)).length
+      : 0;
+    Modal.open({
+      title: '一键恢复所有供应商',
+      body: `<p>将清空网关内<b>所有</b>冷却与熔断状态：</p>
+        <ul>
+          <li>账户级冷却（额度耗尽 / 登录失效 / 被封禁 / 限流）</li>
+          <li>模型级冷却（"这家这个模型被限流"，如 amd 的并发上限）</li>
+          <li>供应商级熔断与它的半开探测名额</li>
+          <li>"这家不提供该模型"的 10 分钟记忆</li>
+          <li>多出口轮换里被判失败的出口</li>
+        </ul>
+        <p class="hint">当前面板上有 <b>${cooling}</b> 个账户处于冷却中。</p>
+        <div class="warnbox">清空之后，下一次请求会立刻重新尝试这些家 —— 如果上游仍在你限流，
+        可能当场再撞一次 429，并重新把它们记成冷却。它适合"我知道现在能用了"（刚续费、刚换 Key、
+        上游已恢复）的场景；不适合拿来反复点。</div>`,
+      buttons: [
+        { label: '取消', cls: 'btn-ghost' },
+        {
+          label: '确认恢复',
+          cls: 'btn-primary',
+          onClick: () => { doResetCooldowns(); },
+        },
+      ],
+    });
+  });
   $('#btnOpenData').addEventListener('click', () => {
     if (LG.state) window.lgw.openPath(LG.state.dataDir);
   });

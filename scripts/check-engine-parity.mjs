@@ -464,6 +464,42 @@ const DECLARED = [
   // ---- 审计 R11：用量保留天数与界面区间对齐 ----
   { name: 'USAGE_KEEP_DAYS', why: '改动（审计 R11）：保留期从写死的 30 天改为「默认 90 天 + DSH_GATEWAY_USAGE_KEEP_DAYS 可覆盖」。缺陷形态与 R10 修掉的 dumpWorkbuddy11128 死代码同族、都是"承诺了一个范围，实现只给了一半"：`renderer/js/usage.js:226` 的天数按钮是 [1, 7, 30, 90]，`src/usage.js:157` 老老实实按 90 天算 cutoff，但磁盘上超过 30 天的日文件早被 pruneUsageFiles 删掉了 —— 用户点「90 天」看到的是"最近 90 天"的数字，实际只统计到 30 天，而界面上没有任何提示。取 90 对齐界面最长期；允许调大（属"先存着以后用"），下调要谨慎因为删掉就真没了' },
 
+  // ---- 2026-10-29：drop-thinking 降噪 + 「这家不提供该模型」记忆 ----
+  { name: 'thinkingDropLogged', why: '新增：已记过 drop-thinking 说明的供应商集合。amd 的 DeepSeek-V4.1-Flash 不认顶层 thinking 参数（400 `"thinking" is not supported for this model.`），配置里写 quirks:["drop-thinking"] 后由网关在发送前剥掉、请求照常成功 —— 但那行说明原先**每个请求都打一遍**、措辞又像报错，用户读成"一直报错"。改成每供应商只记一次，文案也去掉"错误"字样' },
+  { name: 'MODEL_NOT_OFFERED_TTL_MS', why: '新增：「这家不提供该模型」的记忆时长（默认 10 分钟，DSH_GATEWAY_NOT_OFFERED_TTL_MS 可调）。sensenova 每轮必回 403 `model is not available in the current token plan`、x666 必回 503 model_not_found，白花 1–3 秒；但这类事实既可能变（用户刚开通/刚换 Key），也不能当成永久结论' },
+  { name: 'modelNotOfferedUntil', why: '新增：上面那条记忆的存储（key = providerId\\u0000逻辑模型）' },
+  { name: 'MODEL_NOT_OFFERED_MAX', why: '新增：容量上界 2000（按"供应商 × 模型"的笛卡尔积，正常只有几十条）' },
+  { name: 'notOfferedKey', why: '新增：记忆键的拼装（分隔符 \\u0000，与 modelBreakerKey 同约定）' },
+  { name: 'markModelNotOffered', why: '新增：记一笔，命中上限时整表清空（比逐条淘汰更省事，且这些记忆本来 10 分钟就过期）' },
+  { name: 'isModelCachedNotOffered', why: '新增：查记忆（过期即删）' },
+  { name: 'clearModelNotOffered', why: '新增：某家对某模型成功即清除该条 —— 自愈，不让一次误判粘住十分钟' },
+  { name: 'noteModelNotOffered', why: '新增：把"上游 ID 或逻辑名"归一成逻辑名后记一笔（两条转发路径共用）' },
+  { name: 'demoteNotOffered', why: '新增：把命中记忆的候选**排到队尾而不是删除**。删除 = 记忆过期前该家永远不被尝试（用户改好配置/上游补货也发现不了）；降级 = 好候选先上场，只有其余候选全失败时才轮到它（真到那一步，试一次仍然值得）' },
+
+  // ---- 2026-10-29：一键恢复（用户需求「增加『恢复』按钮，用于一键将冷却或受限的供应商恢复正常使用」）----
+  { name: 'resetAllCooldowns', why: '新增：清空本进程内所有"自保型"不可用状态（账户级 + 模型级冷却、供应商级 + 模型级熔断、出口冷却、"不提供该模型"记忆），语义 == "不重启地重启一次状态机"。为什么必须有：概览页「账户池与冷却」原本只能看不能动，一家被判定冷却后用户唯一出路是**重启整个网关**或干等 —— 而最长的一档是 12 小时（ACCOUNT_RESTRICTED_COOLDOWN_MS）。且刻意**不清** sessionAffinity / responseAffinity：那是缓存热度、不是可用性，清掉不会让谁恢复可用，只会白白丢掉已建立的上游 prompt cache 命中' },
+  { name: 'routeRequest', why: '改动：新增 `POST /reset-cooldowns` 分支，位置在 CORS 预检之后、`/v1/` 鉴权之前。**必须鉴权**（不像 /health 那样免鉴权就放行）：一条免鉴权的"把所有人的冷却清掉"接口等于让任何本机进程反复把网关推到"刚被限流就接着打"的滥用画像上；**只认 POST**（GET 会被地址栏/预取/反代日志顺手触发，改状态的端点不该有 GET 语义，非 POST 回 405）' },
+
+  // ---- 2026-10-30：WorkBuddy 凭据自愈（用户需求「我需要的是连接 workbuddy 的稳定性，可用性！！」）----
+  { name: 'workbuddyForceRefresh', why: '新增：「下一次解析必须刷新 token，不管本地 expiresAtMs 怎么说」的家集合（一次性，解析成功即消费）。为什么不能只靠 workbuddyNeedsRefresh：它只看缓存里的过期时间，而 token 被上游轮换/吊销时那个时间戳**仍然在未来** —— 2026-10-20 那次"永远 11128"就是这个原因。上游明确说凭据不对时，必须能覆盖掉"本地以为还没过期"的无知' },
+  { name: 'isWorkbuddyCredentialReject', why: '新增：判"这次失败是不是凭据的锅"，三种长相 —— 裸 401/403（token 被轮换/吊销）、12153 / `Offline user session not found` 类会话措辞、`code:11128`。为什么必须单独判：这类失败此前被 ACCOUNT_FAILURE_RULES 的 bare-401-403 吃掉 → kind=session → 把**完全正常的账号**冷却 60 分钟，用户现象是"WorkBuddy 时不时整家挂一小时"。它与额度耗尽/限流处置完全相反：换账户没用（同一台机器的凭据是同一套），正确处置是刷新凭据后**原地重发同一个账户**' },
+  { name: 'invalidateWorkBuddyCredential', why: '改动（2026-10-30 复核）：函数体未变，但它现在被两类拒绝共用 —— 11128 两处（既有）+ 401/403/12153 两类新增重试点。语义仍是"作废该家全部缓存凭据并登记强制走桌面 auth 文件"' },
+  { name: 'forwardWithAccounts', why: '改动（2026-10-30）：账户池循环新增"换凭据重试同一账户"分支（每账户最多一次，`i--` 让下一轮仍是这个账户），位置在 `sink.modelScopeOnly` 之后、`classifyAccountFailure` 之前 —— 排在 modelScopeOnly 之后是必须的：与账号无关的拒绝（地区受限/模型下架）换凭据也没用' },
+  { name: 'forwardAnthropicViaOpenAI', why: '改动（2026-10-30）：翻译路径两处新增同一自愈分支（有账户时在 acctKind 分支之前、无账户时在 401/403 分支之前）。这条路径是 DSH 最常用的链路（Anthropic 客户端 → openai-chat 上游），只改直通路径等于只修一半' },
+  { name: 'resolveWorkBuddyCredential', why: '改动（2026-10-30）：刷新条件从 `workbuddyNeedsRefresh(cred)` 改为 `workbuddyForceRefresh.delete(id) || workbuddyNeedsRefresh(cred)`；强制刷新失败时**不再**适用"token 未过期就继续用"的豁免 —— 上游刚说它不认这份凭据，带着它重试只会再挨一次同样的 401' },
+
+  // ---- 2026-10-30：WorkBuddy 11128 真因（提示词句式指纹）与三级自救 ----
+  { name: 'WB_PROMPT_FINGERPRINTS', why: '新增：Claude-Code 风格提示词句式 → 等价说法的替换表。真因由二分实验钉死：身份句改写**已生效**（出站是 `You are an AI agent.`）仍回 11128；触发面是两句连写 —— `Tokens prefixed with @ are paths the user explicitly referenced.` + `Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.`（单发任一句 200，两句连写 11128；删掉那个 `@`、换成 `at`、或整段换说法即 200）。长度/工具数/请求体量全部排除' },
+  { name: 'WB_NEUTRAL_SYSTEM', why: '新增：11128 最后一级自救用的中性 system（一行身份 + 一句"按用户语言回答"）。为什么需要：身份句与句式都改完仍被拒时，唯一还能换的就是整份 system。代价必须说清 —— 这一发 system 里的细节指令不生效（工具声明与工具调用不受影响）' },
+  { name: 'scrubWorkbuddyPromptFingerprintText', why: '新增：按 WB_PROMPT_FINGERPRINTS 逐条换说法，返回 {text,n}（n 用于日志「渠道**句式**改写：N 处」）。与身份句改写分开的理由：身份句是"哪个 Harness"，句式是"像不像 Claude Code 的框架提示词"，实验室里两者是**独立**的触发向量（只改身份句不够）' },
+  { name: 'neutralizeWorkbuddySystem', why: '新增：把 body.system（string / 块数组）与 body.messages[0] 的 system/developer 文本换成 WB_NEUTRAL_SYSTEM。⚠ 调用点必须落在"每次构建 body 之后"：翻译路径每轮都从 Anthropic 原始请求重建 OpenAI 体，改上一轮的 finalBody 会被覆盖（首版就这么写错，靠测试里"第二次请求仍是原 system"才暴露）' },
+  { name: 'scrubWorkbuddyTextPair', why: '新增：一次遍历同时做身份句改写与句式改写，返回 {text,n,f}（n=身份句处数、f=句式处数）。result 的三个字段都被 translateBody 用来分别记账 —— 两件事混在一个计数里，日志就分不清"是身份改写起作用还是句式改写起作用"' },
+  { name: 'scrubWorkbuddyMessage', why: '改动（2026-10-30）：返回值从 {msg,n} 变为 {msg,n,f}（f=句式改写处数），调用方 translateBody 相应累加 wbFpScrubbed' },
+  { name: 'translateBody', why: '改动（2026-10-30）：新增 wbFpScrubbed 计数与「渠道**句式**改写：N 处」日志行；调用点条件从 `r.n` 改为 `r.n || r.f`（只改句式也算改过，必须标脏）' },
+
+  // ---- 2026-11-04：缓存命中率口径（用户报「缓存命中率严重下降」）----
+  { name: 'inputTokensIncludeCache', why: '新增：判上游 usage 的 input 口径**含不含**缓存。Anthropic 的三桶互斥（input_tokens + cache_read + cache_creation = 总输入），OpenAI chat 的 prompt_tokens / Responses 的 input_tokens 则**包含** cached_tokens。为什么必须按形状判、不能无条件减：Anthropic 直通的 input_tokens 本身就不含缓存，再减一次会直接变 0（另一种方向的错）。实测：prompt_tokens=4386 / cached=4224，旧口径 4224/(4386+4224)=49%，真值 4224/4386=96% —— 这正是用户截图里那个 49%' },
+
   // ⚠ 待办：本清单在 v1.0.7 之后就没再维护，v1.0.8–v1.0.17 的改动（OpenCode 车道、
   //   出口轮换等）大量未登记，`node scripts/check-engine-parity.mjs`
   //   因此恒报 FAIL（本次改动之前就已经是红的）。这是清单腐烂，不是功能回退，

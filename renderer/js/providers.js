@@ -33,7 +33,10 @@ LG.renders.providers = function renderProviders() {
   $('#provEmpty').classList.toggle('hidden', total > 0);
   if (total === 0) { box.innerHTML = ''; return; }
 
-  box.innerHTML = rows.map(({ p, i }) => {
+  const note = LG.proxyTestNote
+    ? `<div class="warnbox" style="margin:0 0 10px">${esc(LG.proxyTestNote)}</div>`
+    : '';
+  box.innerHTML = note + rows.map(({ p, i }) => {
     const models = modelEntriesOf(p);
     const logical = new Set(models.map((e) => e.as));
     const t = LG.testResults[p.id];
@@ -225,6 +228,24 @@ function moveItem(arr, from, to) {
 
 /* ==================== 连通性测试 ==================== */
 
+/**
+ * 记录"本次测试是怎么走网络的"。
+ *
+ * 主进程的 resolveProxy() 在「配置的代理连不上」时会静默降级直连 —— 这本身是对的，
+ * 但探测结果会把**需要代理才能到达**的家全报成"连不上"，用户看到一片红就以为渠道全挂。
+ * 实测（2026-11-03）：本机代理没启动时 agentrouter/x666/windhub/nvidia 齐刷刷报连不上，
+ * 而它们的真实调用成功率是 137/140、37/37、9/9 —— 全是假失败。
+ * 所以降级这件事必须写在列表上方，而不是只躺在 /health 里。
+ */
+function noteProxy(r) {
+  const n = r && r.proxyNote;
+  if (!n || !n.warn) { LG.proxyTestNote = ''; return; }
+  const configured = n.configured ? `「${n.configured}」` : '配置的代理';
+  LG.proxyTestNote = `本次测试时本机代理 ${configured} 连不上（没启动 / 端口或地址写错），`
+    + (n.used ? `已自动改用 ${n.used}` : '已降级为直连')
+    + '。标着「连不上」的家很可能只是需要代理，不代表渠道坏了 —— 把代理开起来再测一次即可确认。';
+}
+
 async function testOne(p) {
   if (!p || !p.id) return;
   LG.testResults[p.id] = { busy: true };
@@ -240,6 +261,7 @@ async function testOne(p) {
     return;
   }
   const one = (r && r.results && r.results[0]) || { ok: false, verdict: (r && r.error) || '探测失败' };
+  noteProxy(r);
   LG.testResults[p.id] = one;
   LG.renders.providers();
   toast(`${p.id}：${one.verdict || ''}`, one.ok === true ? 'ok' : (one.ok === null ? 'warn' : 'err'), 6000);
@@ -276,6 +298,7 @@ async function testAll() {
     return;
   }
   results.forEach((x) => { if (x && x.id) LG.testResults[x.id] = x; });
+  noteProxy(r);
   // 主进程没回的那些（被整体预算截断之外的极端情况）也要把 busy 清掉，否则圆点一直转
   list.forEach((p) => {
     const cur = LG.testResults[p.id];
@@ -284,12 +307,16 @@ async function testAll() {
   LG.renders.providers();
   const okN = results.filter((x) => x.ok === true).length;
   const badN = results.filter((x) => x.ok === false).length;
+  // 「判不出来」不能混进"异常"里：限流、模型级限制、本机代理不通都会落在这里，
+  // 它们都不是"这家坏了"。分开报，用户才知道下一步该做什么。
+  const unkN = results.filter((x) => x.ok === null && !x.skipped).length;
   // 整体时间预算用完时主进程会返回 skipped 条目 —— 如实告诉用户"还有几家没测"，
   // 而不是把它们混进"其余未知"里让人以为都测过了。
   const skipN = results.filter((x) => x.skipped).length;
   toast(`连通性测试完成：${okN} 家正常 / ${badN} 家异常`
-    + (skipN ? ` / ${skipN} 家未测（时间预算用完，请单独测试）` : ' / 其余未知'),
-  badN ? 'warn' : 'ok', 6000);
+    + (unkN ? ` / ${unkN} 家判不出来（限流 / 连接 / 模型限制）` : '')
+    + (skipN ? ` / ${skipN} 家未测（时间预算用完，请单独测试）` : ''),
+  (badN || unkN) ? 'warn' : 'ok', 6000);
 }
 
 /* ==================== 编辑抽屉 ==================== */

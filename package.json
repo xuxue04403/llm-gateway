@@ -1,7 +1,7 @@
 {
   "name": "llm-gateway",
   "productName": "LLM Gateway",
-  "version": "1.0.23",
+  "version": "1.0.25",
   "description": "通用桌面版 LLM 网关：多供应商统一代理（OpenAI / Anthropic / Responses 三协议）+ 一键写入 dsh / Claude Code / Codex 等客户端",
   "main": "src/main.js",
   "private": true,
@@ -20,7 +20,7 @@
   },
   "scripts": {
     "start": "electron .",
-    "test": "node tests/unit.js && node tests/writers.test.js && node tests/edge.test.js && node tests/security.test.js && node tests/renderer.test.js && node tests/gateway.test.js",
+    "test": "node tests/unit.js && node tests/probe.test.js && node tests/writers.test.js && node tests/edge.test.js && node tests/security.test.js && node tests/renderer.test.js && node tests/gateway.test.js",
     "check": "node --check src/main.js && node --check src/gateway-manager.js && node --check src/writers/index.js",
     "parity": "node scripts/check-engine-parity.mjs",
     "verify-artifact": "node scripts/verify-artifact.mjs",

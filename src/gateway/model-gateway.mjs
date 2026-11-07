@@ -9,6 +9,7 @@
  *  - POST /v1/messages          Anthropic protocol (same routing)
  *  - POST /v1/responses         passthrough (same routing)
  *  - GET  /health               liveness probe for the desktop assistant
+ *  - POST /reset-cooldowns      clear all cooldown/breaker state (one-click "recover" in the UI)
  *  - unified Bearer auth (config.apiKey) on all /v1 routes
  *  - SSE streaming passthrough (node fetch ReadableStream -> res)
  *  - per-provider model-catalog cache with TTL, cleared on failure
@@ -1392,6 +1393,12 @@ const clientSimulationProviders = new Set();
  * 不想等学习、或想强制某家永不发 thinking，可在配置里写 `quirks: ["drop-thinking"]`。
  */
 const thinkingUnsupportedProviders = new Set();
+
+/**
+ * 已经为哪些供应商记过"剥离 thinking"那一行（2026-10-29）。
+ * 剥离本身是**预期行为**，每请求记一次只会把日志刷成一片警告色（用户据此报"一直在报错"）。
+ */
+const thinkingDropLogged = new Set();
 
 /** 该家是否应去掉顶层 thinking 参数：已学习，或显式声明了 drop-thinking quirk。 */
 function shouldDropThinking(provider) {
@@ -4087,6 +4094,36 @@ function invalidateWorkBuddyCredential(providerId) {
 const workbuddyForceDesktop = new Set();
 
 /**
+ * 同上，但记的是「下一次解析**必须刷新**，不管 `expiresAtMs` 怎么说」的家
+ *（由凭据类拒绝触发，判据见 {@link isWorkbuddyCredentialReject}）。
+ *
+ * 为什么需要单独一个标记：`workbuddyNeedsRefresh()` 只看本地缓存里的 `expiresAtMs`（留 5 分钟余量）。
+ * token 被上游轮换/吊销时，那个时间戳**仍然是未来**，于是"按需刷新"永远不触发 ——
+ * 2026-10-20 那次卡死就是这个原因（详见 {@link invalidateWorkBuddyCredential} 上方的事故记录）。
+ * "上游说你的凭据不对"必须能覆盖掉"本地以为还没过期"这种无知。
+ */
+const workbuddyForceRefresh = new Set();
+
+/**
+ * 这次失败是不是**凭据的锅** —— WorkBuddy 的凭据类拒绝有三种长相，处置与"额度/限流"完全相反：
+ *   ① 裸 401/403：token 被轮换或吊销（桌面端重新登录、或另一处刷新把它顶掉）
+ *   ② 12153 / `Offline user session not found` 一类的会话措辞
+ *   ③ `code:11128`（未授权通道）：四种已知成因里两种就是"手里的 token 不是当前那一个"
+ *
+ * 这三种都**不该**把账户冷却 60 分钟 —— 那等于"一次 token 过期 = 这把号锁一小时"，
+ * 而它恰恰是最容易自愈的一类失败。正确处置：作废缓存 → 强制刷新/重读桌面 auth →
+ * **原地重试同一账户**。换账户没用（同一台机器上的凭据都是同一套），换家也没用（问题不在这家）。
+ */
+function isWorkbuddyCredentialReject(status, detail) {
+  const code = Number(status) || 0;
+  const d = String(detail || '');
+  if (!d) return code === 401 || code === 403;
+  if (WORKBUDDY_SESSION_RE.test(d)) return true;
+  if (WORKBUDDY_CHANNEL_BLOCK_RE.test(d)) return true;
+  return code === 401 || code === 403;
+}
+
+/**
  * 11128 现场转储（默认关闭，`DSH_GATEWAY_DUMP_WB11128=1` 才写）。
  *
  * 为什么需要它：这个错误码的四种成因（token 失效 / 缺会话头 / 角色 / **system 身份句指纹**）
@@ -4326,12 +4363,20 @@ async function resolveWorkBuddyCredential(provider, acct) {
         );
       }
     }
-    if (workbuddyNeedsRefresh(cred)) {
+    // 「上一次请求被上游以凭据为由拒了」→ 无论 `expiresAtMs` 说什么都刷一次。
+    // 标记是一次性的：解析成功即消费掉（`Set.delete` 的返回值就是"这次要不要强制刷"）。
+    const forcedRefresh = workbuddyForceRefresh.delete(String(provider.id));
+    if (forcedRefresh || workbuddyNeedsRefresh(cred)) {
       try {
         cred = await refreshWorkBuddyToken(provider, acct, cred);
+        if (forcedRefresh) {
+          log(`account ${provider.id}#${acct ? acct.id : '-'} 凭据被上游拒绝过 → 已强制刷新 token（不看本地过期时间）`);
+        }
       } catch (e) {
-        if (cred.expiresAtMs > Date.now() + 30_000) {
-          log(`account ${provider.id}#${acct.id} 刷新失败但 token 未过期，继续使用：${e && e.message}`);
+        // 强制刷新失败时，"token 未过期就继续用"这条豁免**不适用** ——
+        // 上游刚刚明确说它不认这份凭据，带着它重试只会再挨一次同样的 401。
+        if (!forcedRefresh && cred.expiresAtMs > Date.now() + 30_000) {
+          log(`account ${provider.id}#${acct ? acct.id : '-'} 刷新失败但 token 未过期，继续使用：${e && e.message}`);
         } else {
           throw e;
         }
@@ -4909,7 +4954,28 @@ async function forwardWithAccounts(provider, upstreamPath, baseHeaders, body, re
       log(`provider ${provider.id} 头部构造失败：${e && e.message}`);
       return false;
     }
-    return forward(provider, upstreamPath, headers, body, res, opts);
+    const sink0 = {};
+    const first = await forward(provider, upstreamPath, headers, body, res, { ...(opts || {}), failureSink: sink0 });
+    // 无账户池的 WorkBuddy（配置里只写 authFile、没写 accounts）也要能自愈：
+    // 与上面账户池分支同一判据、同一处置 —— 作废并强制刷新后**再发一次**，
+    // 只不过这里没有"下一个账户"可选，重试失败就照旧交回调用方换下一家。
+    if (first !== true && !res.headersSent
+        && String(provider.auth || '').toLowerCase() === 'workbuddy'
+        && isWorkbuddyCredentialReject(sink0.status || 0, sink0.detail || '')) {
+      const dropped = invalidateWorkBuddyCredential(provider.id);
+      workbuddyForceRefresh.add(String(provider.id));
+      let again = headers;
+      try {
+        again = await accountUpstreamHeaders(provider, null, baseHeaders, { anthropicUpstream, model: scopeModel });
+      } catch (e) {
+        log(`provider ${provider.id} 凭据被拒后重建头失败：${e && e.message}`);
+        return first;
+      }
+      log(`provider ${provider.id} 凭据被上游拒绝（HTTP ${sink0.status || '?'}）`
+        + ` → 作废 ${dropped} 条凭据缓存并强制刷新，**原地重试一次**`);
+      return forward(provider, upstreamPath, again, body, res, opts);
+    }
+    return first;
   }
   const usable = accounts.filter((a) => accountUsable(provider.id, a, scopeModel));
   if (usable.length === 0) {
@@ -4922,6 +4988,12 @@ async function forwardWithAccounts(provider, upstreamPath, baseHeaders, body, re
   const ordered = [...usable.slice(n % usable.length), ...usable.slice(0, n % usable.length)];
   const anthropicUpstream = upstreamPath === '/messages' || upstreamPath === '/v1/messages';
   let lastOut = false;
+  // 「换凭据重发」的记账（每账户最多一次）。与"换账户"是两件事：
+  //   · 换账户 = 这把号的额度/限流到顶了 → 用另一把号
+  //   · 换凭据 = 这把号本身没问题，是**手里这份 token 过期了** → 还是这把号，重发一次
+  // 不做这个区分时（2026-10-30 前的行为），一次 token 轮换就会把账户冷却 60 分钟，
+  // 而它本该是一次刷新就解决的事（WorkBuddy 桌面端和网关会各自刷新同一个账号的 token）。
+  const credRetried = new Set();
   for (let i = 0; i < ordered.length; i++) {
     const acct = ordered[i];
     let headers;
@@ -4943,6 +5015,28 @@ async function forwardWithAccounts(provider, upstreamPath, baseHeaders, body, re
     // 实测：不带这个判断时，一个地区受限的模型会把该家 2 把 Key 全部标成 session（冷却 1 小时），
     // 随后同家另一个完全正常的模型在路由阶段就被"全部冷却中"挡掉。
     if (sink.modelScopeOnly) return out;
+    // ── 凭据类拒绝 → 换一份凭据，**原地重试同一个账户**（2026-10-30）───────────────
+    //
+    // 现场动机：WorkBuddy 的 token 会被桌面端和网关两边各自刷新，任一方刷新后另一方的
+    // 旧 token 立刻失效 —— 上游回 401/403 或 12153。旧实现在这里直接 `markAccountFailure(...,'session')`，
+    // 也就是把这个**完全正常的账号**冷却 60 分钟；用户看到的现象就是"WorkBuddy 时不时整家不可用"，
+    // 而且一挂就是一小时，只能靠重启网关或等。
+    //
+    // 这类失败的正确处置是"刷新凭据再发一次"：作废该家缓存 + 登记强制刷新（见
+    // {@link isWorkbuddyCredentialReject} 里的三种长相）。`i--` 让下一轮仍然是**这个账户** ——
+    // 变的只是手里那份 token，不是账号。
+    if (String(provider.auth || '').toLowerCase() === 'workbuddy'
+        && !credRetried.has(acct.id)
+        && isWorkbuddyCredentialReject(sink.status || 0, sink.detail || '')) {
+      credRetried.add(acct.id);
+      const dropped = invalidateWorkBuddyCredential(provider.id);
+      workbuddyForceRefresh.add(String(provider.id));
+      log(`account ${provider.id}#${acct.id} 凭据被上游拒绝（HTTP ${sink.status || '?'}）`
+        + ` → 作废 ${dropped} 条凭据缓存并强制刷新，**原地重试同一账户一次**`
+        + `（换账户没用：同一台机器的凭据是同一套）`);
+      i--;
+      continue;
+    }
     const kind = classifyAccountFailure(sink.status || 0, sink.detail || '');
     if (kind && i + 1 < ordered.length) {
       markAccountFailure(provider.id, acct, kind, sink.detail, scopeModel, sink.retryMs || 0);
@@ -5864,6 +5958,102 @@ const WB_NEUTRAL_IDENTITY = 'You are an AI agent.';
 const WB_BRAND_RE = /(?<![\\/])DeepSeek[\s_-]*Harness(?![\\/])/giu;
 const WB_BRAND_NEUTRAL = 'DeepSeekRuntime';
 
+/* ---------------- WorkBuddy 渠道校验：**第二类指纹**（提示词句式） ----------------
+ * 2026-10-30 实测定位（用户报"WorkBuddy 不可用、日志 11128"）：
+ *
+ *   身份句改写**已经生效**（出站 system 确实是 `You are an AI agent.`），但上游照样回 11128。
+ *   二分实验（`_scratch\wb-bisect*.mjs`，直打运行中的网关）把触发面缩到**两句连写**：
+ *
+ *     "Tokens prefixed with @ are paths the user explicitly referenced.
+ *      Relative paths resolve from the workspace root; absolute paths identify files or
+ *      directories on the host."
+ *
+ *   · 单发第一句 → 200；单发第二句 → 200；**两句连写（170 字符）→ 11128**；
+ *   · 把 `@` 换成 `at`、或只删掉那一个 `@` → 200（说明这是**句式组合**指纹，不是长度/字符）；
+ *   · 纯 3000 个 `x`、含 `@` 的长中性文本、52 个工具声明 → 全都 200（与工具数、体量无关）；
+ *   · 拿 DSH 真实 system（1246 字符，`_scratch` 里 dump 出来的原文）验证：
+ *       原样 → 11128（含 +52 工具）；**只把这两句换成本网关自己的说法 → 200**（含 +52 工具）。
+ *
+ * 所以第二类指纹是"**像 Claude Code 的提示词句式**"。处置与身份句一样：换成等价说法，
+ * 语义不动、用户无感，只把上游眼里的"这是 Claude Code 在发"这个信号削掉。
+ *
+ * ⚠ 这同样是猫鼠游戏：`WB_PROMPT_FINGERPRINTS` 只能覆盖**已实测到**的句式。
+ *   下一次上游换句子时，唯一的通用兜底是 11128 分支里的"中性 system 原地重试一次"
+ *   （见 forwardAnthropicViaOpenAI 里 `wb11128NeutralRetried` 那段），
+ *   它会牺牲 system 里的细节指令换"这一发能过"，并在日志里明说。
+ * ⚠ 只对 `auth: "workbuddy"` 的家生效；关闭开关与身份改写共用（`DSH_GATEWAY_WB_IDENTITY=0`）。
+ */
+const WB_PROMPT_FINGERPRINTS = [
+  {
+    from: 'Tokens prefixed with @ are paths the user explicitly referenced.',
+    to: 'Items beginning with @ name files or directories on the machine.',
+  },
+  {
+    from: 'Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.',
+    to: 'A path may be relative to the project root or absolute.',
+  },
+];
+// 11128 兜底重试用：把 system 换成一段"没有任何客户端特征"的中性说明。
+// 刻意保留一句身份 + 一句行为提示：上游要的是"看不出是谁发的"，而不是"什么都不说"。
+const WB_NEUTRAL_SYSTEM = 'You are an AI agent. Follow the user request and the tool descriptions. '
+  + 'Answer in the language the user writes in.';
+
+/** 把提示词句式指纹换成等价说法；返回 { text, n }（n = 改写处数） */
+function scrubWorkbuddyPromptFingerprintText(text) {
+  if (!text || typeof text !== 'string') return { text, n: 0 };
+  let out = text;
+  let n = 0;
+  for (const rule of WB_PROMPT_FINGERPRINTS) {
+    if (out.indexOf(rule.from) >= 0) {
+      out = out.split(rule.from).join(rule.to);
+      n += 1;
+    }
+  }
+  return { text: out, n };
+}
+
+/**
+ * 11128 自救第二级：把请求体里的 system 改成中性说明。
+ * 覆盖三种形状：`body.system`（string / [{type:'text'}]）、`body.messages[0].role === 'system'|'developer'`。
+ * 已改过（`retried` 里登记过）或本来就没什么可改 → 返回 false，调用方按原逻辑继续 failover。
+ * ⚠ 只改 system：user/assistant 历史一个字都不动（改历史 = 改用户的话，且不解决校验）。
+ */
+function neutralizeWorkbuddySystem(body, retried, key) {
+  if (!body || typeof body !== 'object') return false;
+  if (retried && retried.has(key)) return false;
+  let changed = false;
+  const neutral = (s) => (typeof s === 'string' && s.trim() && s.trim() !== WB_NEUTRAL_SYSTEM);
+  if (neutral(body.system)) {
+    body.system = WB_NEUTRAL_SYSTEM;
+    changed = true;
+  } else if (Array.isArray(body.system)) {
+    const textIdx = body.system.findIndex((b) => b && typeof b.text === 'string' && b.text.trim());
+    if (textIdx >= 0) {
+      const head = body.system.slice(0, textIdx);
+      body.system = [...head, { ...body.system[textIdx], text: WB_NEUTRAL_SYSTEM }];
+      changed = true;
+    }
+  }
+  const first = Array.isArray(body.messages) ? body.messages[0] : null;
+  if (first && (first.role === 'system' || first.role === 'developer')) {
+    const c = first.content;
+    if (neutral(c)) {
+      body.messages = [{ ...first, role: 'system', content: WB_NEUTRAL_SYSTEM }, ...body.messages.slice(1)];
+      changed = true;
+    } else if (Array.isArray(c)) {
+      const textIdx = c.findIndex((b) => b && typeof b.text === 'string' && b.text.trim());
+      if (textIdx >= 0) {
+        const next = { ...first, role: 'system', content: [...c.slice(0, textIdx), { ...c[textIdx], text: WB_NEUTRAL_SYSTEM }] };
+        body.messages = [next, ...body.messages.slice(1)];
+        changed = true;
+      }
+    }
+  }
+  if (!changed) return false;
+  if (retried) retried.add(key);
+  return true;
+}
+
 /** 该供应商是否走 WorkBuddy 凭据适配 */
 function isWorkBuddyAuth(provider) {
   return String((provider && provider.auth) || '').toLowerCase() === 'workbuddy';
@@ -5892,19 +6082,27 @@ function scrubWorkbuddyIdentityText(text) {
   return { text: out, n };
 }
 
-/** 把一条消息的文本内容（string / [{type:'text'}]）过一遍身份改写；返回 { msg, n } */
+/** 身份句 + 提示词句式一起过（两者是上游**两道**独立校验，日志分开计数） */
+function scrubWorkbuddyTextPair(text) {
+  const a = scrubWorkbuddyIdentityText(text);
+  const b = scrubWorkbuddyPromptFingerprintText(a.text);
+  return { text: b.text, n: a.n, f: b.n };
+}
+
+/** 把一条消息的文本内容（string / [{type:'text'}]）过一遍身份改写 + 句式改写；返回 { msg, n, f } */
 function scrubWorkbuddyMessage(msg) {
   let n = msg;
   let hits = 0;
+  let fp = 0;
   if (typeof n.content === 'string') {
-    const r = scrubWorkbuddyIdentityText(n.content);
-    if (r.n) { n = { ...n, content: r.text }; hits += r.n; }
+    const r = scrubWorkbuddyTextPair(n.content);
+    if (r.n || r.f) { n = { ...n, content: r.text }; hits += r.n; fp += r.f; }
   } else if (Array.isArray(n.content)) {
     let partsChanged = false;
     const parts = n.content.map((b) => {
       if (b && typeof b === 'object' && typeof b.text === 'string') {
-        const r = scrubWorkbuddyIdentityText(b.text);
-        if (r.n) { partsChanged = true; hits += r.n; return { ...b, text: r.text }; }
+        const r = scrubWorkbuddyTextPair(b.text);
+        if (r.n || r.f) { partsChanged = true; hits += r.n; fp += r.f; return { ...b, text: r.text }; }
       }
       return b;
     });
@@ -5916,14 +6114,17 @@ function scrubWorkbuddyMessage(msg) {
     const calls = n.tool_calls.map((c) => {
       const args = c && c.function && c.function.arguments;
       if (typeof args === 'string') {
-        const r = scrubWorkbuddyIdentityText(args);
-        if (r.n) { callsChanged = true; hits += r.n; return { ...c, function: { ...c.function, arguments: r.text } }; }
+        const r = scrubWorkbuddyTextPair(args);
+        if (r.n || r.f) {
+          callsChanged = true; hits += r.n; fp += r.f;
+          return { ...c, function: { ...c.function, arguments: r.text } };
+        }
       }
       return c;
     });
     if (callsChanged) n = { ...n, tool_calls: calls };
   }
-  return { msg: n, n: hits };
+  return { msg: n, n: hits, f: fp };
 }
 
 function translateBody(body, provider) {
@@ -5931,6 +6132,7 @@ function translateBody(body, provider) {
   const wbScope = isWorkBuddyAuth(provider) ? wbIdentityScrubScope(provider) : 'off';
   const wbScrub = wbScope !== 'off';
   let wbScrubbed = 0;
+  let wbFpScrubbed = 0;
   let out = translateReasoningBody(body, provider);
   if (!out || typeof out !== 'object' || Array.isArray(out)) return out;
   let changed = false;
@@ -5962,7 +6164,7 @@ function translateBody(body, provider) {
       //   · all：全角色改写（含 tool 结果与 tool_calls.arguments），参照实现的保守派口径
       if (wbScrub && (n.role === 'system' || wbScope === 'all')) {
         const r = scrubWorkbuddyMessage(n);
-        if (r.n) { n = r.msg; changed = true; wbScrubbed += r.n; }
+        if (r.n || r.f) { n = r.msg; changed = true; wbScrubbed += r.n; wbFpScrubbed += r.f; }
       }
       return n;
     });
@@ -5971,6 +6173,10 @@ function translateBody(body, provider) {
   if (wbScrubbed) {
     log(`WorkBuddy 渠道身份改写（范围 ${wbScope}）：${wbScrubbed} 处身份句/品牌词 → 「${WB_NEUTRAL_IDENTITY}」/「${WB_BRAND_NEUTRAL}」`
       + `｜不改则上游必回 400/11128（关闭：DSH_GATEWAY_WB_IDENTITY=0，全角色：=all）`);
+  }
+  if (wbFpScrubbed) {
+    log(`WorkBuddy 渠道**句式**改写：${wbFpScrubbed} 处 Claude-Code 风格提示词句式换成等价说法`
+      + `｜2026-10-30 实测：system 里那两句连写即被判 11128（与工具数、请求体量无关），换说法后同一请求 200`);
   }
   return out;
 }
@@ -6296,7 +6502,7 @@ const ROUTE_MISSING_RE = /invalid\s+url|not\s+implemented|unsupported\s+(method|
  *   · "unsupported model" / "model not offered" / "does not offer this model"
  * 只用于**继续 failover**，不用于判定"整个请求无解"。
  */
-const MODEL_UNSUPPORTED_BY_PROVIDER_RE = /requested\s+model[^\n]{0,120}?not\s+supported|model[^\n]{0,60}?is\s+not\s+available|model_not_found|unsupported\s+model|model\s+not\s+(?:offered|supported|found)|does\s+not\s+(?:offer|support)[^\n]{0,40}?model|is\s+not\s+available\s+in\s+your\s+(?:region|country|area|location)|not\s+available\s+in\s+your\s+(?:region|country|area|location)|(?:region|country|area)[-_\s]?(?:not\s+supported|restricted|blocked)|not\s+available\s+(?:for|on|in)\s+your\s+(?:plan|tier|subscription|account\s+level)|不提供[^\n]{0,20}?模型|模型[^\n]{0,20}?不支持|(?:地区|区域)[^\n]{0,10}?(?:不支持|不可用|受限)/i;
+const MODEL_UNSUPPORTED_BY_PROVIDER_RE = /requested\s+model[^\n]{0,120}?not\s+supported|model[^\n]{0,60}?is\s+not\s+available|model_not_found|unsupported\s+model|model\s+not\s+(?:offered|supported|found)|does\s+not\s+(?:offer|support)[^\n]{0,40}?model|is\s+not\s+available\s+in\s+your\s+(?:region|country|area|location)|not\s+available\s+in\s+your\s+(?:region|country|area|location)|(?:region|country|area)[-_\s]?(?:not\s+supported|restricted|blocked)|not\s+available\s+(?:for|on|in)\s+your\s+(?:plan|tier|subscription|account\s+level)|not\s+available\s+in\s+(?:the\s+)?(?:current\s+)?(?:token\s+)?(?:plan|tier|subscription)|only\s+available\s+via\s+[^\n]{0,40}?(?:product\s+surfaces?|official\s+client|desktop\s+app)|不提供[^\n]{0,20}?模型|模型[^\n]{0,20}?不支持|(?:地区|区域)[^\n]{0,10}?(?:不支持|不可用|受限)/i;
 
 /**
  * ── 工具调用可观测性（2026-10-13 加）─────────────────────────────────────
@@ -6559,7 +6765,130 @@ function isModelUnavailableByProvider(status, detail) {
   const d = String(detail || '');
   if (!d) return false;
   if (MODEL_UNSUPPORTED_BY_PROVIDER_RE.test(d)) return true;
+  // new-api / one-api 系（x666、windhub 等分销商）的措辞：
+  //   503 {"error":{"message":"No available channel for model deepseek-v4.1-flash under group level3 (distributor)"}}
+  // 这句话的意思是**该账号所在分组没有这个模型的渠道**，与凭据、与该家是否健康都无关：
+  // 同一家在真实流量里 37 次调用全部成功（走的是分组里有渠道的别的模型）。
+  // 旧实现不认这句 → 按 503 计「供应商失败」→ 3 次就熔断整家 2 分钟，
+  // 把一个纯模型级问题升级成了整家不可用（实测 2026-11-03）。
+  if (/\bno\s+available\s+channel\b/i.test(d) || /\bunder\s+group\b/i.test(d)) return true;
   return Number(status) === 404 && MODEL_MISSING_RE.test(d);
+}
+
+/* ---------------- 「这家不提供该模型」的短期记忆（2026-10-29） ----------------
+ *
+ * 现场（本机 2026-10-29 全天日志，165 次调用）：
+ *   sensenova HTTP 403 `model is not available in the current token plan`   ×138
+ *   x666      HTTP 503 `model_not_found`                                    ×122
+ * 两家都排在 priority=1，也就是**每个请求的第一次尝试**都先撞这两个必然失败的组合，
+ * 白花 1–3 秒延迟，一天重复 260 次。旧实现只打一行"若长期如此，请从配置的 models 里移除该映射"，
+ * 然后**下一次请求照旧**——把一件机器能记住的事留给用户手工维护配置。
+ *
+ * 现在的处置刻意选**降级排序**而不是删除候选：
+ *   · 删除 = 记忆过期前该家永远不被尝试（用户改好配置/上游补货也发现不了）；
+ *   · 降级到队尾 = 好候选先上场；只有其余候选全失败时才轮到它（真到那一步，试一次仍然值得）。
+ * 命中"不提供该模型"时记 10 分钟；同一组合再次失败就续期；**一旦成功立刻清除**（自愈）。
+ * TTL 可用 env `DSH_GATEWAY_NOT_OFFERED_TTL_MS` 覆盖。
+ */
+const MODEL_NOT_OFFERED_TTL_MS = (() => {
+  const n = Number(process.env.DSH_GATEWAY_NOT_OFFERED_TTL_MS);
+  return Number.isFinite(n) && n > 0 ? n : 10 * 60_000;
+})();
+/** key = `${providerId}\u0000${logicModel}` → 到期时间戳（ms） */
+const modelNotOfferedUntil = new Map();
+/** 无界增长防护：这是个按"供应商 × 模型"的笛卡尔积，正常只有几十条。 */
+const MODEL_NOT_OFFERED_MAX = 2000;
+
+function notOfferedKey(providerId, logicalModel) {
+  return String(providerId || '') + '\u0000' + String(logicalModel || '');
+}
+
+function markModelNotOffered(providerId, logicalModel) {
+  if (!providerId || !logicalModel) return;
+  if (modelNotOfferedUntil.size >= MODEL_NOT_OFFERED_MAX) modelNotOfferedUntil.clear();
+  modelNotOfferedUntil.set(notOfferedKey(providerId, logicalModel), Date.now() + MODEL_NOT_OFFERED_TTL_MS);
+}
+
+function isModelCachedNotOffered(providerId, logicalModel) {
+  const k = notOfferedKey(providerId, logicalModel);
+  const until = modelNotOfferedUntil.get(k);
+  if (!until) return false;
+  if (Date.now() >= until) { modelNotOfferedUntil.delete(k); return false; }
+  return true;
+}
+
+function clearModelNotOffered(providerId, logicalModel) {
+  if (!providerId || !logicalModel) return;
+  modelNotOfferedUntil.delete(notOfferedKey(providerId, logicalModel));
+}
+
+/** 上游 ID（或逻辑名）→ 记一笔"这家没有这个模型"。两条路径共用。 */
+function noteModelNotOffered(provider, model) {
+  if (!provider || !model) return;
+  const logical = logicalModelOf(provider, model);
+  if (logical) markModelNotOffered(provider.id, logical);
+}
+
+/**
+ * 把"先前明确回过不提供该模型"的候选**排到队尾**（不删除，见上面 TTL 说明）。
+ * 返回新数组；没有命中记忆时原样返回（引用不变，调用方无需判断）。
+ */
+function demoteNotOffered(order, logicalModel) {
+  if (!Array.isArray(order) || order.length < 2 || !logicalModel) return order;
+  const fresh = [];
+  const known = [];
+  for (const p of order) (isModelCachedNotOffered(p && p.id, logicalModel) ? known : fresh).push(p);
+  if (known.length === 0) return order;
+  log(`[route] ${logicalModel}: ${known.map((p) => p.id).join('、')} 先前明确回过"这家不提供该模型"`
+    + `（记忆 ${Math.round(MODEL_NOT_OFFERED_TTL_MS / 60000)} 分钟）→ 排到最后，不再每轮白试一次`);
+  return [...fresh, ...known];
+}
+
+/**
+ * 一键恢复（2026-10-29 用户需求）：把本进程内所有"自保型"的不可用状态一次性清空。
+ *
+ * 为什么必须有：概览页「账户池与冷却」只能看不能动。一家被判定成冷却后，用户唯一的出路是
+ * **重启整个网关**，或者干等 —— 而最长的一档是 `ACCOUNT_RESTRICTED_COOLDOWN_MS`（12 小时）、
+ * 熔断退避上限 30 分钟、模型级冷却同理。现实里最常见的三种起因（上游抽风/刚换好 Key/刚充值）
+ * 都不是"等一等"能解决的，用户明明知道"现在能用了"，界面却一点办法都没有。
+ *
+ * 清哪四类（全是**内存态**，本来重启就会清，所以这个动作的语义 == "不重启地重启一次状态机"）：
+ *   · `accountPool`  —— 账户级（credit/session/restricted）+ 模型级（rate）冷却
+ *   · `breaker`      —— 供应商级熔断（open / half-open 名额）
+ *   · `modelBreaker` —— 模型级熔断
+ *   · `modelNotOfferedUntil` —— "这家不提供该模型"的 10 分钟降级记忆
+ *   · `outletCooldown` —— 多出口轮换里被判失败的出口
+ *
+ * ⚠ 刻意**不清** sessionAffinity / responseAffinity：那两个是"缓存热度"（把同一会话粘到
+ *   同一家以命中上游 prompt cache），不是"可用性"。清掉不会让谁恢复可用，只会让下一轮白白
+ *   换一家、丢掉已经建立的缓存命中 —— 属于"看起来在帮用户，其实在扣钱"。
+ *
+ * ⚠ 也刻意**不清** breaker 里的 `opens`（连续开闸阶梯）——清表就等于清零，这正是"恢复"的
+ *   语义：用户明确说了"我现在要用它"，退避阶梯从头开始才是对的。
+ *
+ * @returns {{accounts:number, modelAccounts:number, providers:number, models:number, notOffered:number, egress:number}}
+ *   被清掉的条目数（**只数真正处于不可用状态的**，用于界面回显"恢复了几个"）
+ */
+function resetAllCooldowns() {
+  const now = Date.now();
+  // open 且未到点 / half-open（名额在途）才算"正在拦人"；closed 条目留着只是计数与退避历史
+  const blocked = (b) => !!b && (b.state === 'half-open' || (b.state === 'open' && now < (b.openUntil || 0)));
+  const counts = { accounts: 0, modelAccounts: 0, providers: 0, models: 0, notOffered: 0, egress: 0 };
+  for (const [, st] of accountPool) {
+    if (!st || coolEntryUsable(st)) continue;
+    if (st.model) counts.modelAccounts += 1;
+    else counts.accounts += 1;
+  }
+  for (const [, b] of breaker) if (blocked(b)) counts.providers += 1;
+  for (const [, b] of modelBreaker) if (blocked(b)) counts.models += 1;
+  counts.notOffered = modelNotOfferedUntil.size;
+  for (const u of outletList) if ((outletCooldown.get(u) || 0) > now) counts.egress += 1;
+  accountPool.clear();
+  breaker.clear();
+  modelBreaker.clear();
+  modelNotOfferedUntil.clear();
+  outletCooldown.clear();
+  return counts;
 }
 
 /** 见下方 MODEL_NOT_ON_ENDPOINT_RE：这家有这模型，但不在这个端点上（baseURL 路径写错）。 */
@@ -7595,7 +7924,17 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       const stripped = stripThinkingParam(outBody);
       if (stripped) {
         outBody = stripped.body;
-        log(`upstream ${provider.id}（不支持 thinking）→ 去掉顶层 thinking 参数后发送`);
+        // 2026-10-29（用户报"调用 amd 时一直报错"）：这行原来**每个请求都打一次**，
+        // 措辞又长得像报错，于是正常的配置行为被读成"持续失败"。
+        // 事实：AMD 的 DeepSeek-V4.1-Flash 对顶层 thinking 直接回
+        //   400 `"thinking" is not supported for this model`
+        // 所以剥掉是**必须且预期**的；它既不是错误，也不该每轮刷一次。
+        // 现在每个供应商只记一行（进程内），并明确写出"预期行为"。
+        if (!thinkingDropLogged.has(provider.id)) {
+          thinkingDropLogged.add(provider.id);
+          log(`upstream ${provider.id} 不支持 extended thinking（配置已声明 drop-thinking）`
+            + ' → 已剥掉顶层 thinking 参数后发送（预期行为，本供应商只在首次命中时记这一行）');
+        }
       }
     }
     // ── 转发前的最后一道整形（两个能力，都是"网关才做得了"的事）──
@@ -8078,6 +8417,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         // `session`，照样 markAccountFailure。实测日志：这里刚打完"不冷却账户"，
         // 紧接着就是 `account acctgeo#key1 标记为 session（冷却 3600s）`，
         // 然后 2 个 Key 全冷却 → healthy-model 直接被"全部冷却中"挡掉。
+        noteModelNotOffered(provider, body && body.model);   // 2026-10-29：排到最后，别再每轮白试
         if (opts.failureSink) opts.failureSink.modelScopeOnly = true;
         // "这家不提供该模型"不是"该家正常应答过"→ 只交还名额，不清失败计数（breakerReleaseSlot）
         breakerReleaseSlot(provider.id, bModel);
@@ -8141,6 +8481,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     if (isModelUnavailableByProvider(upstream.status, detail)) {
       log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"这家不提供该模型"（含地区/套餐受限）`
         + ' → 继续 failover（**不熔断该家**；该家对别的模型仍然正常。若长期如此，请从配置的 models 里移除该映射）');
+      noteModelNotOffered(provider, body && body.model);
       // ⚠ 必须交还半开探测名额 —— 与上方"账户级失败"、下方"确定性 4xx"同一个理由：
       // 这家上游**能正常应答**（只是没有这个模型），连接性是健康的。
       //
@@ -8217,6 +8558,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
           log(`upstream ${provider.id} HTTP 404 判定为"这家不提供该模型"（模型不存在/不支持）`
             + ' → 继续 failover（不熔断该家、不冷却账户；该家对别的模型仍然正常。'
             + '若长期如此，请从配置的 models 里移除该映射，或把它排到后面的优先级）');
+          noteModelNotOffered(provider, body && body.model);   // 2026-10-29：排到最后，别再每轮白试
           // 刻意**不调 breakerRecordFail**：该家对别的模型完全正常，记失败会连坐整家。
           // 半开名额已在上方交还（见本段开头的 breakerRecordSuccess）。
           return false;
@@ -8274,6 +8616,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       if (isModelUnavailableByProvider(upstream.status, detail)) {
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"这家不提供该模型"`
           + `（含地区/套餐受限）→ 继续 failover（不熔断该家；若长期如此，请从配置的 models 里移除该映射）`);
+        noteModelNotOffered(provider, body && body.model);   // 2026-10-29：排到最后，别再每轮白试
         return rawMode ? { retryable: upstream.status } : false;
       }
       // 2026-10-08 新增：**上游自己坏了**，但被包在 4xx 里回给我们 → 同样要继续 failover。
@@ -9627,6 +9970,7 @@ function chatToResponsesResponse(json, model) {
   const u = j.usage || {};
   const inTok = Number(u.prompt_tokens) || 0;
   const outTok = Number(u.completion_tokens) || 0;
+  const cached = cachedTokensOf(u);
   const incomplete = choice.finish_reason === 'length';
   return {
     id: String(j.id && /^resp/.test(j.id) ? j.id : 'resp_' + Math.random().toString(36).slice(2, 14)),
@@ -9636,7 +9980,14 @@ function chatToResponsesResponse(json, model) {
     model,
     output,
     ...(incomplete ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
-    usage: { input_tokens: inTok, output_tokens: outTok, total_tokens: Number(u.total_tokens) || (inTok + outTok) },
+    usage: {
+      input_tokens: inTok,
+      output_tokens: outTok,
+      total_tokens: Number(u.total_tokens) || (inTok + outTok),
+      // Responses 协议下 input_tokens **含**缓存命中，命中量在 details 里
+      // （不带它就是 0% 命中，客户端以为上游完全没缓存）。
+      ...(cached > 0 ? { input_tokens_details: { cached_tokens: cached } } : {}),
+    },
   };
 }
 
@@ -9905,8 +10256,12 @@ function makeStreamEncoder(wire, ctx) {
         //
         // 只在与起始值**不同**时附加 —— 上游没给真值时不凭空造一个字段，
         // 保持"没数据就不声明"。
+        // ⚠ 与 anthropicUsage 同一口径：canonical 事件里的 `e.in` 来自 chat 的
+        // `prompt_tokens`（**含**缓存），Anthropic 的 `input_tokens` **不含** ——
+        // 不减就会被客户端算两遍（真实 96% 显示成 49%）。
+        const realIn = Math.max(0, (Number(usageIn) || 0) - (Number(usageCached) || 0) - (Number(usageCacheWrite) || 0));
         const deltaUsage = { output_tokens: usageOut };
-        if (usageIn !== (ctx.inputTokens || 0)) deltaUsage.input_tokens = usageIn;
+        if (usageIn !== (ctx.inputTokens || 0)) deltaUsage.input_tokens = realIn;
         // ⚠ 缓存字段也只能在这里给。
         //
         // Anthropic 原生会把 `cache_read_input_tokens` 放在 message_start（服务端开跑前就知道
@@ -9932,7 +10287,14 @@ function makeStreamEncoder(wire, ctx) {
           response: {
             id: respId,
             object: 'response', status: 'completed', model: ctx.model, output,
-            usage: { input_tokens: usageIn, output_tokens: usageOut, total_tokens: usageIn + usageOut },
+            usage: {
+              input_tokens: usageIn,
+              output_tokens: usageOut,
+              total_tokens: usageIn + usageOut,
+              // Responses 的 input_tokens 含缓存；命中量必须在 details 里，
+              // 否则客户端算出的缓存命中率恒为 0%（2026-11-04 一并修）。
+              ...(usageCached > 0 ? { input_tokens_details: { cached_tokens: usageCached } } : {}),
+            },
           },
         });
         return;
@@ -9940,7 +10302,11 @@ function makeStreamEncoder(wire, ctx) {
       sseWrite(res, 'message', {
         id: 'chatcmpl', object: 'chat.completion.chunk', created: 0, model: ctx.model,
         choices: [{ index: 0, delta: {}, finish_reason: stopReason || 'stop' }],
-        usage: { prompt_tokens: usageIn, completion_tokens: usageOut, total_tokens: usageIn + usageOut },
+        usage: {
+          prompt_tokens: usageIn, completion_tokens: usageOut, total_tokens: usageIn + usageOut,
+          // chat 协议的 prompt_tokens 含缓存，命中量放 details（否则客户端算 0%）
+          ...(usageCached > 0 ? { prompt_tokens_details: { cached_tokens: usageCached } } : {}),
+        },
       });
       try { res.write('data: [DONE]\n\n'); } catch { /* 客户端已断开 */ }
     },
@@ -10613,17 +10979,61 @@ function cacheWriteTokensOf(usage) {
  * @param {number} outTok 已确定的 output_tokens
  */
 function anthropicUsage(usage, inTok, outTok) {
-  const u = {
-    input_tokens: Number(inTok) || 0,
-    output_tokens: Number(outTok) || 0,
-  };
   const cr = cachedTokensOf(usage);
   const cw = cacheWriteTokensOf(usage);
+  const rawIn = Number(inTok) || 0;
+  const u = {
+    // ⚠ 2026-11-04 实测修复（用户报"缓存命中率严重下降"，真实 97% 显示成 49%）。
+    //
+    // Anthropic 的 usage 是**三桶互斥**：input_tokens = 既没读缓存、也没写缓存的部分，
+    // 另外两桶是 cache_read_input_tokens / cache_creation_input_tokens。客户端算命中率
+    // 的分母就是这三者之和（DSH：billedInputTokens = uncached + read + write）。
+    //
+    // 而 OpenAI chat 的 `prompt_tokens` **包含** `prompt_tokens_details.cached_tokens`
+    // （Responses 的 `input_tokens` 包含 `input_tokens_details.cached_tokens`）。
+    // 直接把 prompt_tokens 当 input_tokens 报出去，缓存段就被算了两遍 → 命中率腰斩。
+    // 实测：prompt_tokens=4386 / cached=4224 → 旧口径 4224/8610=49%，真值 4224/4386=96%。
+    //
+    // 只在"上游是 OpenAI 口径"时减；Anthropic 原生的 input_tokens 本身就不含缓存，
+    // 再减一次会直接变成 0（这是另一种方向的错，必须按**形状**判，不能无条件减）。
+    input_tokens: inputTokensIncludeCache(usage) ? Math.max(0, rawIn - cr - cw) : rawIn,
+    output_tokens: Number(outTok) || 0,
+  };
   // 只在有值时附加 —— 上游没给就别凭空声明一个 0，否则客户端无法区分
   // "确实没命中" 与 "上游没报这个字段"。
   if (cr > 0) u.cache_read_input_tokens = cr;
   if (cw > 0) u.cache_creation_input_tokens = cw;
   return u;
+}
+
+/**
+ * 上游 usage 的 `prompt_tokens` / `input_tokens` 是否**包含**缓存命中。
+ *
+ *  · Anthropic 原生：`input_tokens` 与 `cache_read_input_tokens` / `cache_creation_input_tokens`
+ *    是三个互斥分桶 → **不含**。
+ *  · OpenAI chat：`prompt_tokens` 包含 `prompt_tokens_details.cached_tokens` → **含**。
+ *  · OpenAI Responses：`input_tokens` 包含 `input_tokens_details.cached_tokens` → **含**。
+ *
+ * ⚠ 判据必须是 **`prompt_tokens` 这个键在不在**，不能是「有没有 Anthropic 缓存字段」。
+ * 实测（2026-11-04，workbuddy → DeepSeek-V4.1-Flash）上游回的是**混合形状**：
+ *
+ *   {"prompt_tokens":4386,"prompt_tokens_details":{"cached_tokens":4224},
+ *    "prompt_cache_hit_tokens":4224,"prompt_cache_miss_tokens":162,
+ *    "cache_read_input_tokens":0,"cache_creation_input_tokens":0, ...}
+ *
+ * 它同时挂了 OpenAI 的 `prompt_tokens`（含缓存）和 Anthropic 的两桶字段（**恒为 0**）。
+ * 旧判据"看到 cache_read_input_tokens 就当 Anthropic"于是判成不含缓存 →
+ * `input_tokens` 原样报 4386，客户端再加上 4224 的 cache_read，命中率从 96% 腰斩成 49%。
+ */
+function inputTokensIncludeCache(usage) {
+  if (!usage || typeof usage !== 'object') return false;
+  // OpenAI chat：有 prompt_tokens，就按"含缓存"处理（哪怕旁边挂着恒为 0 的 Anthropic 字段）。
+  if (Number(usage.prompt_tokens) > 0) return true;
+  if ('prompt_tokens' in usage) return true;
+  // OpenAI Responses：input_tokens 含 input_tokens_details.cached_tokens。
+  if (usage.input_tokens_details && typeof usage.input_tokens_details === 'object') return true;
+  // 其余（含 Anthropic 原生 input_tokens 三桶互斥）→ 不含。
+  return false;
 }
 
 /** 把 OpenAI 非流式响应 → Anthropic message */
@@ -11095,14 +11505,18 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
   //
   // 这里的 `ensureStart()` 已经把估算值写进 message_start 了，改不了（事件已发出），
   // 所以在收尾帧把真值补回来 —— 客户端取"最后一次读到的 input_tokens"即为真值。
-  const realInTok = (usage && Number(usage.prompt_tokens) > 0) ? Number(usage.prompt_tokens) : null;
-  const deltaUsage = { output_tokens: outTok };
-  if (realInTok !== null) deltaUsage.input_tokens = realInTok;
   // 缓存命中/写入只能在收尾帧给（上游收尾才报；message_start 早已发出）。
   // 不给这两个字段，客户端算出的缓存命中率恒为 **0%** —— 实测上游明明报了
   // `prompt_tokens_details.cached_tokens: 2944`（见 anthropicUsage 的注释）。
   const realCached = cachedTokensOf(usage);
   const realCacheWrite = cacheWriteTokensOf(usage);
+  // ⚠ 与 anthropicUsage 同一口径：chat 的 prompt_tokens **含**缓存，Anthropic 的
+  // input_tokens **不含** —— 不减就会被客户端算两遍（真实 96% 显示成 49%）。
+  const realInTok = (usage && Number(usage.prompt_tokens) > 0)
+    ? Math.max(0, Number(usage.prompt_tokens) - realCached - realCacheWrite)
+    : null;
+  const deltaUsage = { output_tokens: outTok };
+  if (realInTok !== null) deltaUsage.input_tokens = realInTok;
   if (realCached > 0) deltaUsage.cache_read_input_tokens = realCached;
   if (realCacheWrite > 0) deltaUsage.cache_creation_input_tokens = realCacheWrite;
   if (!aggregateOnly) {
@@ -11181,6 +11595,15 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
   // 「上游自己忙」429 的原地重试预算（**本次调用**内共享，不是每账户一份）。
   // ⚠ 必须在循环**外面**声明：放在循环体内会在每次迭代被重置 → `ai--` 变成死循环。
   let busy429RetriesLeft = INLINE_429_MAX_RETRIES;
+  // 「换凭据重发」的记账（每账户最多一次），与直通路径同一语义 —— 详见 forwardWithAccounts 里的
+  // 同名变量注释：换账户是"这把号额度到顶"，换凭据是"这把号没问题、手里这份 token 过期了"。
+  // ⚠ 必须声明在循环**外面**：放在循环体会被每次迭代重置，`ai--` 就成了死循环。
+  const credRetried = new Set();
+  // 11128 的"中性 system 原地重试"记账（每家最多一次）。与 credRetried 同样的理由声明在循环外。
+  // 语义：身份句改写 + 句式改写都做完仍回 11128 → 说明上游换了我们还不认识的提示词指纹，
+  // 此时**牺牲 system 里的细节指令**换"这一发能过"：换成 WB_NEUTRAL_SYSTEM 再发一次。
+  // （2026-10-30：实测这样做能让"原样必 11128"的 DSH 真实 prompt 通过，代价是丢了系统提示。）
+  const wb11128NeutralRetried = new Set();
   for (let ai = 0; ai < attemptAccounts.length; ai++) {
     const acct = attemptAccounts[ai];
     const startedAt = Date.now();
@@ -11222,9 +11645,10 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
           outTok: num(u && u.output_tokens),
           cacheRead: num(u && u.cache_read_input_tokens),
           cacheWrite: num(u && u.cache_creation_input_tokens),
-          // `input_tokens` 来自 anthropicUsage(usage, **prompt_tokens**, ...) ——
-          // 而 OpenAI 的 prompt_tokens **含**缓存命中 → 需要减。
-          inTokIncludesCache: true,
+          // `input_tokens` 取自 anthropicUsage()：2026-11-04 起那里**已经**把
+          // OpenAI `prompt_tokens` 里的缓存段减掉了（Anthropic 的三桶互斥语义）。
+          // 所以这里不能再声明"含缓存"，否则 recordUsage 会**再减一次** → 落盘 inTok=0。
+          inTokIncludesCache: false,
         });
       } catch (e) {
         // 旁路失败要留痕（本次审计教训：静默 catch 会让"没记账"完全看不出来）
@@ -11286,6 +11710,18 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       if (fp) {
         finalBody = fp.body;
         log(`OpenCode 免费档工具指纹（翻译路径）：补声明 ${fp.added.join('/')}`);
+      }
+    }
+
+    // ── 11128 自救：上一轮已判定"改写都救不回来" → 这一轮直接换中性 system 再发 ──────
+    // ⚠ 必须在这里（每次构建 body 之后）改，**不能**在 11128 分支里改上一轮的 `finalBody`：
+    //   循环每轮都会从 Anthropic 原始 `body` 重新 `anthropicToOpenAIRequest` 构建一份新的
+    //   OpenAI 体，上一轮的修改会被原样覆盖 —— 首版就是这么写的，靠"第二次请求仍是原 system"
+    //   的断言才暴露出来（教训：要改的对象必须与真正 `JSON.stringify` 的是同一个实例）。
+    if (String(provider.auth || '').toLowerCase() === 'workbuddy' && wb11128NeutralRetried.has(provider.id)) {
+      if (neutralizeWorkbuddySystem(finalBody, null, provider.id)) {
+        log(`WorkBuddy 11128 自救：本次请求的 system 已换成中性说明（${WB_NEUTRAL_SYSTEM.length} 字符），`
+          + '工具声明与工具调用不受影响；代价是 system 里的细节指令这一发不生效');
       }
     }
 
@@ -11429,6 +11865,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"这家不提供该模型"（含地区/套餐受限）`
           + ' → 继续 failover（**不熔断该家、不冷却账户**；该家对别的模型仍然正常。'
           + '若长期如此，请从配置的 models 里移除该映射）');
+        noteModelNotOffered(provider, body && body.model);   // 2026-10-29：排到最后，别再每轮白试
         // ⚠ 必须交还半开探测名额。理由与直通路径同一处完全相同：
         // 上游能正常应答（只是没有这个模型），连接性是健康的；不交还的话
         // half-open 名额被永久占用 → 该家所有模型在熔断窗口内全部 503（连坐）。
@@ -11495,6 +11932,26 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
           lastDetail,
         );
         const missingConv = /conversation\s+id\s+missing/i.test(String(lastDetail || ''));
+        // ── 自救第二级：把 system 换成中性说明，原地重试一次（2026-10-30）────────────
+        // 身份句改写（WB_CHANNEL_IDENTITY_RE）与句式改写（WB_PROMPT_FINGERPRINTS）都做完
+        // 仍然 11128 → 说明上游认的是我们还不认识的提示词特征。此时若直接继续 failover，
+        // 等于这家**永远用不上**（DSH 每轮都会带同一份 system，每次都撞）。
+        // 换成一段"没有任何客户端特征"的中性 system 再发一次，实测能过；
+        // 代价是这次请求丢了 system 里的细节指令（工具声明还在，工具调用不受影响）。
+        // ⚠ 每家只试一次：`wb11128NeutralRetried` 在循环外声明，`ai--` 不会死循环。
+        // ⚠ 必须 clearTimeout：上一轮的定时器不清掉会在下一轮把请求误判成超时。
+        if (String(provider.auth || '').toLowerCase() === 'workbuddy'
+            && !wb11128NeutralRetried.has(provider.id)) {
+          wb11128NeutralRetried.add(provider.id);
+          const droppedNeutral = invalidateWorkBuddyCredential(provider.id);
+          log(`upstream ${provider.id} HTTP ${upstream.status} 11128：身份句/句式改写都没救回来`
+            + ' → 把 system 换成中性说明后再发一次'
+            + `（凭据缓存作废 ${droppedNeutral} 条）`
+            + '｜若这次成功，说明上游认的是 system 里的提示词特征，与凭据/头/出口无关');
+          clearTimeout(timer);
+          ai--;
+          continue;
+        }
         const dropped = String(provider.auth || '').toLowerCase() === 'workbuddy'
           ? invalidateWorkBuddyCredential(provider.id) : 0;
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为 WorkBuddy 渠道校验拒绝（11128）`
@@ -11509,6 +11966,22 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       const acctRule = acct ? accountFailureRule(upstream.status, lastDetail) : null;
       const acctKind = acctRule ? acctRule.kind : null;
       if (acctKind) {
+        // ── 凭据类拒绝 → 换一份凭据，**原地重试同一个账户**（2026-10-30）──────────
+        // 与直通路径（forwardWithAccounts）同一判据、同一处置，这条路径是 DSH 最常用的
+        // （Anthropic 客户端 → openai-chat 上游），漏了它等于只修一半。
+        if (acct && String(provider.auth || '').toLowerCase() === 'workbuddy'
+            && !credRetried.has(acct.id)
+            && isWorkbuddyCredentialReject(upstream.status, lastDetail)) {
+          credRetried.add(acct.id);
+          const droppedCred = invalidateWorkBuddyCredential(provider.id);
+          workbuddyForceRefresh.add(String(provider.id));
+          log(`account ${provider.id}#${acct.id} 凭据被上游拒绝（HTTP ${upstream.status}）`
+            + ` → 作废 ${droppedCred} 条凭据缓存并强制刷新，**原地重试同一账户一次**`
+            + `（换账户没用：同一台机器的凭据是同一套）`);
+          clearTimeout(timer);
+          ai--;          // 下一轮仍是这个账户，变的只是手里那份 token
+          continue;
+        }
         // F11：把 Retry-After 一并传下去。直通路径早就传了（见 forward 里的 failureSink.retryMs），
         // 翻译路径一直漏着 —— 上游明确说"600 秒后再来"时，这里只按指数退避冷却（90s 起）。
         markAccountFailure(provider.id, acct, acctKind, lastDetail, scopeModel, retryAfterMs(upstream));
@@ -11524,6 +11997,20 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         continue;   // 换下一个账户（此时尚未向客户端写任何字节）
       }
       if (upstream.status === 401 || upstream.status === 403 || upstream.status === 429 || upstream.status >= 500) {
+        // 无账户池的 WorkBuddy（只配了 authFile、没配 accounts）同样能自愈：
+        // 判据与账户池分支一致，只是"重试"没有账户可换，重试的就是同一份配置 ——
+        // 真正变化的是下一轮 `accountUpstreamHeaders` 会强制刷新后重新取到的 token。
+        if (!acct && String(provider.auth || '').toLowerCase() === 'workbuddy'
+            && !credRetried.has('-')
+            && isWorkbuddyCredentialReject(upstream.status, lastDetail)) {
+          credRetried.add('-');
+          const droppedCred = invalidateWorkBuddyCredential(provider.id);
+          workbuddyForceRefresh.add(String(provider.id));
+          log(`provider ${provider.id} 凭据被上游拒绝（HTTP ${upstream.status}）`
+            + ` → 作废 ${droppedCred} 条凭据缓存并强制刷新，**原地重试一次**`);
+          clearTimeout(timer);
+          continue;
+        }
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
         // 传 lastDetail：识别"该模型被下架"的 403 → 只冷却该模型，不连坐整家（2026-10-14）。
         breakerRecordFail(provider.id, upstream.status, upstream.status === 429 ? retryAfterMs(upstream) : 0, false, bModel, lastDetail);
@@ -12028,6 +12515,9 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
         + '（不删除 —— 全都失败时仍会轮到它们）');
     }
   }
+  // 2026-10-29：先前明确回过"这家不提供该模型"的候选**排到最后**（同样不删除）。
+  // 位置在 roomy 之后：两种降级理由各自独立，谁先谁后都不改变"好候选先上场"这个性质。
+  tryOrder = demoteNotOffered(tryOrder, model);
 
   // ── tool_loop（2026-10-25，吸收自 magpie `tool_loop.go`）──
   // 死循环的证据**已经在请求体里**：agent 每一轮都把整段对话重发一遍，
@@ -12118,6 +12608,8 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
     const out = await forwardWithAccounts(p, sendPath + search, passthroughHeaders(req.headers, p.apiKey, cfg.clientUA, effectiveClientProfile(cfg, p), cfg), sendBody, res, fwdOpts);
     if (out === true) {
       log(`served ${model} via ${viaTag(p.id)}`);
+      // 成功即自愈：这家其实服务得了该模型 → 撤掉"不提供该模型"的记忆（2026-10-29）。
+      clearModelNotOffered(p.id, model);
       // 会话亲和记档：记的是**实际成功的那家**（可能是 failover 之后的一家），
       // 下一轮就优先回到它 —— 缓存热度跟着真实服务方走，而不是跟着配置优先级走。
       if (sessKey) sessionAffinitySet(sessKey, p.id);
@@ -12456,6 +12948,9 @@ async function handleMessages(cfg, req, res, body) {
         + '（不删除 —— 全都失败时仍会轮到它们）');
     }
   }
+  // 2026-10-29：先前明确回过"这家不提供该模型"的候选**排到最后**（不删除，见 demoteNotOffered）。
+  // ⚠ 与 handleCompletion 同一处逻辑，改一处必须同时改另一处（本项目老坑）。
+  tryOrder = demoteNotOffered(tryOrder, model);
   if (ACTIVE_TOOL_LOOP) {
     const loop = detectToolLoop(outBody, 'anthropic-messages');
     if (loop) {
@@ -12533,6 +13028,8 @@ async function handleMessages(cfg, req, res, body) {
     }
     if (out === true) {
       log(`served ${model} via ${viaTag(p.id)} (anthropic)`);
+      // 成功即自愈：撤掉可能存在的"这家不提供该模型"记忆（2026-10-29）。
+      clearModelNotOffered(p.id, model);
       logCall(`via=${viaTag(p.id)}`, 'ok');
       return;
     }
@@ -12899,6 +13396,32 @@ async function routeRequest(cfg, req, res) {
       // 204 本身不能带 body，所以 end() 不带参数，也不要手写 content-length。
       res.end();
       return;
+    }
+
+    // 一键恢复（2026-10-29）：清空所有"冷却/熔断/受限"的自保状态，见 resetAllCooldowns 的注释。
+    //
+    // ⚠ 必须鉴权。`/health` 免鉴权是**只读**的（进程内 watchdog 自检要用），而这个端点改状态：
+    //   一条免鉴权的"把所有人的冷却清掉"接口，等于把用户交的学费（上游限流/封禁保护）一键作废，
+    //   而且会让任何本机进程都能反复把网关推到"刚被限流就接着打"的滥用画像上。
+    // ⚠ 只认 POST。GET 会被浏览器地址栏/预取/反代日志顺手触发，改状态的端点不该有 GET 语义。
+    if (p === '/reset-cooldowns') {
+      if (req.method !== 'POST') {
+        return json(res, 405, { error: { message: 'use POST /reset-cooldowns (this endpoint changes state)' } });
+      }
+      if (!authorized(req, cfg)) {
+        return json(res, 401, { error: { message: 'invalid or missing API key' } });
+      }
+      let cleared;
+      try {
+        cleared = resetAllCooldowns();
+      } catch (e) {
+        log(`[reset] 一键恢复失败：${e && e.message}`);
+        return json(res, 500, { error: { message: 'reset failed: ' + (e && e.message) } });
+      }
+      log(`[reset] 一键恢复：清空 账户冷却 ${cleared.accounts} 条、模型级账户冷却 ${cleared.modelAccounts} 条、`
+        + `供应商熔断 ${cleared.providers} 个、模型熔断 ${cleared.models} 个、`
+        + `"不提供该模型"记忆 ${cleared.notOffered} 条、出口冷却 ${cleared.egress} 个`);
+      return json(res, 200, { ok: true, cleared });
     }
 
     if (p.startsWith('/v1/')) {

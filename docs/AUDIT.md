@@ -2142,3 +2142,166 @@ README 水位与覆盖说明同步。
 是最后一层兜底没有专项用例、**上游根本没吐数据**、功能刚加。
 如果只记"5 条存活"这个数字，下一次还会踩。
 
+
+---
+
+## W. WorkBuddy 11128 真因定案：提示词**句式**指纹 + 三级自救（2026-10-30）
+
+用户报（原话）：`停止代码审计任务，排查workbuddy不可用的问题！`，附现场日志：DSH 的
+`/v1/messages` → `try workbuddy（anthropic→openai）` → `WorkBuddy 渠道身份改写（范围 identity）：3 处`
+→ `upstream workbuddy HTTP 400: {"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`。
+
+### W.1 先纠正上一轮（Q 节）的归因
+
+Q 节把 11128 归给"system 里的宿主身份句"，并据此写了身份句改写 —— **改写是对的、但不够**：
+现场日志里身份改写**已经生效**（出站 system 确实是 `You are an AI agent.`），上游照样 11128。
+
+### W.2 二分实验（决定性证据）
+
+全部直打运行实例 3091，判定只认响应体里的 `"code":11128`（早期版本用 `/11128/` 匹配整段日志，
+把自己那条"不改则上游必回 400/11128"的日志行也算成了失败 —— **假阳性来源，已修正**）。
+
+| 变量 | 结果 |
+|---|---|
+| 前缀长度 160/200/205/210/215/220/225/230/**235** | 200 |
+| 前缀长度 **240**/245/250/300/350/400/450/500 | **11128** |
+| 235 + 5 个 `Z`（=240）、200 + 40 个 `Z`（=240）、300 个 `x`、3000 个 `x` | 200 |
+| 240 原文去掉那个 `@`（239）/ `@`→`at`（241） | 200 |
+| S1「Tokens prefixed with @ are paths the user explicitly referenced.」单独 | 200 |
+| S2「Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.」单独 | 200 |
+| S3「A trailing slash marks a directory: list it when its contents matter.」单独 | 200 |
+| **S1+S2（170）** / S1+S2+S3（240） | **11128** |
+| S1+S3（134）/ S2+S3（175）/ IDENT+S1（189）/ IDENT+S2（230） | 200 |
+| 52 个工具（无 system） | 200 |
+| 等长中性 system（500 / 1273 字符）、「前 200 字符原样 + 后段中性」 | 200 |
+
+结论：**不是长度、不是工具、不是单个短语，而是"两句连写的 Claude-Code 框架提示词"这个组合特征**；
+改动一两个字符就能翻转（那个 `@` 正好在临界点上）—— 这类判据只能靠"换说法"绕，不能靠"删品牌词"绕。
+
+### W.3 真机验证
+
+- 真实 DSH system 已转储（1246 字符 / 15 行）。原样发 → **11128（带不带 52 个工具都一样）**。
+- 只把 S1、S2 换成本网关说法（语义不变）→ **200**，带 52 个工具也 200。
+- 修复后同一脚本四组全绿：原样 / 改写两句 / 改写+52 工具 / 原样+52 工具，全部 `served via workbuddy#acct1`，
+  日志出现 `WorkBuddy 渠道**句式**改写：2 处`。
+
+### W.4 落地（引擎改动）
+
+1. `WB_PROMPT_FINGERPRINTS` + `scrubWorkbuddyPromptFingerprintText`：把上述两句换成等价说法，
+   与身份句改写**分开计数**（日志能看出是哪一层起的效）。
+2. `WB_NEUTRAL_SYSTEM` + `neutralizeWorkbuddySystem`：最后一级自救 —— 两道改写都做完仍 11128 时，
+   把整份 `system` 换成中性说明，**原地重发一次**（每家每轮一次）。
+3. 11128 分支（翻译路径）：命中即登记"下一轮换中性 system"并 `ai--; continue`，不再直接 failover。
+
+### W.5 本轮踩的坑（值得记）
+
+- **改错了对象**：首版在 11128 分支里改 `finalBody` 再重试，测试直接抓到"第二次请求仍是原 system" ——
+  翻译路径每轮都从 Anthropic 原始请求 **重新构建** OpenAI 体，改上一轮的 body 会被原样覆盖。
+  要改的对象必须与真正 `JSON.stringify` 出去的是**同一份实例**。
+- 探针里 `try` 块内的 `const` 在块外引用会 `ReferenceError`，而它被外层 `catch {}` 吞掉 → 探针"看起来没生效"，
+  实际是崩在里面。**临时探针也要放在能看见的层级**。
+
+### W.6 最终水位
+
+```
+unit 104 / writers 50 / edge 29 / security 19 / renderer 24 / gateway 234(+2)
+合计 → 460 项 0 失败
+```
+
+## X. 第十三轮：缓存命中率口径（2026-11-04）
+
+用户报「使用 llm-gateway 的 deepseek-v4.1-flash 时，缓存命中率严重下降」，
+截图：`20.7M tok · 缓存命中 49%`。
+
+### X.1 结论：不是上游缓存坏了，是我们把 usage 报成了另一种语义
+
+- 账本 `logs/usage/2026-11-04.jsonl`（该模型 245 次，全部 workbuddy）：
+  `inTok=486,961 / cacheRead=15,731,456` → **真实命中 97.0%**。
+- 客户端（DSH）按 Anthropic 语义算：`billedInputTokens = input_tokens + cache_read + cache_creation`。
+- 而网关报的 `input_tokens` 取自 chat 上游的 `prompt_tokens` —— 它**包含** `cached_tokens`。
+  缓存段因此被算两遍：`4224 / (4386 + 4224) ≈ 49%`。截图那个 49% 就是这么来的。
+- 反向对齐：从今日账本往回取 **134 行**，按"双重计数"累计正好 `20.7M tok / 49.5%`，与截图逐字吻合。
+
+### X.2 为什么以前没暴露
+
+`recordUsage()`（引擎记账侧）早就有 `inTokIncludesCache` 语义位并做了减法，
+所以**账本一直是对的**，错的只有"回给客户端的那份 usage"。10-29 之前该模型主要走
+`amd|/messages`（Anthropic 原生直通，口径天然正确）；10-30 之后主力变成
+`workbuddy|/chat/completions`（翻译路径），差异才浮出来。
+
+### X.3 三处修正（都按**形状**判，不能无条件减）
+
+1. `anthropicUsage()`：新增 `inputTokensIncludeCache(usage)` —— 以 **`prompt_tokens` 在不在**
+   为准（有它 = OpenAI chat 形状 = 含缓存；`input_tokens_details` = Responses 形状 = 含；
+   其余 Anthropic 原生 = 三桶互斥 = 不含）。`input_tokens = max(0, rawIn - cached - cacheWrite)`。
+   （第一版按"有没有 Anthropic 缓存字段"判，被混合形状骗过，见 X.6。）
+2. 流式收尾 `message_delta`：同一减法（客户端取"最后一次读到的"usage）。
+3. 矩阵路径 `makeStreamEncoder.finish()`：canonical 事件里的 `e.in` 也来自 chat 的
+   `prompt_tokens`，同样先减再报。
+
+⚠ `inTokIncludesCache: true`（翻译路径的记账旁路）**必须同时改成 false** ——
+首版改漏了它，`recordUsage` 在已经减过的数上又减一次，落盘 `inTok=0`，
+被「用量记账覆盖」那条用例当场抓住（`rec.inTok` 期望 100，实际 0）。
+
+顺带补齐：OpenAI 形状的客户端（chat / Responses）此前**从不带** `cached_tokens`，
+命中率恒 0%；现在按各自协议的 `prompt_tokens_details` / `input_tokens_details` 补上。
+
+### X.4 新用例（`tests/gateway.test.js`）
+
+「chat 上游的 prompt_tokens 含缓存 → 报给 Anthropic 客户端前必须减掉」同时守两个方向：
+不减 → 报 1000（分母虚高）；减两次 → 报 0。断言三处：非流式、流式 `message_delta`、
+以及 **Anthropic 直通不得再减**（input_tokens 仍是 100）。
+
+### X.5 最终水位
+
+```
+unit 104 / probe 18 / writers 50 / edge 29 / security 19 / renderer 25 / gateway 236(+1)
+合计 → 481 项 0 失败
+```
+
+### X.6 第一版修完仍没生效 —— 真因是「形状判据」写反了（2026-11-04 追加）
+
+第一版代码全部落盘、测试全绿、打包副本已同步、程序已重启，真机探针却**一个字节都没变**：
+仍是 `{"input_tokens":4386,"cache_read_input_tokens":4224}`（应 162）。
+
+排查路径（都值得留档）：
+
+1. 确认不是没同步：`inputTokensIncludeCache` 在 repo 与 `out\LLM-Gateway\resources\app` 里各命中 2 次（定义 + 使用）。
+2. 确认走的就是这条路：日志 `try workbuddy for deepseek-v4.1-flash (anthropic→openai)` + `[call] … stream=0`。
+3. 对照实验：repo 引擎起 3099（只留 workbuddy）、打包副本引擎起 3098（同一份配置）→ **都还是 4386**，
+   说明与"跑的是哪份副本"无关。
+4. 决定性证据：把 `console.error` 插进 `anthropicUsage()` 打出上游原始 usage
+   （`_scratch\engine-dbg.mjs`），拿到 workbuddy 的**真实形状**：
+
+```json
+{"prompt_tokens":4386, "completion_tokens":1, "total_tokens":4387,
+ "prompt_tokens_details":{"cached_tokens":4224},
+ "prompt_cache_hit_tokens":4224, "prompt_cache_miss_tokens":162,
+ "cache_read_input_tokens":0, "cache_creation_input_tokens":0,
+ "prompt_cache_write_tokens":0, "cached_tokens":0, "credit":0.01}
+```
+
+**它同时挂了 OpenAI 的 `prompt_tokens`（含缓存）和 Anthropic 的两个桶字段（恒为 0）。**
+第一版判据是"看到 `cache_read_input_tokens` 就当 Anthropic 形状 → 不含缓存"，
+于是这条混合形状被判成"不含"，减法被整体跳过。
+
+修正：`inputTokensIncludeCache()` 改成 **`prompt_tokens` 在不在** 才算数 ——
+有 `prompt_tokens` 就按"含缓存"处理（哪怕旁边挂着恒 0 的 Anthropic 字段）；
+`input_tokens_details`（Responses 形状）也算"含"；其余（Anthropic 原生三桶互斥）为"不含"。
+
+⚠ 教训：**上游的 usage 不一定是"纯"某一种形状**。中转商（这里是 CodeBuddy/WorkBuddy）
+会把两套字段混着回，用"有没有某个字段"去判归属，一定会被零值字段骗到；
+要判就用**主键**（`prompt_tokens` vs `input_tokens`）。
+
+修后真机复验（`out\LLM-Gateway` 3091）：
+
+```
+call#1 {"input_tokens":162,"cache_read_input_tokens":4224}
+call#2 {"input_tokens":162,"cache_read_input_tokens":4224}
+call#3（多一句）{"input_tokens":174,"cache_read_input_tokens":4224}   → 命中率 96.3%
+流式 message_delta {"output_tokens":1,"input_tokens":162,"cache_read_input_tokens":4224}
+落盘账本 {"inTok":162,"cacheRead":4224,...}（不再被二次扣减成 0）
+```
+
+用例补了第 ④ 段（混合形状，断言 162 / 4224 / 三桶和 4386），就是这条缺陷的回归锁。
+
