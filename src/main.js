@@ -11,7 +11,7 @@
 // 窗口/托盘全无响应）。
 'use strict';
 
-const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, shell, dialog, nativeImage, session } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, clipboard, shell, dialog, nativeImage, session, powerMonitor } = require('electron');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -103,6 +103,15 @@ function createWindow() {
     win.show();
     if (settings.get('openDevTools')) win.webContents.openDevTools({ mode: 'detach' });
   });
+
+  // ⚠ 2026-11-12 复核修（M9 在 Windows 上其实没生效）：
+  // `powerMonitor` 的 `shutdown` 事件在 Electron 的 SDK 里标着 `@platform linux,darwin` ——
+  // Windows 上**根本不会触发**。Windows 走的是窗口级事件：
+  //   · `query-session-end`：关机/重启/注销**之前**发（可以 preventDefault，我们不去拦）；
+  //   · `session-end`：会话真的要结束了，拦也没用，只能记一笔。
+  // 两个都挂上，按平台各取所需：Windows 靠这两个，Linux/macOS 靠 installShutdownWatch 里的 powerMonitor。
+  win.on('query-session-end', () => noteShutdown('query-session-end'));
+  win.on('session-end', () => noteShutdown('session-end'));
 
   // 渲染层的报错也要进日志：界面白屏/按钮没反应时，用户唯一能提供的证据就是日志文件。
   // （限速：同一秒内最多 20 条，防止某个循环错误把日志刷爆。）
@@ -358,6 +367,157 @@ function maskKey(k) {
 }
 
 /**
+ * 出站请求的目标校验：这些 IPC 通道的 baseURL 来自渲染层，不能只判"是 http(s)"。
+ *
+ * 2026-11-12 审计 M10（已复现）：三个探测通道（`gw:fetch-catalog` / `gw:fetch-models` /
+ * `gw:measure-models`）唯一的闸门是 `/^https?:\/\//i.test(base)`。实测把 baseURL 传成
+ * `http://127.0.0.1:<任意端口>/v1` 就能拿到该端口的响应体并**原样回传给渲染层**（4MB 上限），
+ * 传 `http://192.168.1.1:8080/v1` 也不拦。渲染进程一旦被攻破（或某个上游把恶意 HTML 塞进
+ * 模型名/错误体，而界面某处没转义干净），主进程就成了一台**内网扫描器 / 任意请求发起器**。
+ *
+ * 这里做两件事：
+ *   ① 字面量 IP：拒私有网段（10/8、172.16/12、192.168/16、100.64/10 CGNAT）、
+ *      链路本地（169.254/16，含云元数据 169.254.169.254）、唯一本地 IPv6（fc00::/7）、
+ *      组播/保留/未指定（0.0.0.0、::、224/4、240/4）；
+ *   ② 域名：解析一次，解析结果里**任一**地址落在上面那些段就拒 —— 否则 `foo.example.com`
+ *      指到 192.168.1.1 就绕过了 ①（DNS rebinding / 内网别名）。
+ *
+ * **刻意放行 loopback（127/8、::1）**：README 与界面都支持把本地推理（Ollama / LM Studio /
+ * vLLM）当上游，那是用户自己在这台机器上装的服务，路径本来就该通。残余风险是"渲染层被攻破后
+ * 可以探本机回环端口"，但它拿不到比"用户自己开个终端 curl"更多的东西，而堵掉它会让本地模型
+ * 用户完全没法拉目录 —— 取舍记录在此，不隐藏。
+ *
+ * @returns {Promise<string>} 空串 = 通过；否则是给界面看的中文原因
+ */
+async function checkOutboundTarget(base) {
+  let u;
+  try { u = new URL(base); } catch (_) { return 'Base URL 不是合法 URL'; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return 'Base URL 必须是 http(s) 绝对地址';
+
+  const host = String(u.hostname || '').replace(/^\[|\]$/g, '').toLowerCase();
+  if (!host) return 'Base URL 缺少主机名';
+
+  // 回环判定也要认全形式：URL 会把 `[::ffff:127.0.0.1]` 归一化成 `[::ffff:7f00:1]`，
+  // 只测字符串前缀会把本机地址误判成"公网"进而放行（方向上是安全的，但会挡住本地推理用户）。
+  const isLoopback = (h) => {
+    if (h === 'localhost' || h === '::1' || /^127\./.test(h)) return true;
+    if (/^::ffff:127\./.test(h)) return true;
+    const e = embeddedIpv4(h);
+    return e !== '' && /^127\./.test(e);
+  };
+
+  /** 把 IPv6 字面量解成 16 个字节；不是合法 IPv6 返回 null。 */
+  const v6Bytes = (h) => {
+    if (h.indexOf(':') < 0) return null;
+    let s = h;
+    const zone = s.indexOf('%');                           // 去掉 zone id（fe80::1%eth0）
+    if (zone >= 0) s = s.slice(0, zone);
+    const halves = s.split('::');
+    if (halves.length > 2) return null;
+    const parse = (part) => (part === '' ? [] : part.split(':'));
+    const left = parse(halves[0]);
+    const right = halves.length === 2 ? parse(halves[1]) : [];
+    if (left.concat(right).some((g) => !/^[0-9a-f]{1,4}$/.test(g))) return null;
+    let groups;
+    if (halves.length === 2) {
+      const fill = 8 - left.length - right.length;
+      if (fill < 1) return null;
+      groups = left.concat(new Array(fill).fill('0'), right);
+    } else {
+      groups = left;
+      if (groups.length !== 8) return null;
+    }
+    const out = [];
+    for (const g of groups) {
+      const n = parseInt(g, 16);
+      out.push((n >> 8) & 0xff, n & 0xff);
+    }
+    return out.length === 16 ? out : null;
+  };
+
+  /**
+   * IPv6 里嵌着 IPv4 的几种写法 → 点分 IPv4；没有就返回空串。
+   *
+   * ⚠ 2026-11-12 复核修（第一次）：`new URL('http://[::ffff:192.168.1.1]/')` 会把 hostname
+   * 归一化成**十六进制压缩形式** `[::ffff:c0a8:101]`，所以 `h.replace(/^::ffff:/,'')` 拿到的是
+   * `c0a8:101`，点分正则不命中 → 掉进 IPv6 分支 → 三个网段正则都不匹配 → 放行。
+   *
+   * ⚠ 2026-11-12 复核修（第二次）：只还原 `::ffff:` 一种写法等于只堵了字面量。以下写法当时
+   * 全部能绕过（实测 PASS）——它们都是"IPv6 地址，但语义上指向一个 IPv4"：
+   *   `[::ffff:0:192.168.1.1]`  IPv4-translated（RFC 2765，::ffff:0:0/96）
+   *   `[::192.168.1.1]`         IPv4-compatible（已废弃，但 URL 解析器照收）
+   *   `[64:ff9b::192.168.1.1]`  NAT64（64:ff9b::/96）
+   *   `[2002:c0a8:101::]`       6to4（2002::/16，内嵌 IPv4 在前 4 字节）
+   * 所以现在先解成 16 字节，再把各种内嵌形式统一还原成点分，交给同一套 IPv4 网段判定。
+   */
+  const embeddedIpv4 = (h) => {
+    const b = v6Bytes(h);
+    if (!b) return '';
+    const zero = (from, to) => b.slice(from, to).every((x) => x === 0);
+    const dot = (arr) => arr.join('.');
+    if (zero(0, 10) && b[10] === 0xff && b[11] === 0xff) return dot(b.slice(12, 16));  // ::ffff:a.b.c.d
+    if (zero(0, 8) && b[8] === 0xff && b[9] === 0xff && b[10] === 0 && b[11] === 0) {
+      return dot(b.slice(12, 16));                                                     // ::ffff:0:a.b.c.d
+    }
+    if (b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b && zero(4, 12)) {
+      return dot(b.slice(12, 16));                                                     // 64:ff9b::/96 NAT64
+    }
+    if (b[0] === 0x20 && b[1] === 0x02) return dot(b.slice(2, 6));                     // 2002::/16 6to4
+    if (zero(0, 12)) return dot(b.slice(12, 16));                                      // ::a.b.c.d（含 ::）
+    return '';
+  };
+
+  /** 私有/链路本地/保留地址判定（只处理字面量，域名先解析再喂进来）。 */
+  const isBlocked = (h) => {
+    if (isLoopback(h)) return false;                       // 刻意放行，见上
+    // 先把"IPv6 里嵌 IPv4"的各种写法还原成点分，再走同一套 IPv4 判定。
+    const v = embeddedIpv4(h) || h.replace(/^::ffff:/, '');
+    const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(v);
+    if (m) {
+      const a = Number(m[1]); const b = Number(m[2]);
+      if ([a, b, Number(m[3]), Number(m[4])].some((n) => n > 255)) return false; // 交给 URL 解析去报错
+      if (a === 0) return true;                            // 0.0.0.0/8
+      if (a === 10) return true;                           // 私有
+      if (a === 172 && b >= 16 && b <= 31) return true;    // 私有
+      if (a === 192 && b === 168) return true;             // 私有
+      if (a === 100 && b >= 64 && b <= 127) return true;   // CGNAT（Tailscale 等）
+      if (a === 169 && b === 254) return true;             // 链路本地 + 云元数据
+      if (a >= 224) return true;                           // 组播 / 保留
+      return false;
+    }
+    if (/^f[cd][0-9a-f]{2}:/.test(v)) return true;         // fc00::/7 唯一本地
+    if (/^fe[89ab][0-9a-f]:/.test(v)) return true;         // fe80::/10 链路本地
+    if (/^ff[0-9a-f]{2}:/.test(v)) return true;            // ff00::/8 组播
+    if (v === '::') return true;                            // 未指定
+    return false;
+  };
+
+  if (isBlocked(host)) {
+    return `Base URL 指向内网/保留地址（${host}），已拒绝：这类请求只能发往公网或本机回环。`
+      + '如果你确实要连局域网里的推理服务，请改用自己的回环端口转发。';
+  }
+
+  // 域名宿主要解析后再判一次（字面量 IP 走不到这里）
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(host) && !host.includes(':')) {
+    if (host !== 'localhost') {
+      try {
+        const dns = require('node:dns').promises;
+        const addrs = await dns.lookup(host, { all: true });
+        for (const a of addrs) {
+          const ip = String((a && a.address) || '');
+          if (ip && isBlocked(ip)) {
+            return `Base URL 的域名 ${host} 解析到了内网/保留地址（${ip}），已拒绝。`;
+          }
+        }
+      } catch (_) {
+        // 解析不了就让后面的请求自己去失败并如实报错（例如公司内网域名只在该网段可解析）
+      }
+    }
+  }
+  return '';
+}
+
+/**
  * 把网关统一 Key **和全部上游 Key** 登记为"精确敏感串"，之后的日志/崩溃现场里它们一律被打码。
  *
  * 为什么必须做：统一 Key 是本程序自己生成的 `dsh-gateway-<随机>` / `lgw-<hex>`，
@@ -457,6 +617,25 @@ function registerIpc() {
   handle('app:open-path', async (_e, p) => {
     const target = String(p || '');
     if (!target) return { ok: false, error: '空路径' };
+    // ⚠ 2026-11-12 审计 L2：这个通道原来接受**任意路径**，等于把"用资源管理器打开任意位置"
+    // 的能力交给了渲染层。渲染层本身是 sandbox + contextIsolation + 无 connect-src 的，
+    // 所以这不是"远程可利用"，但它是一条没人需要的能力：界面真正会打开的位置只有两处 ——
+    //   ① 数据目录（日志页「打开日志」、仪表盘「打开数据目录」、写入后「打开所在目录」）；
+    //   ② 各客户端的配置文件（`~/.claude/settings.json`、`~/.codex/config.toml` …）。
+    // 因此收窄成：必须落在数据目录或用户主目录之内。越界直接拒绝并记一条日志，
+    // 免得以后有人从渲染层传 `C:\Windows\System32` 时我们连痕迹都没有。
+    const roots = [];
+    try { if (dataDir) roots.push(path.resolve(dataDir)); } catch (_) { /* 忽略 */ }
+    try { roots.push(path.resolve(os.homedir())); } catch (_) { /* 忽略 */ }
+    const resolved = path.resolve(target);
+    const inside = (child, parent) => {
+      const rel = path.relative(parent, child);
+      return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+    };
+    if (!roots.some((r) => inside(resolved, r))) {
+      logger.warn('拒绝打开越界路径（只允许数据目录与用户主目录之内）：' + resolved);
+      return { ok: false, error: '只允许打开数据目录或用户主目录之内的路径' };
+    }
     try {
       if (fs.existsSync(target) && fs.statSync(target).isDirectory()) {
         await shell.openPath(target);
@@ -533,8 +712,12 @@ function registerIpc() {
       registerGatewaySecret();   // 统一 Key 可能被换过
       // 保存会顺带重启网关；重启失败时不能只回 ok —— 否则界面显示"配置已保存并生效"，
       // 而实际上网关已经停了，用户下一个请求才发现。
+      // ⚠ 2026-11-12 复核修：这里以前是**直接赋值** r.warning，会把 saveConfig() 里
+      // "重启网关失败：<真实原因>" 覆盖成一句更笼统的"重启后未运行" —— 真正的失败原因
+      //（比如 taskkill 被拒 / 端口被占 / 配置没被引擎接受）从此消失。改成追加，两条都留。
       if (wasRunning && !gateway.running) {
-        r.warning = `配置已保存，但网关重启后未运行（端口 ${gateway.configPort()}）——请查看「日志」页。`;
+        const extra = `配置已保存，但网关重启后未运行（端口 ${gateway.configPort()}）——请查看「日志」页。`;
+        r.warning = r.warning ? (r.warning + ' ' + extra) : extra;
       }
     }
     broadcastState();
@@ -747,6 +930,8 @@ function registerIpc() {
     const p = provider && typeof provider === 'object' ? provider : {};
     const base = probe.upstreamBase(String(p.baseURL || ''));
     if (!/^https?:\/\//i.test(base)) return { ok: false, error: 'Base URL 必须是 http(s) 绝对地址' };
+    const probeBlock = await checkOutboundTarget(base);
+    if (probeBlock) return { ok: false, error: probeBlock };
     const proxy = await gateway.resolveProxy();
     const noProxy = String(gateway.computeNoProxy() || '').split(',').filter(Boolean);
     const r = await probe.getJson(base + '/models', {
@@ -783,6 +968,8 @@ function registerIpc() {
     const o = options && typeof options === 'object' ? options : {};
     const base = probe.upstreamBase(String(p.baseURL || ''));
     if (!/^https?:\/\//i.test(base)) return { ok: false, error: 'Base URL 必须是 http(s) 绝对地址' };
+    const probeBlock = await checkOutboundTarget(base);
+    if (probeBlock) return { ok: false, error: probeBlock };
     const proxy = await gateway.resolveProxy();
     const noProxy = String(gateway.computeNoProxy() || '').split(',').filter(Boolean);
     const r = await probe.getJson(base + '/models', {
@@ -834,6 +1021,8 @@ function registerIpc() {
     const p = provider && typeof provider === 'object' ? provider : {};
     const base = probe.upstreamBase(String(p.baseURL || ''));
     if (!/^https?:\/\//i.test(base)) return { ok: false, error: 'Base URL 必须是 http(s) 绝对地址' };
+    const probeBlock = await checkOutboundTarget(base);
+    if (probeBlock) return { ok: false, error: probeBlock };
     const list = (Array.isArray(models) ? models : []).slice(0, 60);
     if (!list.length) return { ok: false, error: '没有要测速的模型' };
     const proxy = await gateway.resolveProxy();
@@ -1114,7 +1303,15 @@ function registerIpc() {
     if (!r || r.canceled || !r.filePath) return { ok: false, canceled: true };
     try {
       fs.writeFileSync(r.filePath, gateway.configText(), 'utf8');
-      return { ok: true, path: r.filePath };
+      // ⚠ 导出的就是配置原文，里面**全是明文密钥**（每个 provider 的 apiKey/apiKeys/accounts）。
+      // 2026-11-12 审计 M14：界面只提示「已导出到 <path>」，用户很容易把这份文件贴到群里、
+      // 传网盘、发给同事排错。文件本身不能脱敏（导出的用途就是"换台机器还原"），
+      // 所以至少要在返回值和界面上把风险说清。
+      return {
+        ok: true,
+        path: r.filePath,
+        warning: '该文件含**明文密钥**（所有供应商的 Key 都在里面），请勿外传或提交到代码仓库。',
+      };
     } catch (e) { return { ok: false, error: String(e && e.message) }; }
   });
 
@@ -1153,9 +1350,12 @@ function sanitizePreview(r) {
   // ⚠ 失败分支（!r.ok）过去**原样返回**，而 `errors[]` 恰恰是最可能带上游原文的地方
   //（"写入失败：… <上游返回的错误体>"）。预览的承诺是"不把密钥送进渲染进程"，
   // 那条承诺不该因为一次失败就失效 —— 失败路径反而是更容易漏的路径。
-  if (!r) return r;
-  if (!r.ok) return scrubDeepSecrets(r);
-  return scrubDeepSecrets(r);
+  //
+  // 2026-11-12 审计 L3：所以两个分支做的是**同一件事**。这里曾经写成
+  // `if (!r.ok) return scrubDeepSecrets(r); return scrubDeepSecrets(r);`，
+  // 看着像"成功/失败分别处理"，其实只是同一个调用写了两遍 —— 读代码的人会以为
+  // 存在差异分支而去找不存在的区别。压成一条语句，语义不变，意图更清楚。
+  return r ? scrubDeepSecrets(r) : r;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1194,12 +1394,57 @@ async function bootstrap() {
   registerIpc();
   createWindow();
   createTray();
+  installShutdownWatch();
 
   if (settings.get('autoStartGateway') !== false) {
     gateway.start().catch((e) => logger.error('网关自动启动失败：' + (e && e.message ? e.message : e)));
   }
 
   logger.info(`${APP_NAME} 就绪`);
+}
+
+/**
+ * 系统关机/注销监听（2026-11-12 审计 M9）。
+ *
+ * 为什么必须有：这个应用在 2026-11 的每一次"闪退"，事后查下去都是**用户从开始菜单关机**
+ * （System 事件 1074 与 app.log 的「网关已退出（1073807364）」逐条毫秒级对齐），但应用自己
+ * **完全不知道自己是被关机带走的** —— 全 src 搜 `powerMonitor|session-end` 零命中。
+ *
+ * 后果有两层，第二层才是真问题：
+ *   ① 日志把这次退出记成「**非预期**」并触发一次无效 self-heal（进程马上就没，自愈白设）；
+ *   ② 更糟的是**排障方向被带偏**：用户（和我）看到"非预期退出 + 没有堆栈 + 没有 WER"，
+ *      只能往崩溃/被杀软杀/内存溢出这些方向猜，而真相是"你自己关的机"。
+ *      这是"闪退查不出来"的主要成因之一 —— 证据其实一直都在 Windows 事件日志里，
+ *      只是应用从没在自己的日志里说过一句"我是被关机带走的"。
+ *
+ * 现在：收到关机通知时（Windows 用窗口级的 `query-session-end` / `session-end`；
+ * Linux/macOS 用 `powerMonitor` 的 `shutdown`）
+ *   · 记一行带时间的日志，明确写明"系统关机/注销触发，本次退出属预期"；
+ *   · 把 `gateway._appQuitting` 置真，让引擎 `exit` 归因走「应用正在退出（预期内）」，
+ *     不再误记"非预期"、不再触发 self-heal；
+ *   · **不** preventDefault：不跟用户的关机流程抢时间（stop() 最坏 22.4s，硬拦会让
+ *     "关机卡住"变成新问题），也不指望在关机窗口里还能优雅收尾 —— 被强杀是可以接受的，
+ *     只要日志留下了正确的归因。
+ */
+function noteShutdown(source) {
+  try {
+    if (logger) {
+      logger.info('收到系统关机/注销通知（' + source + '）—— 本次退出属**预期**，'
+        + '不是崩溃、也不是被强杀。之后的「网关已退出」若记成因未知，请先查 Windows 事件日志 1074。');
+    }
+  } catch (_) { /* 日志失败不能影响关机 */ }
+  try { if (gateway) gateway._appQuitting = true; } catch (_) { /* 忽略 */ }
+}
+
+function installShutdownWatch() {
+  try {
+    if (!powerMonitor || typeof powerMonitor.on !== 'function') return;
+    // Linux/macOS 走这里；Windows 上这个事件不存在（Electron SDK 标 `@platform linux,darwin`），
+    // 由 createWindow() 里的 `query-session-end` / `session-end` 负责。
+    powerMonitor.on('shutdown', () => noteShutdown('powerMonitor shutdown'));
+  } catch (e) {
+    try { if (logger) logger.warn('注册关机监听失败（不影响运行）：' + (e && e.message ? e.message : e)); } catch (_) { /* 忽略 */ }
+  }
 }
 
 app.whenReady().then(() => {
@@ -1230,11 +1475,25 @@ app.on('window-all-closed', () => {
  *
  * 流程：第一次 before-quit → preventDefault + 异步收尾 → 置 allowQuit → 再 quit 一次
  * （这一次不再 preventDefault，正常退出）。
+ *
+ * ⚠⚠ 放行判据必须是 `allowQuit`（收尾**完成**），不能用 `teardownStarted`（收尾**开始**）
+ * —— 2026-11-12 审计 H6。旧实现写的是 `if (teardownStarted) return;`，而 teardownStarted
+ * 在下面第 1238 行就被置 true，allowQuit 要等 stop() 完成才为 true。二者的时间差就是
+ * **整个收尾窗口**（stop() 里要等 `_starting`，最坏 8×(2000+800)≈22.4s，再到
+ * killStaleGatewayProcesses 还有 15s PowerShell 上限）。
+ * 在这个窗口里任何**第二次** before-quit（用户又点了一次退出 / 关窗 / 托盘退出 /
+ * 系统的 session-end 触发 app.quit）都会走到 `return` → 不再 preventDefault →
+ * Electron 立刻退出，而 stop() 还在半路 → **引擎成为孤儿并占着端口**。
+ * 已用 host2/exp-e-double-quit.js 复现：t=0.2s 第二次 before-quit 就放行了，
+ * 而 stop() 到 t≈3.6s 才完成。
+ *
+ * 现在：`allowQuit` 才放行；`teardownStarted` 只用于"已在收尾中，继续阻止退出"。
  */
 app.on('before-quit', (e) => {
-  if (teardownStarted) return;             // 已在收尾 / 已收尾完毕 → 放行
+  if (allowQuit) return;                   // 收尾已完成 → 放行（这一次不再拦）
   if (!gateway) { allowQuit = true; return; }
-  e.preventDefault();
+  e.preventDefault();                      // 只要还没收尾完，就一直拦着
+  if (teardownStarted) return;             // 已在收尾中 → 继续拦，等它完成
   teardownStarted = true;
   // 告诉网关管理器"这次退出是预期的"（2026-10-13 加）：
   // 它在子进程 exit 时据此区分「用户/应用主动停止」与「**非预期**被杀」，
@@ -1253,14 +1512,47 @@ app.on('before-quit', (e) => {
   })();
 });
 
-// 进程被硬杀（任务管理器结束进程 / 控制台 Ctrl+C）时也尽力收尾。
+// 进程被硬杀（任务管理器结束进程 / 控制台 Ctrl+C / 服务管理器发 SIGTERM）时也尽力收尾。
 // 这类信号下 Electron 未必走 before-quit，但至少别让引擎继续占端口。
+//
+// ⚠⚠ 必须 **await** stop()，不能"发出去就走"（2026-11-12 审计 H5）。
+// 旧实现：
+//     try { if (gateway) gateway.stop(); } catch (_) {}
+//     setTimeout(() => app.exit(0), 1500);
+// 两个问题叠在一起：
+//   1) `gateway.stop()` 没有被 await —— 它内部第一句是 `if (this._starting) await this._starting`，
+//      而 `_starting` 的最坏情况是就绪探测上界 8×(2000+800)≈22.4s。1500ms 时它**还没走到 taskkill**。
+//   2) 1500ms 的 `app.exit(0)` 是硬退出，不跑 before-quit、不跑任何收尾 → 引擎一定成孤儿。
+// 已用 host2/exp-c-signal-orphan.js 复现：1500ms 时 taskkill 次数 = 0，子进程 exitCode 仍是 null，
+// 父进程已 app.exit(0) → 引擎继续占着 3091。
+//
+// 现在：先 await 收尾，收到信号后**尽快**退；同时保留一个硬上限兜底，避免 stop() 自己卡死时
+// 进程永远不退出。上限取 30s（> 22.4s 就绪探测 + 15s killStale 的合理重叠区间），
+// 触发时会明确 log 一行"超时强制退出"，便于日后归因。
+const SIGNAL_TEARDOWN_DEADLINE_MS = 30_000;
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
     try { if (logger) logger.info('收到系统信号 ' + sig + '，开始收尾（这是**外部**要求退出）。'); } catch (_) { /* 忽略 */ }
     allowQuit = true;
-    try { if (gateway) gateway.stop(); } catch (_) { /* 忽略 */ }
-    setTimeout(() => app.exit(0), 1500);
+    let exited = false;
+    const finish = (why) => {
+      if (exited) return;
+      exited = true;
+      try { if (logger) logger.info('收尾完成（' + why + '），退出。'); } catch (_) { /* 忽略 */ }
+      app.exit(0);
+    };
+    // 硬上限：stop() 若自身卡住，也别让进程挂在那里
+    setTimeout(() => {
+      try { if (logger) logger.warn('收尾超过 ' + (SIGNAL_TEARDOWN_DEADLINE_MS / 1000) + 's 仍未完成 → 强制退出（可能残留引擎进程，下次启动会自动清理）。'); } catch (_) { /* 忽略 */ }
+      finish('超时强制');
+    }, SIGNAL_TEARDOWN_DEADLINE_MS).unref?.();
+    (async () => {
+      try { if (gateway) await gateway.stop(); } catch (err) {
+        try { if (logger) logger.error('信号收尾时停止网关失败：' + (err && err.message ? err.message : err)); } catch (_) { /* 忽略 */ }
+      }
+      try { if (gateway) await gateway.killStaleGatewayProcesses(); } catch (_) { /* 忽略 */ }
+      finish('信号 ' + sig);
+    })();
   });
 }
 

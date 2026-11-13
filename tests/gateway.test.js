@@ -195,11 +195,37 @@ let upstreamPort = 0;
   startGateway();
   const ok = await waitHealth(gwPort, 20000);
   if (!ok) {
-    console.log('[SKIP] 网关未能在 20s 内就绪（本机 spawn 受限？）——跳过端到端用例');
+    // ⚠⚠ 这里**必须**以非 0 退出（2026-11-12 审计 M3）。
+    //
+    // 旧实现是 `console.log('[SKIP] …'); process.exit(0);` —— 于是引擎文件缺失、端口
+    // 冲突、spawn 被拒等任何"起不来"的情况下，**整套 238 条用例一条都没跑**，
+    // 而 npm test 判为通过、CI 绿灯。已实测：把 MJS 指向不存在的文件 → exitCode 0、
+    // passLines 0、failLines 0。这是"假绿"的最直接来源之一（另一处是 M2 的
+    // WorkBuddy 凭据依赖本机登录状态）。
+    //
+    // 为什么当初写成 SKIP：某些受限环境（沙箱/CI）确实 spawn 不了子进程，作者想让
+    // 本地开发不被卡住。这个诉求本身合理，但**不能用"假装通过"来实现**：
+    //   · 真要在缺环境时跳过，应显式声明一个环境变量（如 LLM_GATEWAY_TEST_NO_SPAWN=1）
+    //     并由 CI 侧决定，而不是默认静默跳过；
+    //   · 现在默认就是 fail-fast：起不来 = 测试失败，先把环境修好。
+    // 环境变量开关保留：`LLM_GATEWAY_TEST_ALLOW_SKIP=1` 时仍按旧行为跳过（本地应急用），
+    // 但会打一行醒目的提示，且**只有显式设置时**才生效。
+    const allowSkip = String(process.env.LLM_GATEWAY_TEST_ALLOW_SKIP || '') === '1';
+    console.log('[FAIL] 网关未能在 20s 内就绪 —— 端到端用例**一条都没执行**');
+    console.log('       已尝试：spawn ' + MJS + '，端口 ' + gwPort);
+    if (allowSkip) {
+      console.log('[SKIP] 已设置 LLM_GATEWAY_TEST_ALLOW_SKIP=1 → 按旧行为跳过（**本次结果不能当作通过**）');
+      try { gwProc.kill(); } catch { }
+      try { upstreamServer.close(); } catch { }
+      fs.rmSync(tmp, { recursive: true, force: true });
+      process.exit(0);
+    }
+    console.log('       若确认是环境限制（沙箱禁止 spawn），显式设置 LLM_GATEWAY_TEST_ALLOW_SKIP=1 再跑；');
+    console.log('       否则请修好环境 —— 这条失败代表"网关根本没起来"，后面的用例全都没验证过。');
     try { gwProc.kill(); } catch { }
     try { upstreamServer.close(); } catch { }
     fs.rmSync(tmp, { recursive: true, force: true });
-    process.exit(0);
+    process.exit(1);
   }
   console.log('[..] 网关已就绪 :' + gwPort + '，假上游 :' + upstreamPort);
 
@@ -2873,6 +2899,20 @@ let upstreamPort = 0;
           res.end(JSON.stringify({ error: {
             type: 'invalid_request_error',
             message: opts.endpointMsg || ('Model "deepseek/deepseek-v4.1-flash" is not supported on this endpoint. Use /provider/v1/chat/completions for OpenAI and OSS models.'),
+          } }));
+          return;
+        }
+        // 2026-11-12（用户报「agentrouter 供应商调用报错」）：上游明说"这个模型在这条线协议上
+        // 不收 tools + 推理"。实测原文（agentrouter 三款 GPT 在 /v1/messages 上带 tools 必 400）：
+        //   Function tools with reasoning_effort are not supported for gpt-6-astra in
+        //   /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.
+        // 措辞既不命中"不在这个端点"，也不命中"模型缺失" → 旧实现只打一句"确定性 4xx"。
+        if (behavior === 'wireUnsupported') {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: {
+            message: opts.wireMsg || ("Function tools with reasoning_effort are not supported for gpt-6-astra in "
+              + "/v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'."),
+            type: null,
           } }));
           return;
         }
@@ -6901,6 +6941,68 @@ let upstreamPort = 0;
         '日志须带上游建议的正确路径（否则用户不知道该改哪）：' + logText.slice(-600));
       assert.ok(!/failover stopped/.test(logText), '不得终止 failover：' + logText.slice(-400));
     } finally { killGw(gw); closeUp(up); closeUp(ok2); }
+  });
+
+  t('agentrouter：模型在该线协议上不支持 tools+推理 → 继续 failover，且日志与客户端文案都指向改「上游协议」', async () => {
+    // 2026-11-12 实测事故（用户报「agentrouter 供应商调用报错」）：
+    //   upstream agentrouter HTTP 400: {"error":{"message":"Function tools with reasoning_effort are
+    //     not supported for gpt-6-astra in /v1/chat/completions. To use function tools,
+    //     use /v1/responses or set reasoning_effort to 'none'. …"}}
+    //   → 旧实现落到兜底的"确定性 4xx → 记为候选失败"，单候选时整请求 400，
+    //     用户只看到失败，**看不出该把该模型的 api 改成 openai-responses**。
+    //
+    // 已用本地 mock 上游排除"网关自己多塞 reasoning_effort"这一可能：发出去的 body 是干净的
+    // {model,max_tokens,stream,tools,messages}；reasoning_effort 是 agentrouter 内部把
+    // /v1/messages 转 /v1/chat/completions 时自己加的。
+    const up = await startFakeOpenAIUpstream({ script: ['wireUnsupported', 'wireUnsupported', 'wireUnsupported'] });
+    const ok2 = await startFakeOpenAIUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      openaiProvider('agentrouter', up, { priority: 1 }),
+      openaiProvider('fallback3', ok2, { priority: 2 }),
+    ], 'wireunsup', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200,
+        '线协议不支持之后必须换下一家并成功，实际 ' + r.status + ' ' + r.text.slice(0, 240));
+      assert.strictEqual(ok2.st.calls, 1, '应真的落到第二家：' + ok2.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/判定为"该模型不支持这条线协议"/.test(logText), '日志须写明是线协议问题：' + logText.slice(-700));
+      assert.ok(/上游协议/.test(logText) && /openai-responses/.test(logText),
+        '日志须告诉用户把「上游协议」改成 openai-responses（配置里合法的枚举值，否则用户照着 /v1/responses 填进去会被校验拒）：' + logText.slice(-700));
+      assert.ok(!/failover stopped/.test(logText), '不得终止 failover：' + logText.slice(-400));
+      // 不熔断整家（它只是这条线协议上的这个模型不行）
+      assert.ok(!/breaker OPEN: agentrouter\n/.test(logText), '不得熔断整家：' + logText.slice(-500));
+    } finally { killGw(gw); closeUp(up); closeUp(ok2); }
+  });
+
+  t('agentrouter 负例边界：只有这一个候选时，回给客户端的 400 文案也必须指向「上游协议」', async () => {
+    // 单候选场景最容易让用户无从下手：状态码 400 + 一句 upstream HTTP 400。
+    // stopFailoverMessage 必须把「改这个模型的 api」写进 message 本身 ——
+    // 用户大概率看不到网关日志，只看得到这句。
+    //
+    // ⚠ 这里必须是**配置里合法的枚举值 `openai-responses`**，不能是上游原话里的
+    //   URL 路径 `/v1/responses`（2026-11-12 审计 M5）。原因很实在：validateConfigText
+    //   的 protocol 白名单只认 openai-chat / anthropic-messages / openai-responses
+    //   （以及 chat/messages/responses 简写），用户照着 `/v1/responses` 去填，
+    //   **保存会被拒**，文案等于把人指向一个填不进去的值。
+    const up = await startFakeOpenAIUpstream({ script: ['wireUnsupported', 'wireUnsupported', 'wireUnsupported'] });
+    const gw = await startGatewayWith([openaiProvider('agentrouter', up, { priority: 1 })], 'wireunsup1', {});
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: {
+        model: 'test-model', max_tokens: 64, stream: false,
+        tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: { city: { type: 'string' } } } }],
+        messages: [{ role: 'user', content: 'hi' }],
+      } });
+      assert.strictEqual(r.status, 400, '全部候选都拒绝时应回 400，实际 ' + r.status + ' ' + r.text.slice(0, 240));
+      assert.ok(/upstream protocol to openai-responses/.test(r.text),
+        '客户端文案必须指向"把上游协议改成 openai-responses"（可填进配置的枚举值，而不是 URL 路径）：' + r.text.slice(0, 400));
+      assert.ok(!/upstream protocol to \/v1\/responses/.test(r.text),
+        '不得把 URL 路径 /v1/responses 当作「上游协议」给用户（配置校验不接受它）：' + r.text.slice(0, 400));
+      assert.ok(!/the request itself may be invalid/.test(r.text),
+        '不得把线协议问题说成"你的请求有错"（那是错误的方向）：' + r.text.slice(0, 400));
+    } finally { killGw(gw); closeUp(up); }
   });
 
   t('commandcode 负例（新契约）：真·请求参数错误也继续 failover，不打死整轮任务', async () => {

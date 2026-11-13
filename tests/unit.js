@@ -33,13 +33,16 @@ t('util.writeAtomic：首次写入留下 .bak-llmgateway 备份', () => {
   assert.strictEqual(fs.readFileSync(f + util.BACKUP_SUFFIX, 'utf8'), 'old', '应保留最原始的那份');
 });
 
-t('util.writeAtomic：备份已存在时不覆盖（保住最原始的内容）', () => {
+t('util.writeAtomic：再次写入时 .bak 变成"上一次写入前"，原内容退到 .bak.prev（审计 M12）', () => {
   const f = path.join(tmp, 'atomic2.json');
   fs.writeFileSync(f, 'v1', 'utf8');
-  util.writeAtomic(f, 'v2');
-  util.writeAtomic(f, 'v3');
-  assert.strictEqual(fs.readFileSync(f + util.BACKUP_SUFFIX, 'utf8'), 'v1');
+  util.writeAtomic(f, 'v2');   // 首次：文件 v1 → 备份 v1，写入 v2
+  util.writeAtomic(f, 'v3');   // 再次：备份 v1 退到 .prev，备份改成 v2，写入 v3
   assert.strictEqual(fs.readFileSync(f, 'utf8'), 'v3');
+  assert.strictEqual(fs.readFileSync(f + util.BACKUP_SUFFIX, 'utf8'), 'v2',
+    '.bak 必须等于"上一次写入前"的内容 —— 否则「恢复」按钮退回的是最初版本，而不是上一步');
+  assert.strictEqual(fs.readFileSync(f + util.BACKUP_SUFFIX + '.prev', 'utf8'), 'v1',
+    '再退一步的内容必须还在 .prev 里，不能丢');
 });
 
 t('util.restore：恢复备份，并把当前内容另存为 before-restore', () => {
@@ -2076,6 +2079,31 @@ t('restart：并发调用必须串行（后一次不得杀掉前一次刚起的�
   assert.strictEqual(stopCalls, 2, 'restart 结束后 _restarting 必须复位，第二次调用应重新执行');
 });
 
+t('GatewayManager._appQuitting：下一次正常启动必须复位（否则真崩溃会被记成"预期内"）', () => {
+  // 背景（2026-11-13 复核）：`_appQuitting` 只被置真、**从来没被复位**（全项目 0 处 `= false`）。
+  // 一次**中止的**退出之后 —— 关机被别的程序 preventDefault 拦下、或用户在托盘点「退出」后
+  // 又改了主意 —— 这个标记会永久留真，于是此后引擎每一次真崩溃都被归因成
+  // 「应用正在退出（预期内）」，既不记「非预期退出的现场」，也不进自愈的现场记录路径。
+  // 那正是"闪退查不出"的老问题 (b: 1074 关机之外的第二类来源)。
+  const dir = fs.mkdtempSync(path.join(tmp, 'appquit-'));
+  const gm = new GatewayManager({ dataDir: dir, logger: { info: () => {} }, settings: null });
+  assert.strictEqual(gm._appQuitting, false, '新实例不应带"正在退出"标记');
+
+  // 行为侧：能走到 spawn 说明应用活着、并且是主动要把网关拉起来 → 必须复位。
+  // unit 里不真 spawn（会起引擎），所以这里断言**源码位置**：复位语句必须在 _doStart 内、
+  // 且位于 spawn 之后（放在 spawn 之前会在"启动失败"时也清掉归因，语义就错了）。
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'gateway-manager.js'), 'utf8');
+  const start = src.indexOf('async _doStart() {');
+  assert.ok(start > 0, '应能找到 _doStart');
+  const body = src.slice(start, src.indexOf('\n  async ', start + 10) > 0
+    ? src.indexOf('\n  async ', start + 10)
+    : src.length);
+  const spawnAt = body.indexOf('this.proc = spawn(');
+  const resetAt = body.indexOf('this._appQuitting = false;');
+  assert.ok(spawnAt > 0, '_doStart 里应该有 spawn');
+  assert.ok(resetAt > spawnAt, '_appQuitting 的复位必须写在 spawn 之后（实际 spawn@' + spawnAt + ', reset@' + resetAt + '）');
+});
+
 /* ==================== 源码级守卫：鉴权的恒定时间比较 ==================== */
 
 t('引擎 authorized()：必须用摘要 + timingSafeEqual 比较（变异测试证明黑盒用例抓不到它退回 ===）', () => {
@@ -2120,6 +2148,74 @@ t('引擎 authorized()：必须用摘要 + timingSafeEqual 比较（变异测试
   assert.ok(/expect\.length < 16\) return false/.test(body),
     '配置 apiKey 不足 16 字符（含空串）必须判伪 —— 短 key 爆破面是线性的。'
     + '注意 gateway-manager.js 的配置校验只管 GUI 那条路径，引擎可被直接启动，必须自己守');
+});
+
+/* ==================== 2026-11-12 复核审计的回归守卫 ==================== */
+
+t('GatewayManager.maskProxyUrl：带口令的代理地址必须打码（H4 宿主侧同源泄露）', () => {
+  const M = GatewayManager.maskProxyUrl;
+  const cases = [
+    ['http://user:pass@127.0.0.1:7890', 'user', 'pass', '127.0.0.1:7890'],
+    ['socks5://alice:s3cr3t@p.example.com:1080', 'alice', 's3cr3t', 'p.example.com:1080'],
+  ];
+  for (const [raw, user, pass, hostPort] of cases) {
+    const out = String(M(raw));
+    assert.ok(!out.includes(user), '用户名必须消失：' + out);
+    assert.ok(!out.includes(pass), '口令必须消失：' + out);
+    assert.ok(out.includes('***'), '打码后应有 ***：' + out);
+    assert.ok(out.includes(hostPort), '主机名与端口必须保留：' + out);
+  }
+  // 没有 userinfo 的原样返回（不能给普通地址加上多余的 ***）
+  assert.strictEqual(M('http://127.0.0.1:7890'), 'http://127.0.0.1:7890');
+  assert.strictEqual(M('http://p.example.com:8080'), 'http://p.example.com:8080');
+  assert.strictEqual(M(''), '');
+});
+
+t('checkOutboundTarget：IPv4-mapped IPv6 不得绕过内网闸门（M10 复核）', async () => {
+  // 直接从源码抽函数求值 —— main.js 顶层会 require('electron')，不能整体加载。
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  const a = src.indexOf('async function checkOutboundTarget');
+  const b = src.indexOf('function registerGatewaySecret');
+  assert.ok(a > 0 && b > a, '应能在 main.js 里定位 checkOutboundTarget');
+  // eslint-disable-next-line no-new-func
+  const fn = new Function('require', src.slice(a, b) + '\nreturn checkOutboundTarget;')(require);
+
+  const blocked = [
+    'http://[::ffff:192.168.1.1]:8080/v1',
+    'http://[::ffff:169.254.169.254]/v1',
+    'http://[::ffff:a9fe:a9fe]/v1',
+    'http://[::ffff:10.0.0.5]/v1',
+    'http://[0:0:0:0:0:ffff:c0a8:101]/v1',
+    'http://[::ffff:172.16.3.4]/v1',
+    'http://[::ffff:100.64.0.1]/v1',
+    // 2026-11-13 复核：只认 `::ffff:` 一种写法等于只堵了字面量，以下都是
+    // "IPv6 地址但语义上指向一个 IPv4"的写法，实测曾全部放行。
+    'http://[::ffff:0:192.168.1.1]/v1',
+    'http://[::ffff:0:169.254.169.254]/v1',
+    'http://[::192.168.1.1]/v1',
+    'http://[64:ff9b::192.168.1.1]/v1',
+    'http://[2002:c0a8:101::]/v1',
+    'http://192.168.1.1/v1',
+    'http://[fd00::1]/v1',
+    'file:///etc/passwd',
+  ];
+  for (const u of blocked) {
+    // eslint-disable-next-line no-await-in-loop
+    assert.ok(await fn(u), '应拒绝：' + u);
+  }
+  const allowed = [
+    'http://[::ffff:127.0.0.1]:11434/v1',
+    'http://[::ffff:7f00:1]:11434/v1',
+    'http://[::ffff:8.8.8.8]/v1',
+    'http://127.0.0.1:11434/v1',
+    'http://localhost:8080/v1',
+    'http://[::1]:8080/v1',
+    'http://172.15.3.4/v1',
+  ];
+  for (const u of allowed) {
+    // eslint-disable-next-line no-await-in-loop
+    assert.strictEqual(await fn(u), '', '应放行：' + u);
+  }
 });
 
 run();

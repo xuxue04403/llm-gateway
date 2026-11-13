@@ -131,21 +131,36 @@ if (!existsSync(APP_DIR)) {
   const artFiles = walk(APP_DIR);
   const mismatched = [];
   const notInSource = [];
+  const notInContentList = [];
+  const expected = expectedInArtifact();
+  const expectedSet = new Set(expected);
   let identical = 0;
   for (const f of artFiles) {
     const r = toPosix(path.relative(APP_DIR, f));
     if (!existsSync(path.join(ROOT, r))) { notInSource.push(r); continue; }
+    // ⚠ 只查"源码树里存在"是不够的（2026-11-12 审计 M8）。
+    //   build-portable 只复制 `APP_CONTENT` 那四项，但**手工同步**或历史遗留会把
+    //   `tests/`、`scripts/` 一起塞进 resources/app —— 实测这个正本里就有
+    //   `scripts/check-engine-parity.mjs` 与 `tests/gateway.test.js`。
+    //   它们存在于源码树，所以旧逻辑算"一致"并放行，等于把测试与发布脚本也发出去了。
+    //   现在：不在 APP_CONTENT 清单里的产物文件单列一类。
+    if (!expectedSet.has(r)) { notInContentList.push(r); continue; }
     if (contentMatches(r)) identical++;
     else mismatched.push(r);
   }
-  const expected = expectedInArtifact();
   const missingInArtifact = expected.filter((r) => !existsSync(path.join(APP_DIR, r)));
 
-  const ok = mismatched.length === 0 && notInSource.length === 0 && missingInArtifact.length === 0;
-  checks.artifactVsSource = { ok, artifactFiles: artFiles.length, identical, mismatched, notInSource, missingInArtifact };
+  const ok = mismatched.length === 0 && notInSource.length === 0
+    && notInContentList.length === 0 && missingInArtifact.length === 0;
+  checks.artifactVsSource = {
+    ok, artifactFiles: artFiles.length, identical, mismatched, notInSource, notInContentList, missingInArtifact,
+  };
   if (!ok) {
     if (mismatched.length) problems.push('产物与源码**内容不同**（产物是旧的或被改过）：' + mismatched.join(', '));
     if (notInSource.length) problems.push('产物里有源码树中不存在的文件：' + notInSource.join(', '));
+    if (notInContentList.length) problems.push('产物里有**不该发布**的文件（不在 src/renderer/package.json/README.md 清单内）：'
+      + notInContentList.slice(0, 8).join(', ')
+      + (notInContentList.length > 8 ? ` … 共 ${notInContentList.length} 个` : ''));
     if (missingInArtifact.length) problems.push('本该打进产物却缺失：' + missingInArtifact.slice(0, 8).join(', ')
       + (missingInArtifact.length > 8 ? ` … 共 ${missingInArtifact.length} 个` : ''));
   }
@@ -163,7 +178,13 @@ if (!existsSync(APP_DIR)) {
       try { tag = git(['describe', '--tags', '--abbrev=0']); } catch { /* 没有标签也正常 */ }
       const dirty = [];
       const untracked = [];
-      for (const line of git(['status', '--porcelain'], { raw: true }).split(/\r?\n/)) {
+      // ⚠ `-uall` 不能省（2026-11-12 审计 H2）。
+      //   默认的 `--porcelain` 对未跟踪目录只输出一行 `?? src/`（目录折叠），而下面那句
+      //   `expected.has(u)` 期望的是**具体文件**（`src/newdir/shipped.js`），于是
+      //   `expected.has('src/')` 恒为 false —— **未跟踪却会被打进产物的文件一个都拦不住**，
+      //   等于发布未提交的代码。已用临时 git 仓库复现（`git rm --cached` 后输出 `?? src/`）。
+      //   `-uall` 让 git 逐文件列出（`?? src/newdir/shipped.js`）。
+      for (const line of git(['status', '--porcelain', '-uall'], { raw: true }).split(/\r?\n/)) {
         if (!line) continue;
         const code = line.slice(0, 2);
         const file = line.slice(3).trim().replace(/^"|"$/g, '');
@@ -172,7 +193,18 @@ if (!existsSync(APP_DIR)) {
       }
       // 只有"会被打进产物"的未跟踪文件才是问题；其它（临时脚本等）只提示
       const expected = new Set(expectedInArtifact());
-      const untrackedShipped = untracked.filter((u) => expected.has(u));
+      // 兜底：万一 git 仍然给了目录（例如 `-uall` 被更早的配置覆盖），
+      // 就把该目录展开成 expected 里以它开头的所有文件，再判断。
+      const untrackedShipped = [];
+      for (const u of untracked) {
+        if (expected.has(u)) { untrackedShipped.push(u); continue; }
+        const norm = u.replace(/\/+$/, '');
+        if (norm !== u || u.endsWith('/')) {
+          const prefix = norm + '/';
+          const hit = [...expected].filter((e) => e.startsWith(prefix));
+          if (hit.length) untrackedShipped.push(u + '（含 ' + hit.length + ' 个会被打包的文件，如 ' + hit[0] + '）');
+        }
+      }
       const ok = dirty.length === 0 && untrackedShipped.length === 0;
       checks.sourceVsHead = { ok, head, tag, dirty, untracked, untrackedShipped };
       if (dirty.length) problems.push('工作区有未提交改动（' + dirty.length + ' 个）：' + dirty.slice(0, 6).join('；')

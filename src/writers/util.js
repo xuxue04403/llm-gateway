@@ -120,15 +120,32 @@ function writeAtomic(file, text) {
             + '已中止写入以免覆盖掉你原有的内容。请检查文件权限/是否被其它程序占用。',
         };
       }
+      // 备份语义（2026-11-12 审计 M12 修正）：`.bak-llmgateway` **永远**等于"上一次写入前的内容"，
+      // 而不是"第一次写入前的内容"。
+      //
+      // 旧实现是 `if (!exists(bak)) copyFileSync(...)` —— 只在备份文件不存在时创建。于是
+      // 连续写两次之后，目标是 V2、备份仍是 V0，而界面上的「恢复」只能回到 V0：
+      // 中间那次改动**不可回退**，且第二次写入还返回 `backup: ''`（看起来像没备份）。
+      // 这在"改坏了想退回上一步"的场景里正好失效 —— 而那才是恢复按钮最常用的时刻。
+      //
+      // 现在：写入前把现有的 .bak-llmgateway 轮转成 .bak-llmgateway.prev（只留一层），
+      // 再用当前内容刷新 .bak-llmgateway。于是
+      //   目标 = V2，.bak-llmgateway = V1（恢复 → 退回上一步），.bak-llmgateway.prev = V0（再退一步）
+      // restore() 仍然读 .bak-llmgateway，语义从"回到最初"改成"撤销上一次写入" —— 更符合按钮的含义。
+      // prev 的轮转失败**不中止**（它只是额外一层历史），但主备份失败仍然中止写入（铁律①）。
       const bak = file + BACKUP_SUFFIX;
-      if (!exists(bak)) {
-        try {
-          fs.copyFileSync(file, bak);
-          backup = bak;
-        } catch (e) {
-          // 备份失败 → 中止（铁律①）
-          return { ok: false, error: '备份失败，已中止写入：' + (e && e.message ? e.message : e) };
+      const prevBak = bak + '.prev';
+      try {
+        if (exists(bak)) {
+          try {
+            fs.copyFileSync(bak, prevBak);
+          } catch (_) { /* 额外历史层，失败不影响写入 */ }
         }
+        fs.copyFileSync(file, bak);
+        backup = bak;
+      } catch (e) {
+        // 备份失败 → 中止（铁律①）
+        return { ok: false, error: '备份失败，已中止写入：' + (e && e.message ? e.message : e) };
       }
     }
     // 临时名带随机后缀：只带 pid 时，**同进程内并发写同一个文件**会共用同一个临时路径

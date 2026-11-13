@@ -44,9 +44,31 @@ class Settings {
       if (fs.existsSync(this.path)) {
         const raw = JSON.parse(fs.readFileSync(this.path, 'utf8'));
         if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-          // 认识的键：逐个覆盖。
+          // 认识的键：逐个覆盖，**但类型必须与默认值一致**（2026-11-12 审计 L6）。
+          //
+          // 旧实现是 `if (raw[k] !== undefined) this.data[k] = raw[k];` —— 不校验类型。
+          // 实测事故：settings.json 里写成 `"minimizeToTray": "false"`（字符串，手改 JSON 时
+          // 很常见的笔误），载入后 main.js 的 `settings.get('minimizeToTray') !== false` 恒为真
+          // → 点 × 只隐藏窗口、window-all-closed 也不退出 → 用户以为"程序关不掉"，
+          // 它变成只有托盘的幽灵进程。而 save() 那边早就有类型校验，读这边没有，
+          // 于是"程序自己写的文件"和"用户手写的文件"走了两套标准。
+          //
+          // 现在：类型不符就**保持默认值**并记一行日志（不静默丢弃用户的其它设置）。
           for (const k of Object.keys(DEFAULTS)) {
-            if (raw[k] !== undefined) this.data[k] = raw[k];
+            if (raw[k] === undefined) continue;
+            const def = DEFAULTS[k];
+            const val = raw[k];
+            const typeOk = (def === null)
+              ? val === null
+              : (typeof def === 'boolean' ? typeof val === 'boolean'
+                : typeof def === 'number' ? (typeof val === 'number' && Number.isFinite(val))
+                  : typeof val === typeof def);
+            if (!typeOk) {
+              this.log(`settings.json 的 ${k} 类型不对（期望 ${def === null ? 'null' : typeof def}，`
+                + `实际 ${val === null ? 'null' : typeof val}），已沿用默认值 ${JSON.stringify(def)}。`);
+              continue;
+            }
+            this.data[k] = val;
           }
           // 不认识的键：**保留在内存里也保留在磁盘上** —— 用户手写的内容不替人做主，
           // 而且 save() 是整体重写文件，丢掉它们等于悄悄删用户的东西。

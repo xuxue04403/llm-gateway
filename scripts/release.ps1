@@ -185,41 +185,81 @@ else {
     # ⚠ 只按 ProcessName 过滤会**漏掉网关引擎子进程**（实测踩到：残留引擎占着端口，
     #    新实例起不来，而 /health 看似正常 —— 其实是旧引擎在服务）。
     #    所以按「端口 owner + exe 路径」双路找 PID，并 taskkill /T 连进程树一起清。
+    #
+    # ⚠⚠ 端口匹配必须是**精确匹配**（2026-11-12 审计 H3）。
+    #    旧实现是 `netstat -ano | findstr :$port` —— findstr 做的是**子串**匹配，
+    #    `:3091` 会同时命中 `:30910`、`1.2.3.4:30911` 等。配合下面的 `taskkill /F /T /PID`
+    #    就是**误杀无关进程**（连同它的整棵子进程树）。已用样本行验证：`:3091` 命中 2 行，
+    #    其中一行是 `:30910`。
+    #    现在改为：先取 netstat 全量行，用**正则**要求端口是字段末尾（`:<port>\s` 或
+    #    行尾），再取 LISTENING 那一列。TCP 行形如：
+    #        协议  本地地址          外部地址        状态        PID
+    #         TCP   127.0.0.1:3091    0.0.0.0:0       LISTENING   9244
+    #    所以判据是 `$f[1] -match ":$port$"`（本地地址以 `:<port>` 结尾），不是全行 contains。
+    $listeningPids = @()
     $pids = New-Object System.Collections.Generic.HashSet[int]
-    foreach ($l in (cmd /c "netstat -ano | findstr :$port")) {
-      $f = ($l -split '\s+') | Where-Object { $_ }
-      if ($f.Count -ge 5 -and $f[3] -eq 'LISTENING') { [void]$pids.Add([int]$f[4]) }
+    $netLines = @(cmd /c 'netstat -ano')
+    foreach ($l in $netLines) {
+      $f = @($l -split '\s+' | Where-Object { $_ })
+      if ($f.Count -lt 5) { continue }
+      if ($f[0] -ne 'TCP') { continue }
+      if ($f[3] -ne 'LISTENING') { continue }
+      # 本地地址可能是 127.0.0.1:3091 / [::1]:3091 / 0.0.0.0:3091 —— 一律要求以 :<port> 结尾
+      if ($f[1] -match (':' + [string]$port + '$')) { $listeningPids += [int]$f[4] }
     }
+    foreach ($p in $listeningPids) { [void]$pids.Add($p) }
     foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
       try { if ($p.Path -and $appExe -and ($p.Path -eq $appExe)) { [void]$pids.Add([int]$p.Id) } } catch { }
     }
     foreach ($p in @($pids)) { & taskkill /F /T /PID $p 2>&1 | Out-Null }
     for ($i = 0; $i -lt 40; $i++) {
       Start-Sleep -Milliseconds 500
-      if (@(cmd /c "netstat -ano | findstr :$port" | Where-Object { $_ -match 'LISTENING' }).Count -eq 0) { break }
+      $still = @()
+      foreach ($l in @(cmd /c 'netstat -ano')) {
+        $f = @($l -split '\s+' | Where-Object { $_ })
+        if ($f.Count -ge 5 -and $f[0] -eq 'TCP' -and $f[3] -eq 'LISTENING' -and $f[1] -match (':' + [string]$port + '$')) { $still += $f[4] }
+      }
+      if ($still.Count -eq 0) { break }
     }
     $stopped = $true
     Ok "应用已停止（清掉 $($pids.Count) 个进程），端口 $port 已释放"
   }
 
   Info "重建 out\$OUT_NAME …"
-  node (Join-Path $ROOT 'scripts\build-portable.mjs') $OUT_NAME 2>&1 | Select-Object -Last 8
-  if ($LASTEXITCODE -ne 0) { & $fail 'build-portable 失败' }
-
-  Info 'npm run dist …'
-  npm run dist 2>&1 | Select-Object -Last 4
-
-  # 3c) 无论成败都要把应用拉起来
-  if ($stopped) {
-    $env:ELECTRON_RUN_AS_NODE = $null
-    if (Test-Path $appExe) {
-      Start-Process -FilePath $appExe -WorkingDirectory (Split-Path $appExe -Parent) | Out-Null
-      for ($i = 0; $i -lt 60; $i++) {
-        Start-Sleep -Seconds 1
-        try { if ((Invoke-RestMethod -Uri "http://127.0.0.1:$port/health" -TimeoutSec 5).ok) { Ok "应用已重启（第 $($i+1) 秒 /health OK）"; break } } catch { }
-      }
-    } else { Warn "找不到 $appExe，未能自动重启应用" }
+  # ⚠ 2026-11-13 发布事故：原来 build-portable 一失败就 `& $fail` 直接 exit 1，
+  #    而"重启应用"写在后面（3c），于是**所有构建失败都会把应用留在停机状态**。
+  #    如果这个应用正好是发布者自己的 LLM 出口，就等于把自己的路断了。
+  #    现在改成 try/finally：不管构建成败，先把应用拉起来，再决定退出码。
+  $buildError = $null
+  try {
+    node (Join-Path $ROOT 'scripts\build-portable.mjs') $OUT_NAME 2>&1 | Select-Object -Last 8
+    if ($LASTEXITCODE -ne 0) { $buildError = "build-portable 失败（exit $LASTEXITCODE）" }
+    else {
+      Info 'npm run dist …'
+      npm run dist 2>&1 | Select-Object -Last 4
+      if ($LASTEXITCODE -ne 0) { $buildError = "npm run dist 失败（exit $LASTEXITCODE）" }
+    }
   }
+  catch { $buildError = '构建过程抛异常：' + $_.Exception.Message }
+  finally {
+    # 3c) 无论成败都要把应用拉起来
+    if ($stopped) {
+      # ⚠ 必须清掉 ELECTRON_RUN_AS_NODE：宿主若把它设成 1（用同一个 exe 当 node 跑引擎），
+      #    子进程会继承 → 主程序以"纯 Node 模式"启动、打印不了任何东西、立刻 exit 0，
+      #    看起来就像"应用起不来但没有报错"。2026-11-13 实测踩到。
+      Remove-Item Env:\ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+      if (Test-Path $appExe) {
+        Start-Process -FilePath $appExe -WorkingDirectory (Split-Path $appExe -Parent) | Out-Null
+        $up = $false
+        for ($i = 0; $i -lt 60; $i++) {
+          Start-Sleep -Seconds 1
+          try { if ((Invoke-RestMethod -Uri "http://127.0.0.1:$port/health" -TimeoutSec 5).ok) { Ok "应用已重启（第 $($i+1) 秒 /health OK）"; $up = $true; break } } catch { }
+        }
+        if (-not $up) { Warn "应用已启动但 60 秒内 /health 未就绪 —— 请手动检查（端口 $port）" }
+      } else { Warn "找不到 $appExe，未能自动重启应用" }
+    }
+  }
+  if ($buildError) { & $fail $buildError }
 }
 
 # ─────────────────────────── 4) ★ 门禁 ───────────────────────────

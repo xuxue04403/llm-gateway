@@ -219,7 +219,9 @@ LG.initSettings = function initSettings() {
   $('#btnImportFile').addEventListener('click', () => pickImportFile());
   $('#btnExportCfg').addEventListener('click', async () => {
     const r = await window.lgw.cfgExport('gateway.config.json');
-    if (r && r.ok) toast('已导出到 ' + r.path, 'ok', 5000);
+    // 导出的是配置原文，含全部供应商明文密钥 —— 提示必须持久一点（10 秒），
+    // 别让用户只看到一闪而过的「已导出」就把文件发出去了（审计 M14）。
+    if (r && r.ok) toast((r.warning ? '已导出到 ' + r.path + '。' + r.warning : '已导出到 ' + r.path), 'ok', 10000);
     else if (r && !r.canceled) toast('导出失败：' + (r.error || ''), 'err');
   });
   $('#btnRawJson').addEventListener('click', () => {

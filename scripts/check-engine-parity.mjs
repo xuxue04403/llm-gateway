@@ -500,10 +500,32 @@ const DECLARED = [
   // ---- 2026-11-04：缓存命中率口径（用户报「缓存命中率严重下降」）----
   { name: 'inputTokensIncludeCache', why: '新增：判上游 usage 的 input 口径**含不含**缓存。Anthropic 的三桶互斥（input_tokens + cache_read + cache_creation = 总输入），OpenAI chat 的 prompt_tokens / Responses 的 input_tokens 则**包含** cached_tokens。为什么必须按形状判、不能无条件减：Anthropic 直通的 input_tokens 本身就不含缓存，再减一次会直接变 0（另一种方向的错）。实测：prompt_tokens=4386 / cached=4224，旧口径 4224/(4386+4224)=49%，真值 4224/4386=96% —— 这正是用户截图里那个 49%' },
 
+  // ---- 2026-11-12：该模型不支持这条线协议（用户报「agentrouter 供应商调用报错」）----
+  { name: 'MODEL_WIRE_UNSUPPORTED_RE', why: '新增：判据「这家有这个模型，但**这条线协议**上不收 tools+推理」。实测 agentrouter（https://agentrouter.org/）的 gpt-5.6-sol / gpt-6-astra / gpt-6.1-sol 在 `/v1/messages` 上一带 tools 就回 400 `Function tools with reasoning_effort are not supported for gpt-6-astra in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to \'none\'.` —— 它既**不**命中 MODEL_NOT_ON_ENDPOINT_RE（措辞里没有 "not supported on this endpoint"，也没有 "use X for"），也**不**命中 MODEL_MISSING_RE（"not supported" 前 60 字符内没有 "model"），于是掉进「确定性 4xx → 记为候选失败」的兜底：单候选时整请求 400，用户只看到失败、看不出该改哪个字段。⚠ 实测已排除"网关自己多塞 reasoning_effort"这一可能：本地 mock 上游收到的是干净的 `{model,max_tokens,stream,tools,messages}` —— reasoning_effort 是 agentrouter 内部把 /v1/messages 转 /v1/chat/completions 时自己加的' },
+  { name: 'isModelWireUnsupported', why: '新增：上面的判定入口。接入点刻意分成**两处**，因为两条 4xx 分类链是分开的：① `forward()`（直通 / chat-completions 路径）的通用 4xx 段 —— 紧跟 `isOpaqueProvider4xx` 之后、`DETERMINISTIC_4XX_STATUS` 兜底之前；② `forwardAnthropicViaOpenAI()`（Anthropic 客户端 → openai-chat 上游，DSH 走得最多的一条）同一个位置。⚠ **必须两处都有**：初版只加在 `forward()` 里那段 `opts.accountScoped` 块内，结果事件顺序是 `accountScoped=false` → 分支根本不评估 → 测试里仍打「确定性 4xx」，用户看到的还是原来那句 400（实测 `node tests/gateway.test.js` exit=1 才发现）。两处的处置一致：继续 failover、不熔断整家、交还半开名额 + 记一次模型级失败，但把 `suggestedEndpointHint` 抠出的上游建议路径（本例 `/v1/responses`）写进日志，直接告诉用户把该模型的「上游协议」改成哪个值' },
+  { name: 'stopFailoverMessage', why: '改动（2026-11-12）：新增 `wireUnsupported` 入参分支 —— 全部候选都失败时，回给客户端的 400 文案由原来那句**方向错误**的 `the request itself may be invalid (parameters / size / context length)` 换成 `this provider does not accept tools + reasoning on the current endpoint for this model — set this model\'s upstream protocol to /v1/responses in the provider settings (or disable reasoning), then retry`。理由：用户大概率看不到网关日志，只看得到这句；而 agentrouter 这条 400 的真实成因是「这家在这个端点上不收这个组合」，不是「你的参数写错了」，指错方向会让人一直去删 tools / 缩上下文。⚠ 2026-11-12 审计 M5 后续修正：这里原来把**URL 路径** `/v1/responses` 当成「上游协议」的取值，但配置里真正可填的枚举是 `openai-responses`（`gateway-manager.js` 的校验白名单不接受 `/v1/responses`）—— 用户照着提示填会被保存校验挡住。现由 `wireHintApiValue()` 换算成枚举值再拼进这句话' },
+
+  // ---- 2026-11-12：全面复核审计的修复（H1–H8 / M1–M15 / L1–L6）----
+  //
+  // 只登记**本次修复新引入或改变了语义**的引擎块。审计报告本身在
+  // `.audit/2026-11-12-full-review/REPORT.md`，每条都带复现脚本。
+  { name: 'maskOutletUrl', why: '新增（审计 H4）：把代理/出口 URL 里的 userinfo 掩成 `***`。`proxyStatus()` 一直是有掩码的，但 `outletStatus()` 直接把 `activeOutletUrl()` 原串返回，于是 `/health`（**免鉴权**）的 `egress.active` 会明文吐出代理口令。实测复现：配置 `proxy.url=http://audituser:SuperSecret123@127.0.0.1:7890` 后 `GET /health` 的 `egress.active` 就是带明文口令的原串，而 `proxy.url` 是 `http://***@…`。同一函数也用在 `rotateOutlet()` 的日志里 —— 那处同样会把带 userinfo 的出口地址写进 gateway.log' },
+  { name: 'outletStatus', why: '改动（审计 H4）：`active` 与 `cooling[].url` 全部过 `maskOutletUrl()`。字段形状与键名不变，只改取值' },
+  { name: 'rotateOutlet', why: '改动（审计 H4）：日志里的短形式 `short(u)` 改为先 `maskOutletUrl` 再去 scheme。原实现直接把出口 URL 写进日志' },
+  { name: 'CONFIG_CLASS_COOLDOWN_MS', why: '新增（审计 M15）：**配置类**失败（不是网络故障，是要用户去改配置）的冷却时长，默认 10 秒，可用 `DSH_GATEWAY_CONFIG_CLASS_COOLDOWN_MS` 覆盖。此前这类失败走通用故障阶梯，首档就 90 秒：用户改好配置后还要等一分半，且第 4 次请求起会收到 503「all providers … temporarily in breaker cooldown (network/upstream failures)」—— 把「字段填错」讲成「网络坏了」，与真正的上游故障无法区分' },
+  { name: 'configClassHintFor', why: '新增（审计 M15）：从 `modelBreaker` 里取该模型当前生效的配置类提示（`b.configClass && slotIsOpen(b)` 时才取 `b.configHint`），供 503 文案使用' },
+  { name: 'breakerAllMessage', why: '新增（审计 M15）：四处「候选全熔断」的 503 文案统一走这里。有配置类提示时返回 `model "…" is unavailable because its configuration is wrong: <hint>（这是配置问题，不是网络故障 —— 改好供应商设置后最多 10 秒即可重试，不用重启网关）`；否则保留原来的 network/upstream failures 文案。⚠ 四处都要换：chat/completions 与 messages 两条入口各有「候选全熔断」与「eligible 全熔断」两个分支，只换一处会导致同样的状态回不同的文案' },
+  { name: 'modelBreakerSnapshot', why: '新增（审计 M4）：`/health` 的 `modelBreaker` 段，列当前处于冷却的**模型级**条目（`{provider, model, state, remainMs, opens, fails, reason?, modelScoped:true}`，按 remainMs 降序、上限 50）。此前 `accountPoolSnapshot` 只覆盖账户/单 Key 级，模型级冷却在 `/health` 里**完全不可见** —— 实测连续 3 次 500 后日志已是 `breaker OPEN: p1[m1] … 仅该模型冷却`，而 `/health.accounts` 仍是 `state: ok`，用户会以为"网关没问题"。⚠ 只读不清理：`trimModelBreaker()` 仍只在写路径调，展示不得改变调度状态' },
+  { name: 'wireHintApiValue', why: '新增（审计 M5）：把 `suggestedEndpointHint()` 从上游报文里抠出的 **URL 路径**（如 `/v1/responses`）换算成配置里真正可填的**枚举值**（`openai-responses` / `anthropic-messages` / `openai-chat`）。原实现把路径直接当"上游协议"的建议值，而 `gateway-manager.js` 的白名单不接受 `/v1/responses` —— 用户照着日志填会被保存校验挡住（实测 `protocol: "/v1/responses"` → `供应商 p1 的 protocol 非法`）' },
+  { name: 'providerAccounts', why: '改动（审计 M2）：`auth: "workbuddy"` 时自动建的 `auto` 账户现在带上 `provider.apiKey`（`String(provider.apiKey || "").trim()`），不再恒为空串。**仍然只造一个 auto 账户** —— 账户数、熔断归属、半开探测行为都不变（2026-10-17 曾因为改成多账户而回退过）。原实现让顶层 `apiKey` 在 workbuddy 家被**静默丢弃**：`apiKeysOf()` 只读 `apiKeys` 数组，而 `resolveWorkBuddyCredential()` 只在 `acct.apiKey` 非空时才短路，于是请求一律 503「未找到 WorkBuddy 登录凭据」。连带后果是 `tests/gateway.test.js` 三处 fixture 用顶层 apiKey 想"短路凭据解析"其实从未生效，只在"本机登录过 WorkBuddy"的机器上通过' },
+
   // ⚠ 待办：本清单在 v1.0.7 之后就没再维护，v1.0.8–v1.0.17 的改动（OpenCode 车道、
   //   出口轮换等）大量未登记，`node scripts/check-engine-parity.mjs`
   //   因此恒报 FAIL（本次改动之前就已经是红的）。这是清单腐烂，不是功能回退，
-  //   需要单独做一次全量登记；本次只登记自己新增的块，不代填别人的理由。
+  //   需要单独做一次全量登记；本次只登记自己新增/改动过的块，不代填别人的理由。
+  //   2026-11-12 再记：本次（agentrouter 线协议事故）只登记了自己的两个块。
+  //   2026-11-12 三记（全面审计修复）：再登记 10 个（H4×3 / M15×3 / M4 / M5 / M2），
+  //   仍有 47 个更早的未登记块 —— 脚本**仍然**是红的，历史欠账未清。
 ];
 
 /** 把源码切成"顶层块"：以列 0 开始的 function/const/let/var/class 声明为界。 */

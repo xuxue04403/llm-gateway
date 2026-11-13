@@ -8,7 +8,16 @@
 // 为什么用 `resources/app/` 目录而不是 `app.asar`：本程序**运行时零 npm 依赖**（全是 Node 内置
 // 模块），因此不需要打包 asar；省掉 asar 也省掉"外部 node 子进程读不了 asar 内文件"那一类坑。
 //
-// 用法：node scripts/build-portable.mjs [输出目录名]
+// 用法：node scripts/build-portable.mjs [输出目录名] [--dry-run | --check-name]
+//
+//   --check-name   只做输出目录名/位置校验，然后立即退出（不暂存 data、不删任何东西）
+//   --dry-run      校验通过后打印将要执行的动作并退出（同上，非破坏性）
+//
+// ⚠ 2026-11-12 审计 H1 的验证过程本身踩了坑，记在这里：当时为了验边界，用"合法名"
+// （`a b` / `out`）直接跑了本脚本，结果真的执行了完整构建 —— 于是 `rmSync` 打到了
+// **正在运行的** `out\LLM-Gateway`。万幸文件被占用立刻 EPERM 中止、data 也备份放回了，
+// 但那两次 `data-backup-*`（各 64 文件 / 22MB，含真实密钥）是我手工删掉的。
+// 结论：**永远不要用真的跑一次来验证构建脚本的边界**。所以现在有了 --check-name。
 'use strict';
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, cpSync } from 'node:fs';
@@ -20,8 +29,64 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
 
-const OUT_NAME = process.argv[2] || 'LLM-Gateway';
-const OUT_DIR = path.join(ROOT, 'out', OUT_NAME);
+// ⚠⚠ 输出目录名必须做边界校验（2026-11-12 审计 H1）。
+//
+// 旧实现直接 `path.join(ROOT, 'out', process.argv[2] || 'LLM-Gateway')`，然后
+// 第 105 行 `rmSync(OUT_DIR, { recursive: true, force: true })`。而 `path.join` 会**归一化**
+// `..`，于是：
+//     node scripts/build-portable.mjs ..        → OUT_DIR = <仓库根>        → 递归删掉整个仓库
+//     node scripts/build-portable.mjs ../..     → OUT_DIR = D:\IDE\dsh      → 连同级项目一起删
+//     node scripts/build-portable.mjs .         → OUT_DIR = <仓库根>\out
+// 这不是理论风险：`rmSync` 是同步递归强删，且 `process.on('exit')` 的 data 还原钩子
+// 只在 out\ 里有 data\ 时才起作用 —— 一旦打到仓库根，什么都不会被还原。
+//
+// 校验分两层（都要过）：
+//   1) 名字本身：只允许单段、不含路径分隔符/盘符/全角空格，不能是 `.` `..`，
+//      首尾不能是空白或点（Windows 上 `foo.` 会被静默截断成 `foo`）。
+//   2) 解析后位置：`path.resolve(OUT_DIR)` 必须严格位于 `<仓库根>\out\` 之下且不等于它。
+//      第 2 层是真正的兜底 —— 即使第 1 层哪天被放宽，也不会删到 out\ 之外。
+// ⚠ 2026-11-12 复核修：取名字时必须**跳过选项**，否则 `--check-name` / `--no-zip` 会被当成目录名。
+// 旧写法是 `process.argv[2] || 'LLM-Gateway'`，实测 `node scripts/build-portable.mjs --check-name`
+// 会打印"校验通过：…\out\--check-name"，而 `node scripts/build-portable.mjs --no-zip` 会真的
+// 往 `out\--no-zip` 里构建一份 —— 名字校验里没有排除 `-` 开头，所以一路放行。
+const POSITIONAL = process.argv.slice(2).filter((a) => !String(a).startsWith('-'));
+const OUT_NAME_RAW = POSITIONAL[0] || 'LLM-Gateway';
+// ⚠ 2026-11-13 发布事故：改名 OUT_NAME → OUT_NAME_RAW 时漏了 zip 段的两处引用，
+//    构建到最后一步抛 "OUT_NAME is not defined"，data\ 被恢复但整个发布中断
+//    （应用停在停机状态）。现在只保留一个名字来源：后面的代码统一用 OUT_NAME。
+const OUT_NAME = OUT_NAME_RAW;
+const CHECK_ONLY = process.argv.includes('--check-name') || process.argv.includes('--dry-run');
+const outRoot = path.join(ROOT, 'out');
+const OUT_DIR = path.resolve(outRoot, OUT_NAME_RAW);
+const outRelative = path.relative(outRoot, OUT_DIR);
+const badOutName = (() => {
+  const n = String(OUT_NAME_RAW);
+  if (!n || n === '.' || n === '..') return '不能为空、`.` 或 `..`';
+  if (/[\\/:*?"<>|\u3000]/.test(n)) return '不能包含路径分隔符或 Windows 非法字符';
+  if (/^[A-Za-z]:/.test(n)) return '不能是盘符路径';
+  if (n !== n.trim()) return '首尾不能有空白';
+  if (/^[. ]|[. ]$/.test(n)) return '首尾不能是点或空格（Windows 会静默截断）';
+  if (n.length > 64) return '过长（上限 64 字符）';
+  // Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）：建目录会失败或被重定向到设备
+  const stem = n.split('.')[0].toUpperCase();
+  if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/.test(stem)) return '是 Windows 保留设备名';
+  return '';
+})();
+if (badOutName) {
+  console.error('输出目录名非法：' + JSON.stringify(OUT_NAME_RAW) + ' —— ' + badOutName);
+  console.error('用法：node scripts/build-portable.mjs [输出目录名]   （默认 LLM-Gateway，必须是单层目录名）');
+  process.exit(2);
+}
+if (!outRelative || outRelative.startsWith('..') || path.isAbsolute(outRelative) || outRelative.split(path.sep).length !== 1) {
+  console.error('输出目录解析后越界：' + OUT_DIR);
+  console.error('必须严格位于 ' + outRoot + path.sep + ' 之下。已中止，未删除任何文件。');
+  process.exit(2);
+}
+if (CHECK_ONLY) {
+  console.log('✅ 输出目录校验通过：' + OUT_DIR);
+  console.log('   （--check-name/--dry-run：未暂存 data、未删除、未复制任何文件）');
+  process.exit(0);
+}
 const ELECTRON_DIST = path.join(ROOT, 'node_modules', 'electron', 'dist');
 
 if (!existsSync(ELECTRON_DIST)) {
@@ -37,6 +102,9 @@ if (!existsSync(exeSrc)) {
 }
 
 console.log('打绿色目录：' + OUT_DIR);
+
+/** zip 阶段是否失败（审计 M7：失败必须在收尾时置非零退出码，而不是静默成功）。 */
+let zipFailed = false;
 
 // ⚠⚠ 重建前必须**保住 data\**。
 //
@@ -135,13 +203,38 @@ console.log('  应用：src / renderer / package.json');
 
 // 3) 可执行文件：优先用 electron-builder 已经打好图标/版本信息的那个（dist/win-unpacked），
 //    没有就用原始 Electron 的 exe（功能一样，只是图标还是 Electron 默认的）。
+//
+// ⚠ 2026-11-12 审计 L1：这里有个真实的版本混用风险 —— exe 取 dist\win-unpacked 的，
+// 而 DLL / .pak / snapshot_blob.bin 一律取 node_modules\electron\dist 的。两边版本不一致时
+// 会得到一个"exe 是 45.0.0-alpha.6、运行时资源却是别的版本"的目录，症状是启动即崩或白屏，
+// 而且极难定位（因为每份文件单独看都正常）。
+// 现状核对（2026-11-12 实测本机）：ffmpeg.dll / vk_swiftshader.dll / d3dcompiler_47.dll /
+// icudtl.dat 四份哈希与 node_modules 完全一致，所以**当前**不会出问题。
+// 这里加一道防线而不是改行为：先把两边都读得到的版本标记比一下（electron dist 有 `version`
+// 文件；electron-builder 产物可能没有），能读到且不一致就**拒绝**，读不到就只在日志里
+// 提示一句"未能核对版本"。宁可让构建失败一次，也不要发一个混装运行时出去。
 const exeInOut = path.join(OUT_DIR, 'electron.exe');
 const exeDst = path.join(OUT_DIR, 'LLM Gateway.exe');
 const iconed = path.join(ROOT, 'dist', 'win-unpacked', pkg.productName + '.exe');
 if (existsSync(iconed)) {
+  const readVer = (p) => { try { return readFileSync(path.join(p, 'version'), 'utf8').trim(); } catch (_) { return ''; } };
+  const distVer = readVer(ELECTRON_DIST);
+  const unpackedVer = readVer(path.join(ROOT, 'dist', 'win-unpacked'));
+  if (distVer && unpackedVer && distVer !== unpackedVer) {
+    console.error('');
+    console.error('[STOP] Electron 运行时版本不一致，拒绝混装：');
+    console.error('   node_modules\\electron\\dist  = ' + distVer);
+    console.error('   dist\\win-unpacked           = ' + unpackedVer);
+    console.error('   用 electron-builder 产物里的 exe 覆盖，却拿另一版本的 dll/pak 拼在一起，');
+    console.error('   启动会崩且很难查。请让两边版本一致（必要时 rm -rf dist 后重跑 npm run pack）。');
+    process.exit(4);
+  }
   rmSync(exeInOut, { force: true });
   cpSync(iconed, exeDst);
   console.log('  可执行：LLM Gateway.exe（取自 electron-builder 产物，图标/版本信息已写入）');
+  if (!distVer || !unpackedVer) {
+    console.log('     ⚠ 未能核对运行时版本（' + (distVer ? 'win-unpacked 无 version 文件' : 'electron dist 无 version 文件') + '），默认按同版本处理');
+  }
 } else {
   renameSync(exeInOut, exeDst);
   console.log('  可执行：LLM Gateway.exe（原始 Electron exe；先跑 npm run pack 可带上图标）');
@@ -214,7 +307,7 @@ console.log('');
 console.log(`[OK] 绿色目录已生成：${OUT_DIR}`);
 console.log(`     ${(s.total / 1048576).toFixed(1)} MB / ${s.files} 个文件`);
 
-// 6) **硬闸门**：产物目录里绝不能有 data\。
+// 6) **硬闸门**：产物目录里绝不能有 data\ 或任何用户数据残留。
 //
 // 为什么值得单独设一道闸：绿色版的 data\ 就在被分发的那个目录里，里面是用户的
 // `gateway.config.json`（含全部上游密钥）与生成的 `clients\llm-gateway-env.*`（含统一 Key）。
@@ -222,15 +315,39 @@ console.log(`     ${(s.total / 1048576).toFixed(1)} MB / ${s.files} 个文件`);
 // `out/LLM-Gateway/` 里跑过一次程序、之后又用**别的方式**打包（手工 zip、改脚本、
 // 换 electron-builder 输出目录），12 家上游密钥就跟着发出去了。
 // 而 README 与「使用说明.txt」恰恰在教用户"整个目录复制到别的电脑"。
-const leaked = ['data', 'logs'].filter((d) => existsSync(path.join(OUT_DIR, d)));
-const leakFiles = (() => {
-  try { return readdirSync(OUT_DIR).filter((f) => /\.bak|\.log$|gateway\.config\.json$/i.test(f)); } catch (_) { return []; }
-})();
+//
+// ⚠ 2026-11-12 审计 M14：旧实现只查 `OUT_DIR` **根**下的 `data`/`logs` 与根目录的文件名。
+// 但用户数据不只在根：`_backupConfig()` 写的是 `data\config-backups\`（子目录，10 份全部
+// 含明文密钥），写入器还会往 `data\clients\` 放统一 Key。只查根等于只挡住了一半 ——
+// 只要哪天 data\ 被挪到别的位置、或产物里出现 `resources\app\data\`，闸门就静默放过。
+// 现在改成**递归**：任意深度的 `data`/`logs` 目录、任意深度的 `*.bak*`/`*.log`/
+// `gateway.config*.json` 文件都算泄漏。实测当前产物递归命中 0 个多余文件（只有 data\ 本身），
+// 所以不会误报。
+const leaked = [];
+const leakFiles = [];
+(function scanLeak(dir, depth) {
+  if (depth > 8) return; // 防御：符号链接环
+  let entries = [];
+  try { entries = readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      if (e.name === 'data' || e.name === 'logs') { leaked.push(p); continue; }
+      scanLeak(p, depth + 1);
+    } else if (/\.bak|\.log$/i.test(e.name) || /^gateway\.config(-|\.json$)/i.test(e.name)) {
+      // ⚠ 这里刻意不用 `gateway\.config.*\.json` 这种宽匹配：`src\gateway\gateway.config.example.json`
+      // 是**要发布**的示例配置，宽匹配会让每次构建都被自己的闸门挡住（实测命中 1 次）。
+      // 真正要拦的是 `gateway.config.json` 本身与 `_backupConfig()` 产出的
+      // `gateway.config-<ISO>.json`（`gateway.config-` 前缀），以及任何 `*.bak*`。
+      leakFiles.push(p);
+    }
+  }
+})(OUT_DIR, 0);
 if (leaked.length || leakFiles.length) {
   console.error('');
   console.error('[STOP] 产物目录里出现了用户数据，已中止打包：');
-  for (const d of leaked) console.error('   目录  ' + path.join(OUT_DIR, d));
-  for (const f of leakFiles) console.error('   文件  ' + path.join(OUT_DIR, f));
+  for (const d of leaked) console.error('   目录  ' + d);
+  for (const f of leakFiles) console.error('   文件  ' + f);
   console.error('   这些内容含你的上游密钥与本机网关 Key。请先删除它们再重跑本脚本。');
   process.exit(1);
 }
@@ -292,8 +409,15 @@ if (!process.argv.includes('--no-zip')) {
   if (zipOk) {
     console.log(`[OK] zip：${zipPath}（${(statSync(zipPath).size / 1048576).toFixed(1)} MB）`);
   } else {
+    // ⚠ 必须**置非零退出码**（2026-11-12 审计 M7）。
+    // 旧实现只 console.log 一句就继续往下走、正常 exit 0 —— 于是
+    // `scripts\release.ps1` 里 `npm run` 那一串不会失败，发布流程会拿着一个
+    // 根本不存在（或 0 字节）的 zip 继续上传，甚至打 tag。
+    // 修 M7 时保持这一点：先说清为什么失败，再让进程带着码退出（data 仍会由下面的
+    // restoreStash 放回，因为退出前会走 process.on('exit') 钩子）。
     const why = existsSync(zipPath) ? `产物过小（${statSync(zipPath).size} 字节，疑似损坏）` : '未生成';
-    console.log('     zip 打包失败：' + why + '　' + ((r.stderr || r.stdout || '').trim() || ''));
+    console.error('     zip 打包失败：' + why + '　' + ((r.stderr || r.stdout || '').trim() || ''));
+    zipFailed = true;
   }
 }
 
@@ -325,4 +449,13 @@ try {
   }
 } catch (e) {
   console.warn('  ⚠ 清理旧备份失败（不影响构建）：' + (e && e.message));
+}
+
+// 10) 收尾退出码（审计 M7）。
+//
+// 放在 data 放回之后：即使 zip 失败，用户的配置也必须先归位，再带着非零码退出。
+// 只在这一处判定，避免前面的 `process.exit(2)`（参数校验）被覆盖。
+if (zipFailed) {
+  console.error('[FAIL] zip 打包失败 —— 目录已生成，但压缩包不可用。不要再往上发布，先看上面的原因。');
+  process.exit(3);
 }

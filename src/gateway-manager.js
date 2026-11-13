@@ -35,6 +35,26 @@ const MAX_CONTEXT_WINDOW = 10 * 1000 * 1000;   // 上下文长度上限 1000 万
 const CLIENT_PROFILES = ['claude', 'codex', 'cline', 'opencode'];
 const MAX_MAX_TOKENS = 1000 * 1000;            // 单次最大输出上限 100 万
 
+/**
+ * 线协议名的**唯一白名单**（供应商级 `protocol` 与模型级 `api`/`protocol`/`wire` 共用）。
+ *
+ * 必须与引擎的 `wireOfName()`（model-gateway.mjs）**逐字对齐**。旧白名单少了几种引擎
+ * 本来就认的拼法（`chat` / `messages` / `openai-responses` / `responses`），于是用户
+ * 写出引擎完全支持的协议时被校验器挡在门外（实测 2026-10-09：Codex 订阅预设填
+ * `openai-responses` 直接保存失败）。渲染层的 `canonicalApiValue()` 也认同一组拼法 ——
+ * 三处必须一致，`tests/unit.js` 有一条守卫测试拿引擎源码来比这份清单。
+ *
+ * ⚠ 2026-11-12 审计 M1：模型级的 `api` / `protocol` / `wire` 之前**完全没有校验**。
+ * 实测 `{id:'m1',api:'openai-response'}`（少一个 s）、`api:'foobar'`、`protocol:'nonsense'`
+ * 三项全部"保存成功"，而引擎 `:3024` 的 `wireOfName(m.api ?? m.protocol ?? m.wire)`
+ * 认不出就**静默丢弃**该字段 → 模型退回"跟随供应商协议"。用户以为给这个模型单独指定了
+ * 线路，实际一个字节都没生效，且没有任何提示。这正是 2026-11-12 agentrouter 事故的
+ * 同一类坑（那次值是对的、只是写错了层级），所以必须在校验器里拦住。
+ */
+const PROTOCOL_VALUES = ['openai-chat', 'openai-completions', 'openai', 'chat',
+  'anthropic', 'anthropic-messages', 'messages',
+  'openai-responses', 'responses'];
+
 const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const http = require('http');
@@ -229,7 +249,7 @@ function validateConfigText(text) {
   if (keyPresent) {
     const k = String(cfg.apiKey).trim();
     if (k === '') {
-      return { ok: false, error: 'apiKey 被显式设成了空值：网关能启动、/health 返回 200，但每个模型请求都会 401。请填一个 ≥16 字符的随机 Key，或直接删掉这个字段（=不启用网关鉴权）。' };
+      return { ok: false, error: 'apiKey 被显式设成了空值：网关能启动、/health 返回 200，但每个模型请求都会 401。请填一个 ≥16 字符的随机 Key，或者**把 apiKey 字段整个删掉**——注意删掉不等于"关闭鉴权"：引擎对缺失的 apiKey 同样是 fail-closed（`model-gateway.mjs` 的 authorized() 在密钥不足 16 字符时一律返回 false），删掉之后仍然是每个请求 401。**想真正不校验就得换个大于等于 16 字符的 Key 并用它调用**，本程序不提供"无鉴权"模式。' };
     }
     if (k === 'dsh-gateway-change-me') {
       return { ok: false, error: 'apiKey 仍是示例占位值（dsh-gateway-change-me）：本机任何进程都能白用你的上游额度，请改成自己的随机 Key' };
@@ -379,6 +399,21 @@ function validateConfigText(text) {
           if (m.timeoutMs !== undefined && Number(m.timeoutMs) < 1000) {
             return { ok: false, error: who + ' 的条目 "' + up + '" 的 timeoutMs 太小（' + m.timeoutMs + 'ms），至少 1000ms' };
           }
+          // 逐模型线路（2026-11-12 审计 M1）：引擎 `wireOfName(m.api ?? m.protocol ?? m.wire)`
+          // 认不出就静默丢弃该字段、退回跟随供应商协议 —— 用户看不到任何提示。
+          // 校验器必须拦住，否则"给这个模型单开一条线"是个谎。
+          for (const fk of ['api', 'protocol', 'wire']) {
+            if (m[fk] === undefined || m[fk] === null) continue;
+            const fv = String(m[fk]).trim().toLowerCase();
+            if (fv === '') continue;   // 空串 = 不指定，与引擎同语义
+            if (!PROTOCOL_VALUES.includes(fv)) {
+              return {
+                ok: false,
+                error: who + ' 的条目 "' + up + '" 的 ' + fk + ' 非法（' + JSON.stringify(m[fk])
+                  + '）—— 该字段会被引擎静默忽略、退回跟随供应商协议。可选：openai-chat / anthropic-messages / openai-responses（以及简写 chat / messages / responses）',
+              };
+            }
+          }
           continue;
         }
         return { ok: false, error: who + ' 存在非法条目——每项应为字符串，或形如 { "id": "上游真实ID", "as": "逻辑模型名" } 的对象' };
@@ -392,18 +427,7 @@ function validateConfigText(text) {
       }
       if (p.protocol !== undefined) {
         const proto = String(p.protocol).trim().toLowerCase();
-        // ⚠ 白名单必须与引擎的 `wireOfName()`（model-gateway.mjs）**逐字对齐**。
-        //
-        // 旧白名单少了 4 个引擎本来就认的拼法：`chat` / `messages` /
-        // **`openai-responses`** / **`responses`** —— 于是用户（和渠道预设）
-        // 写出引擎完全支持的协议时，被校验器挡在门外，报「protocol 非法」。
-        // 实测（2026-10-09）：Codex 订阅预设填 `openai-responses` 直接保存失败。
-        //
-        // 这是"两个地方各写一份规则"的经典漂移。渲染层的 `canonicalApiValue()`
-        // 也认同一组拼法 —— 三处必须一致。
-        if (!['openai-chat', 'openai-completions', 'openai', 'chat',
-          'anthropic', 'anthropic-messages', 'messages',
-          'openai-responses', 'responses'].includes(proto)) {
+        if (!PROTOCOL_VALUES.includes(proto)) {
           return {
             ok: false,
             error: who + ' 的 protocol 非法（可选：openai-chat / anthropic-messages / openai-responses，'
@@ -510,6 +534,14 @@ class GatewayManager extends EventEmitter {
     // 这个标志由 _doStart 的就绪探测结果驱动（见下方 healthy 的处理）。
     this.failed = false;
     this.stopping = false;
+    // 停止代次（2026-11-12 审计 H7）：每调一次 stop() 就 +1。
+    // restart() 是 stop → killStale → waitPortFree → start，中间有真实时间窗；
+    // 只有代次能表达"这几步之间用户又点了一次停止"，布尔位做不到（且 start() 会无条件复位它）。
+    this._stopSeq = 0;
+    // 「应用正在退出」标记：由宿主在 before-quit / 关机通知里置真，用来把引擎退出归因成
+    // 「预期内」。**必须能在下一次正常启动时复位**，否则一次中止的退出会让之后所有真崩溃
+    // 都被当成预期（2026-11-13 复核修，复位点在 _doStart 的 spawn 之后）。
+    this._appQuitting = false;
     // 最近一次启动的代理决策（resolveProxy 写，proxyNote() 读 → /health 透出给界面）。
     // 存在的意义：**代理不可达导致"所有供应商都调不通"必须让用户看得见**，而不是只写进日志。
     this.proxyDecision = null;
@@ -625,17 +657,42 @@ class GatewayManager extends EventEmitter {
         throw e;
       }
       this.log('网关配置已保存。');
-      if (this.running && !(opts && opts.noRestart)) await this.restart();
-      return { ok: true, error: null };
     } catch (err) {
       return { ok: false, error: '配置写入失败：' + (err && err.message ? err.message : err) };
     }
+    // ⚠ 重启必须在写盘 try **之外**（2026-11-12 审计 M11）。
+    //
+    // 旧实现把 `await this.restart()` 放在写盘 try 里，于是 restart 抛错（端口被占、
+    // taskkill 失败、引擎起不来…）会被下面那个 catch 捕获，返回"配置写入失败：…"。
+    // 实测（host2/exp-f-saveconfig-misattribution.js）：磁盘上的 marker 已经是新值、
+    // config-backups 也 +1，**配置其实写成功了**，界面却告诉用户写失败 →
+    // 用户再点一次保存 → 再备份一份、再重启一次，越修越乱。
+    // 语义上这是两件事：写入成功 / 重启失败。分开报，别让后者冒充前者。
+    // 调用方（main.js 的 gw:save-config）本来就会把 r.warning 透给界面，直接复用。
+    if (this.running && !(opts && opts.noRestart)) {
+      try {
+        await this.restart();
+      } catch (e) {
+        const msg = e && e.message ? e.message : String(e);
+        this.log('配置已写入，但重启网关失败：' + msg);
+        return { ok: true, saved: true, restarted: false, warning: '配置已保存，但重启网关失败：' + msg + '。可点「重启网关」重试。' };
+      }
+      return { ok: true, saved: true, restarted: true, error: null };
+    }
+    return { ok: true, saved: true, restarted: false, error: null };
   }
 
   /**
-   * 把当前配置复制进 data\config-backups\，只保留最近 10 份。
+   * 把当前配置复制进 data\config-backups\，只保留最近 5 份。
    * 刻意保留"每次保存前"的版本，而不是"N 分钟一次" —— 用户改配置是低频动作，
    * 按动作留档既能精确回到"上一次保存之前"，也不会把目录撑大。
+   *
+   * ⚠ 份数从 10 降到 5（2026-11-12 审计 M14）。配置本身是明文，所以每多一份备份就是
+   * 把同一批密钥多复制一份：实测 10 份备份里 **10/10 全部含完整明文 Key**（26 个真实 Key
+   * 共命中 260 次），而 README 恰恰在教用户"整个目录复制到别的电脑"。
+   * 5 份仍足够覆盖"改坏了想退回几步"的实际需求（配置是低频改动），暴露面直接减半。
+   * 想彻底解决得让备份脱敏或加密，但那会让"恢复"变成需要额外输入密钥的流程 ——
+   * 在一次审计修复里不做这种改变用户操作路径的事，留作后续设计。
    */
   _backupConfig() {
     if (!fs.existsSync(this.configPath)) return;
@@ -653,12 +710,37 @@ class GatewayManager extends EventEmitter {
     }
     fs.copyFileSync(this.configPath, path.join(dir, name));
     const olds = fs.readdirSync(dir).filter((n) => /^gateway\.config-.*\.json$/.test(n)).sort();
-    for (const n of olds.slice(0, Math.max(0, olds.length - 10))) {
+    for (const n of olds.slice(0, Math.max(0, olds.length - 5))) {
       try { fs.unlinkSync(path.join(dir, n)); } catch (_) { /* 忽略 */ }
     }
   }
 
   /* ---------------- 代理 ---------------- */
+
+  /**
+   * 代理 URL 的展示形态：把 userinfo（用户名/口令）打成 `***`。
+   *
+   * ⚠ 2026-11-12 复核修（H4 的宿主侧同源泄露）：`resolveProxy()` 里的 `norm` 是用户
+   * 手填的原始地址，可能是 `http://user:pass@127.0.0.1:7890`。旧实现把它**原样**写进
+   * app.log（"使用配置代理 …" / "⚠ 配置的代理 … 连不上"），还塞进 `proxyDecision` →
+   * `proxyNote()` → `/health` 和界面。引擎侧的 `/health egress` 已经修了（maskOutletUrl），
+   * 但宿主这条路径一直漏着 —— 日志文件会被用户贴进工单、issue、聊天窗口。
+   * 调度仍然用原串（`return norm`），只有**字符形态**过这一层。
+   */
+  static maskProxyUrl(u) {
+    const s = String(u == null ? '' : u);
+    if (!s) return s;
+    try {
+      const parsed = new URL(s);
+      if (!parsed.username && !parsed.password) return s;
+      parsed.username = '***';
+      parsed.password = '';
+      return parsed.toString();
+    } catch (_) {
+      // 解析不了就退化为正则：把 scheme://...@ 之间的部分整段替换掉
+      return s.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/]*@/i, '$1***@');
+    }
+  }
 
   async resolveProxy() {
     // 每次决策都从零开始。否则"上一次的降级告警"会在下次启动时被复用，
@@ -683,19 +765,21 @@ class GatewayManager extends EventEmitter {
           // 而界面显示"运行中、/health 正常"（自检走恒直连的回环），用户只能从"模型全都调不通"
           // 里猜原因。本文件 probeProxyUrl 上方的注释早就把这条定为硬要求，只有这个分支漏了。
           if (await this.probeProxyUrl(norm, 2000)) {
-            this.log('使用配置代理 ' + norm + '（TCP 探测通过）');
-            this.proxyDecision = { mode: 'proxy', reason: 'config', configured: norm, used: norm, warn: false };
+            const shown = GatewayManager.maskProxyUrl(norm);
+            this.log('使用配置代理 ' + shown + '（TCP 探测通过）');
+            this.proxyDecision = { mode: 'proxy', reason: 'config', configured: shown, used: shown, warn: false };
             return norm;
           }
-          this.log('⚠ 配置的代理 ' + norm + ' 连不上（代理没启动 / 端口不对 / 地址写错）→ **不再使用它**。'
+          const shownBad = GatewayManager.maskProxyUrl(norm);
+          this.log('⚠ 配置的代理 ' + shownBad + ' 连不上（代理没启动 / 端口不对 / 地址写错）→ **不再使用它**。'
             + '不这样做的话，一个不存在的代理会让网关"健康"但所有未标记直连的供应商请求全部失败。');
-          this.proxyDecision = { mode: 'fallback', reason: 'config-unreachable', configured: norm, used: '', warn: true };
+          this.proxyDecision = { mode: 'fallback', reason: 'config-unreachable', configured: shownBad, used: '', warn: true };
           // 降级不是"直接直连"，而是回到与"没配代理"时**同一套**探测流程（环境变量/系统设置/常见端口），
           // 都不通才直连 —— 否则用户明明有可用的代理，却因为我们只认配置里那一个而全部走直连。
           const alt = await this.detectProxy();
           if (alt) {
-            this.proxyDecision.used = alt;
-            this.log('已改用自动探测到的代理 ' + alt + '（配置里那个连不上）。');
+            this.proxyDecision.used = GatewayManager.maskProxyUrl(alt);
+            this.log('已改用自动探测到的代理 ' + this.proxyDecision.used + '（配置里那个连不上）。');
           } else {
             this.log('也没有探测到其它可用代理 → **直连**（供应商请求不经过任何代理）。'
               + '若确实需要代理：先启动它，或到「设置 → 网络代理」改地址 / 关掉代理开关。');
@@ -707,8 +791,9 @@ class GatewayManager extends EventEmitter {
       }
     } catch (_) { /* 配置解析失败忽略 */ }
     const auto = await this.detectProxy();
-    if (this.proxyDecision) this.proxyDecision.used = auto || '';
-    else this.proxyDecision = { mode: auto ? 'proxy' : 'direct', reason: auto ? 'detected' : 'none', configured: '', used: auto || '', warn: false };
+    const autoShown = auto ? GatewayManager.maskProxyUrl(auto) : '';
+    if (this.proxyDecision) this.proxyDecision.used = autoShown;
+    else this.proxyDecision = { mode: auto ? 'proxy' : 'direct', reason: auto ? 'detected' : 'none', configured: '', used: autoShown, warn: false };
     return auto;
   }
 
@@ -879,7 +964,7 @@ class GatewayManager extends EventEmitter {
     return false;
   }
 
-  async start() {
+  async start(opts) {
     if (this.proc) return;
     // ⚠ 2026-10-14 修正（审计）：`stopping` 原来只有 `_doStart` 开头一处复位。
     // 触发路径：用户连点两次「重启」→ 第一次 stop() 置 stopping=true → start() 撞上
@@ -887,6 +972,21 @@ class GatewayManager extends EventEmitter {
     // 此后 `stopping` 永久为 true：`_scheduleHeal` 里 `if (this.stopping) return`
     // → **引擎崩了不再自愈**；且 _doStart 里每个 await 之后的取消语义全部失效。
     // 现在在每次 start() 请求入口无条件复位：start 的意图就是"我要它跑着"。
+    //
+    // ⚠⚠ 但这句无条件复位本身又制造了另一个竞态（2026-11-12 审计 H7）：
+    // restart() 的流程是 stop → killStale → waitPortFree → start，这几步之间有真实的时间窗
+    // （killStale 是 PowerShell 查询，上限 15s）。用户在这个窗口里点「停止」时：
+    //   stop() 看到 proc===null → 立刻返回（"已停止"），置 stopping=true；
+    //   紧接着 restart 跑到 start() → **无条件把 stopping 复位成 false** → 引擎照样被拉起来。
+    // "用户点了停止，网关却起来了"（host2/exp-b-race-orphan.js 场景 1 复现）。
+    // 修法：用单调递增的代次 `_stopSeq` 而不是布尔位来表达"期间是否又来了一次停止"。
+    // restart 在 stop 之后记下代次，启动前发现代次变了就放弃本次启动。
+    // 直接调用 start()（用户点「启动」）不传 opts，行为与 2026-10-14 版一致。
+    if (opts && typeof opts.expectedStopSeq === 'number' && this._stopSeq !== opts.expectedStopSeq) {
+      this.log('网关：启动已取消（期间收到停止请求）。');
+      this.emit('state');
+      return;
+    }
     this.stopping = false;
     if (this._starting) return this._starting;      // 并发 start/restart 只执行一次
     this._starting = this._doStart();
@@ -947,7 +1047,7 @@ class GatewayManager extends EventEmitter {
         gwEnv.no_proxy = noProxy;
         this.log('网关：NO_PROXY 直连 ' + noProxy);
       }
-      this.log('网关：进程走代理 ' + proxy);
+      this.log('网关：进程走代理 ' + GatewayManager.maskProxyUrl(proxy));
     } else {
       // 显式直连：把**继承来的**代理变量一并清掉，否则"配置写了直连却仍走代理"，
       // 代理一死就是全网关 ECONNREFUSED（含回环自检）。
@@ -966,6 +1066,15 @@ class GatewayManager extends EventEmitter {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: gwEnv,
     });
+    // ⚠ 2026-11-13 复核修：`_appQuitting` 原来只被置真、**从没人复位**（全项目 0 处 `= false`）。
+    // 后果：一次关机/注销通知（或一次 before-quit）之后，只要用户其实没退成 —— 例如
+    //   ① Windows 关机被别的程序 preventDefault 拦下、会话继续；
+    //   ② 用户在托盘点「退出」后又改了主意（主进程仍在）；
+    // 那么此后引擎**每一次真崩溃**都会被归因成「应用正在退出（预期内）」，
+    // 既不记「非预期退出的现场」，也不进 `_scheduleHeal` 的现场记录路径 ——
+    // 又回到"闪退查不出"的老问题上。这里在**新启动一次引擎**时复位：
+    // 能走到 spawn 说明应用活着、并且是主动要把网关跑起来，不属于"正在退出"。
+    this._appQuitting = false;
     const spawned = this.proc;   // 身份快照：restart 期间旧进程迟到的 error/exit 不得改写新状态
     this.running = true;
     // `running` 只表示"子进程对象还在"，不表示"端口真的在监听"。
@@ -1086,6 +1195,7 @@ class GatewayManager extends EventEmitter {
 
   async stop() {
     this.stopping = true;
+    this._stopSeq++;                     // 代次 +1：让排队中的 restart/start 知道"期间被停过"
     // 若一次启动正在飞行，先等它落地：它在每个 await 之后都会复查 stopping 并在 spawn 前退出。
     // 不等的话存在一个窗口——stop() 看到 this.proc 还是 null 就返回"已停止"，
     // 而紧接着 _doStart 完成 spawn，网关又跑起来了（用户点了停止，网关却活着）。
@@ -1093,16 +1203,54 @@ class GatewayManager extends EventEmitter {
       try { await this._starting; } catch (_) { /* 忽略：下面的收尾才是关键 */ }
     }
     const p = this.proc;
-    this.proc = null;
-    this.running = false; this.ready = false; this.failed = false;   // 提前返回路径也要复位，否则界面一直显示"运行中"
-    if (!p || p.exitCode !== null) { this.emit('state'); return; }
+    // ⚠⚠ 不能在杀之前就把 proc 置 null（2026-11-12 审计 H8）。
+    // 旧实现：`const p = this.proc; this.proc = null;` 先清引用，再 taskkill；
+    // 一旦 taskkill 非 0 且 p.kill() 也抛（GDI/句柄异常、进程已僵尸、权限不足），
+    // 下面 catch 全吞 —— 于是 proc=null、running=false，界面显示"已停止"，
+    // 但**子进程还活着占着端口**，而且再调一次 stop() 也够不着它（proc 已经是 null）。
+    // 已用 host2/exp-b-race-orphan.js 场景 2 复现（taskkill status=1 + kill 抛错 →
+    // 子进程 exitCode 仍为 null，taskkill 总次数停在 1）。
+    // 现在：杀成功（或确认已退出）之后才清 proc；失败则保留引用、置 failed、记 error。
+    this.running = false; this.ready = false;
+    if (!p || p.exitCode !== null) {
+      this.proc = null;
+      this.failed = false;
+      this.emit('state');
+      return;
+    }
+    let killed = false;
     try {
       const r = spawnSync('taskkill', ['/pid', String(p.pid), '/T', '/F'], { windowsHide: true });
-      if (r.status !== 0) p.kill();
-    } catch (_) {
-      try { p.kill(); } catch (_) { /* 忽略 */ }
+      // taskkill 退出码 0 就是 Windows 自己给的"已终止"结论，不需要再等 exit 事件
+      //（exit 事件是异步到达的，用它当唯一判据会把成功误判成失败）
+      if (r.status === 0) killed = true;
+    } catch (e) {
+      this.log('网关：taskkill 失败（' + (e && e.message ? e.message : e) + '），改用进程句柄 kill。');
     }
-    this.log('网关已停止。');
+    if (!killed) {
+      try { p.kill(); } catch (e) {
+        this.log('网关：进程句柄 kill 也失败（' + (e && e.message ? e.message : e) + '）。');
+      }
+      // kill() 之后给 OS 一点时间回收，再用 exitCode 复核
+      for (let i = 0; i < 10 && p.exitCode === null; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      if (p.exitCode !== null) killed = true;
+    }
+    if (killed) {
+      // 等一小会儿让 exit 处理器与 OS 把状态落定（不阻塞太久：taskkill /F 通常几十毫秒）
+      for (let i = 0; i < 5 && p.exitCode === null; i++) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      this.proc = null;
+      this.failed = false;
+      this.log('网关已停止。');
+    } else {
+      // 杀不掉：保留引用（下次 stop/killStale 还能再试），并把状态标成失败让界面可见
+      this.proc = p;
+      this.failed = true;
+      this.log('网关：停止失败 —— 进程 ' + p.pid + ' 仍存活（可能被占用/权限不足）。请用任务管理器结束它，或点「重启」重试。');
+    }
     this.emit('state');
   }
 
@@ -1125,9 +1273,12 @@ class GatewayManager extends EventEmitter {
     const p = (async () => {
       try {
         await this.stop();
+        // 记下 stop 之后的代次：如果 killStale/waitPortFree 期间用户又点了停止，
+        // 代次会变，下面的 start 就应该放弃（H7）。
+        const seqAfterStop = this._stopSeq;
         await this.killStaleGatewayProcesses();   // 其他实例/旧版本的残留也会占端口、延续旧熔断状态
         await this.waitPortFree(this.port, 4000);
-        await this.start();
+        await this.start({ expectedStopSeq: seqAfterStop });
       } finally {
         this._restarting = null;
       }

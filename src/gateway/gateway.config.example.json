@@ -1,5 +1,6 @@
 {
   "_说明": [
+    "**首次使用必读（2026-11-12 审计 L4）：本文件不能直接保存。** 根部的 \"apiKey\": \"dsh-gateway-change-me\" 与各家的 \"sk-llm-gatway-xxxxxxxx\" 都是占位值，配置校验会**故意**拦下它们（否则本机任何进程都能白用你的上游额度）。请先把根部的 apiKey 换成自己生成的 Key（设置页有「生成」按钮，形如 lgw-…，≥16 字符），再把要用的供应商填上真实 Key 并 enabled: true。",
     "选路顺序：**先按 priority 升序，同一 priority 内按 providers 数组顺序**（2026-09-17 起 priority 重新参与排序）。",
     "注意：配置页的 ▲▼ 只调整数组顺序，因此**改动只在同一 priority 内生效**；跨优先级调整请直接改 priority 字段。",
     "models 每项：字符串 = 上游 ID 与逻辑名相同；对象 = { id: 上游真实 ID, as: 逻辑名, vision?: true }。",
@@ -129,20 +130,28 @@
       "apiKey": "sk-llm-gatway-xxxxxxxx"
     },
     {
-      "_说明": "AgentRouter：Anthropic 原生协议（protocol: anthropic-messages）+ claude 客户端仿真。",
+      "_说明": "AgentRouter（https://agentrouter.org/）：**按模型声明上游协议**。2026-11-12 实测：这三款 GPT 在 /v1/messages 上一带 tools 就回 400（Function tools with reasoning_effort are not supported … use /v1/responses），在 /v1/chat/completions 上直接回「不支持该接口，请改用 /v1/responses」——**它们只能走 /v1/responses**，故逐模型写 api: \"openai-responses\"。留空会继承供应商级 protocol，那样每次带工具的请求都会先白等 4~6 秒再失败（单候选时整轮请求直接 400）。Anthropic（/v1/messages）那面仍可用，只是不能带 tools，所以不建议作为默认协议；clientProfile: claude 保留（该家对客户端指纹有白名单校验）。",
       "id": "agentrouter",
       "baseURL": "https://agentrouter.org/",
       "priority": 1,
       "enabled": false,
       "models": [
-        "deepseek-v4-flash",
         {
-          "id": "gpt-6-astra",
-          "vision": true
+          "id": "gpt-5.6-sol",
+          "vision": true,
+          "contextWindow": 400000,
+          "maxTokens": 128000,
+          "api": "openai-responses"
         },
         {
-          "id": "claude-opus-5",
-          "vision": true
+          "id": "gpt-6-astra",
+          "vision": true,
+          "api": "openai-responses"
+        },
+        {
+          "id": "gpt-6.1-sol",
+          "vision": true,
+          "api": "openai-responses"
         }
       ],
       "reasoningEffortMap": {

@@ -1208,6 +1208,19 @@ const BREAKER_SHORT_MS = envMs('DSH_GATEWAY_BREAKER_SHORT_MS', 90_000);      // 
                                                 // clash 抖动很常见，5 分钟误伤过大：全家熔断期间请求
                                                 // 全部 404/503，用户以为网关坏了）
 const BREAKER_LONG_MS = envMs('DSH_GATEWAY_BREAKER_LONG_MS', 30 * 60_000);  // 长熔断 30 分钟（401/403 业务拒绝）
+/**
+ * **配置类**失败的冷却时长（2026-11-12 审计 M15）。默认 10 秒。
+ *
+ * 判据见 `isModelWireUnsupported()`：上游明说"这个模型在这条线协议上不收 tools+推理"。
+ * 这不是故障，是配置写错了 —— 用户改完 `api` 字段就该立刻能用。修复前它走故障阶梯
+ * （首档 90 秒），且第 4 次请求会变成 503 说"network/upstream failures; restart the
+ * gateway"，把"你有个字段填错"讲成"网络坏了"。
+ *
+ * 为什么不干脆不冷却：不记的话每条请求都先白打一发（实测 agentrouter 每次白等 4~6 秒，
+ * 且失败请求照样计入上游的异常画像）。10 秒足够挡住"客户端重试风暴"，又不至于让用户
+ * 改完配置还要干等一分半。
+ */
+const CONFIG_CLASS_COOLDOWN_MS = envMs('DSH_GATEWAY_CONFIG_CLASS_COOLDOWN_MS', 10_000);
 // 2026-09-17 优化（实测事故：坏家长期霸占候选首位）：
 //  ① 短熔断按"连续开闸次数"指数退避 90s→3m→6m→12m→24m→…（封顶见 BACKOFF_MAX）。
 //     旧实现固定 90 秒：windhub 当天被放了 28 次探测、x666 12 次，每次都在用户请求路径上白等。
@@ -1644,8 +1657,21 @@ function providerBreakerRecordFail(providerId, httpStatus, serverRetryMs, timedO
   breaker.set(providerId, b);
 }
 
-/** 模型级记录（规则 2/3）：连续 N 次 → **只**冷却该模型，首档短冷却、反复开闸按指数退避到配置上限。 */
-function modelBreakerRecordFail(providerId, model, key, httpStatus, serverRetryMs, timedOutByUs) {
+/** 模型级记录（规则 2/3）：连续 N 次 → **只**冷却该模型，首档短冷却、反复开闸按指数退避到配置上限。
+ *
+ * `opts.configClass`（2026-11-12 审计 M15）：这次失败是**配置类**（例如该模型在这条线协议上
+ * 不接受 tools+推理，上游回 400 并在措辞里给了答案）。这类错误的性质与"网络抖动/上游 5xx"
+ * 完全不同：
+ *   · 它**不会自己好**，要用户改配置；所以仍然要记、要冷却，否则每条请求都先白打一发
+ *     （实测 agentrouter 每次白等 4~6 秒）；
+ *   · 但它**不是故障**，冷却不该按 90 秒起跳的故障阶梯走 —— 用户改完配置后最多等 10 秒
+ *     就能恢复，而不是 90 秒起步、越修越久；
+ *   · 更要紧的是**文案**：修复前第 4 次请求变成 503 并说"network/upstream failures; restart
+ *     the gateway"，把"你有一个字段填错了"讲成了"网络坏了"，用户根本不会去改配置。
+ * 所以这一档用固定短冷却，并在条目上打 `configClass` + `configHint`，让 503 文案能把
+ * 真正的原因带出来。 */
+function modelBreakerRecordFail(providerId, model, key, httpStatus, serverRetryMs, timedOutByUs, opts) {
+  const configClass = !!(opts && opts.configClass);
   const b = modelBreaker.get(key) || { state: 'closed', fails: 0, openUntil: 0, opens: 0 };
   b.fails += 1;
   if (!httpStatus) b.lastNetFailAt = Date.now();
@@ -1670,12 +1696,25 @@ function modelBreakerRecordFail(providerId, model, key, httpStatus, serverRetryM
       MODEL_BREAKER_COOLDOWN_MS,
     );
     let ms = ladder;
-    if (serverRetryMs > 0) ms = Math.max(ms, Math.min(serverRetryMs, MODEL_BREAKER_COOLDOWN_MS));
+    // 配置类：固定短冷却，不走故障阶梯，也不理会上游给的 Retry-After
+    //（那句 "retry in a moment" 是上游对故障的模板话术，对"字段填错"没有意义）。
+    if (configClass) ms = CONFIG_CLASS_COOLDOWN_MS;
+    else if (serverRetryMs > 0) ms = Math.max(ms, Math.min(serverRetryMs, MODEL_BREAKER_COOLDOWN_MS));
     b.state = 'open';
     b.openUntil = Date.now() + ms;
+    if (configClass) {
+      b.configClass = true;
+      b.configHint = String((opts && opts.configHint) || '').slice(0, 200);
+    } else {
+      delete b.configClass;
+      delete b.configHint;
+    }
     log(`breaker OPEN: ${providerId}[${model}] 失败（${httpStatus || (timedOutByUs ? 'timeout' : 'network')}），`
       + `**仅该模型**冷却 ${fmtMs(ms)}（连续 ${b.fails} 次失败；第 ${b.opens} 次开闸`
-      + `${b.opens > 1 ? '，退避递增' : ''}；规则：${MODEL_BREAKER_THRESHOLD} 次 → 上限 ${fmtMs(MODEL_BREAKER_COOLDOWN_MS)}。`
+      + `${b.opens > 1 && !configClass ? '，退避递增' : ''}；`
+      + (configClass
+        ? `**配置类**：改好配置后最多等 ${fmtMs(CONFIG_CLASS_COOLDOWN_MS)} 即可重试，不用重启网关。`
+        : `规则：${MODEL_BREAKER_THRESHOLD} 次 → 上限 ${fmtMs(MODEL_BREAKER_COOLDOWN_MS)}。`)
       + `该家其它模型不受影响）`);
     noteModelCooled(providerId, model);   // 护栏：多模型相继冷却 → 升级为整家
   }
@@ -1721,13 +1760,13 @@ function noteModelCooled(providerId, model) {
  *   （实测：commandcode 退役 ling 免费档，把同家 deepseek/glm 一起停了）。
  *   不传时行为与旧版完全一致（403 仍按整家处理），保证既有调用点语义不变。
  */
-function breakerRecordFail(providerId, httpStatus, serverRetryMs, timedOutByUs, model, detail) {
+function breakerRecordFail(providerId, httpStatus, serverRetryMs, timedOutByUs, model, detail, opts) {
   if (isProviderWideFailure(httpStatus, timedOutByUs)) {
     // 例外：403 但属于"该模型被下架/退役" → 降级为**模型级**冷却，不连坐整家。
     if (httpStatus === 403 && model && isModelRetired403(detail)) {
       const key = modelBreakerKey(providerId, model);
       if (key) {
-        modelBreakerRecordFail(providerId, model, key, httpStatus, serverRetryMs, timedOutByUs);
+        modelBreakerRecordFail(providerId, model, key, httpStatus, serverRetryMs, timedOutByUs, opts);
         return;
       }
     }
@@ -1735,7 +1774,7 @@ function breakerRecordFail(providerId, httpStatus, serverRetryMs, timedOutByUs, 
     return;
   }
   const key = modelBreakerKey(providerId, model);
-  if (key) { modelBreakerRecordFail(providerId, model, key, httpStatus, serverRetryMs, timedOutByUs); return; }
+  if (key) { modelBreakerRecordFail(providerId, model, key, httpStatus, serverRetryMs, timedOutByUs, opts); return; }
   // 拿到了"模型级失败"却没有模型信息 → 不能凭空放过，退回供应商级（宁可比规则更保守）
   providerBreakerRecordFail(providerId, httpStatus, serverRetryMs, timedOutByUs);
 }
@@ -2024,11 +2063,42 @@ function rotateOutlet(provider, reason) {
   }
   outletCursor = next;
   syncOutletEnv();
-  const short = (u) => String(u).replace(/^https?:\/\//, '');
+  // ⚠ 日志同样要脱敏（H4 的第二个出口）：这行会进 gateway.log，而日志是给人看、
+  //   会被贴进 issue 的。`short` 先 maskOutletUrl 再剥 scheme。
+  const short = (u) => maskOutletUrl(u).replace(/^https?:\/\//, '');
   log(`[egress] ${provider && provider.id ? provider.id + ' ' : ''}出口失败（${String(reason || '').slice(0, 60)}）`
     + ` → 轮换：${short(failed) || '(直连)'}（冷却 ${Math.round(outletCooldownMs / 60_000)} 分钟）`
     + ` → 现在用 ${short(activeOutletUrl()) || '(直连)'}`);
   return true;
+}
+
+/**
+ * 把带 userinfo 的出站 URL 抹成 `scheme://***@host:port`（2026-11-12 审计 H4）。
+ *
+ * `/health` 是**免鉴权**的（watchdog 自检要用，不能加鉴权），所以任何进 /health 的
+ * 字符串都必须先脱敏。`proxyStatus()` 早就这么做了，但 `outletStatus()` 忘了 ——
+ * 实测：配 `proxy.url = http://user:SuperSecret123@127.0.0.1:7890` 时，
+ * `/health.proxy.url` 是 `http://***@…`（已掩），而 `/health.egress.active` 是
+ * **明文 `SuperSecret123`**。本机任意进程读一次 /health 就拿到代理口令。
+ *
+ * 日志侧同样需要：rotateOutlet 的 `[egress] … 轮换：…` 行也会把带口令的 URL 写进
+ * gateway.log，而 flash 会把日志给人看 / 贴出来排障。
+ */
+function maskOutletUrl(u) {
+  const s = String(u || '');
+  if (!s) return '';
+  try {
+    const parsed = new URL(s);
+    if (parsed.username || parsed.password) {
+      parsed.username = parsed.username ? '***' : '';
+      parsed.password = '';
+      return parsed.toString().replace(/\/$/, '');
+    }
+    return s;
+  } catch {
+    // 解析不了就退化成"只保留 scheme://host 之后的部分"，宁可少显示也不要漏口令
+    return s.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/]*@/i, '$1***@');
+  }
 }
 
 /** /health 与日志用的出口状态快照。 */
@@ -2036,10 +2106,11 @@ function outletStatus() {
   const now = Date.now();
   return {
     count: outletList.length,
-    active: activeOutletUrl() || null,
+    // ⚠ 对外只给脱敏后的 URL（见 maskOutletUrl）。调度仍用 outletList 原始值。
+    active: activeOutletUrl() ? maskOutletUrl(activeOutletUrl()) : null,
     cooling: outletList
       .filter((u) => (outletCooldown.get(u) || 0) > now)
-      .map((u) => ({ url: u, remainMs: (outletCooldown.get(u) || 0) - now })),
+      .map((u) => ({ url: maskOutletUrl(u), remainMs: (outletCooldown.get(u) || 0) - now })),
   };
 }
 
@@ -2090,6 +2161,45 @@ function breakerCooldownSecs(providers, model) {
     return Math.max(providerMs, modelMs);
   }));
   return Math.max(1, Math.ceil((until || BREAKER_SHORT_MS) / 1000));
+}
+
+/**
+ * 这个模型是不是"因为配置写错"被冷却的？是就返回那条可执行提示（2026-11-12 审计 M15）。
+ *
+ * 为什么值得单独做：修复前三处「该模型不支持这条线协议」的分支记完模型级失败后，第 4 次请求
+ * 变成一句 `all providers for model "x" are temporarily in breaker cooldown (network/upstream
+ * failures); retry in ~90s or restart the gateway` —— 用户明明只是把 `api` 字段写错了，
+ * 却被网关告知"网络/上游故障，重启试试"。他照着重启、照着等 90 秒，然后拿到一模一样的 503，
+ * 只会判定"这网关坏了"。这条 400 本来是**唯一**把答案送到他手上的机会。
+ *
+ * 现在：冷却条目上带着 `configClass/configHint`（见 `modelBreakerRecordFail`），503 文案
+ * 优先说这条，把"改哪里"直接讲出来，并告诉用户改完 10 秒就能用、不用重启。
+ */
+function configClassHintFor(providers, model) {
+  const list = (Array.isArray(providers) ? providers : []).filter((p) => p && p.id);
+  for (const p of list) {
+    const key = modelBreakerKey(p.id, model);
+    if (!key) continue;
+    const b = modelBreaker.get(key);
+    if (!b || !b.configClass) continue;
+    if (!slotIsOpen(b)) continue;
+    return String(b.configHint || '').trim();
+  }
+  return '';
+}
+
+/**
+ * 构造"全部候选都在熔断中"这句话。配置类冷却优先讲配置（M15），否则按原样讲故障。
+ * 两处文案（chat/completions 与 messages）共用，避免只改一边。
+ */
+function breakerAllMessage(providers, model) {
+  const hint = configClassHintFor(providers, model);
+  if (hint) {
+    return `model "${model}" is unavailable because its configuration is wrong: ${hint}`
+      + `（这是配置问题，不是网络故障 —— 改好供应商设置后最多 10 秒即可重试，不用重启网关）`;
+  }
+  return `all providers for model "${model}" are temporarily in breaker cooldown (network/upstream failures);`
+    + ` retry in ~${breakerCooldownSecs(providers, model)}s or restart the gateway`;
 }
 
 /**
@@ -3343,7 +3453,21 @@ function providerAccounts(provider) {
     const keys = apiKeysOf(provider);
     if (keys.length) return keys.map((k, i) => ({ id: 'key' + (i + 1), authFile: '', apiKey: k }));
     // auth=workbuddy 但没写 accounts → 视为"自动发现本机凭据"的单个账户（开箱即用）
-    return isWorkBuddy ? [{ id: 'auto', authFile: '', apiKey: '' }] : [];
+    //
+    // ⚠ 2026-11-12 审计 M2：这里曾把顶层 `apiKey` 直接丢掉，只造一个空凭据的 auto 账户，
+    //   于是 `{ auth:'workbuddy', apiKey:'sk-xxx' }` 这种写法（文档/示例/测试里都出现过）
+    //   在**没有登录 WorkBuddy 桌面 App 的机器上**必然 503：
+    //   resolveWorkBuddyCredential 只看 acct.apiKey / acct.authFile，两条都空 → 抛
+    //   "未找到 WorkBuddy 登录凭据"。同一份配置在有登录的机器上又能跑 —— 这种
+    //   "只在某些机器上失败"的配置语义陷阱最难查（真实影响：tests/gateway.test.js
+    //   的 3 条用例在干净 HOME 下红、在本机绿）。
+    //   修法：仍然只造**一个** auto 账户（保持账户数、熔断归属、半开探测行为完全不变，
+    //   这正是 2026-10-17 回退的原因），只是把它本来就该用的凭据填进去。
+    if (isWorkBuddy) {
+      const inline = String(provider.apiKey || '').trim();
+      return [{ id: 'auto', authFile: '', apiKey: inline }];
+    }
+    return [];
   }
   const out = [];
   raw.forEach((a, i) => {
@@ -3668,6 +3792,47 @@ function accountPoolSnapshot(cfg) {
   }
   return out.concat(modelScoped);
 }
+
+/**
+ * 模型级熔断的快照（2026-11-12 审计 M4）。
+ *
+ * 为什么单独加：上面 `accountPoolSnapshot` 只覆盖**账户级/供应商级**冷却，完全没有
+ * 模型级（实测：单 Key 家连续 3 次 500 → 日志明写 `breaker OPEN: p1[m1] … **仅该模型**冷却 2 分钟`、
+ * 路由明写 `[route] m1: 候选全部熔断`，而 `/health.accounts` 里那一行始终是 `state:"ok"`）。
+ * 后果是界面/诊断看不到"这个模型为什么全不通"，用户只拿到一句 503 "temporarily in breaker
+ * cooldown (network/upstream failures)" —— 而它可能根本不是网络问题。
+ *
+ * ⚠ 这里只**读**，不做清理：`trimModelBreaker()` 只在写表路径调用（读路径零副作用是本文件
+ *   的既定契约）。/health 是免鉴权的，所以：
+ *     · 只列"当前确实在冷却"的条目（`slotIsOpen` 为真），已过期的不出现；
+ *     · `reason` 走 `maskSecrets`（与 accountPoolSnapshot 同口径）；
+ *     · 条目数上界 50，按剩余冷却时间降序 —— 免鉴权接口不能被 model 键撑爆
+ *       （model 是客户端可控字段，见 MODEL_BREAKER_MAX 那段注释）。
+ */
+function modelBreakerSnapshot(limit) {
+  const cap = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 50;
+  const now = Date.now();
+  const rows = [];
+  for (const [k, b] of modelBreaker) {
+    if (!b || !slotIsOpen(b)) continue;
+    const sep = k.indexOf(MODEL_BREAKER_SEP);
+    if (sep <= 0) continue;
+    rows.push({
+      provider: k.slice(0, sep),
+      model: k.slice(sep + MODEL_BREAKER_SEP.length),
+      state: b.state,
+      remainMs: Math.max(0, Number(b.openUntil || 0) - now),
+      opens: b.opens || 0,
+      fails: b.fails || 0,
+      ...(b.reason ? { reason: maskSecrets(String(b.reason)).replace(/\s+/g, ' ').slice(0, 120) } : {}),
+      modelScoped: true,
+    });
+  }
+  rows.sort((a, b) => b.remainMs - a.remainMs);
+  if (rows.length > cap) rows.length = cap;
+  return rows;
+}
+
 
 /**
  * 取该供应商本次要用的账户（轮询）。
@@ -6923,14 +7088,64 @@ function isEndpointMismatchByProvider(status, detail) {
  */
 const MODEL_NOT_ON_ENDPOINT_RE = /is\s+not\s+supported\s+on\s+this\s+endpoint|not\s+available\s+on\s+this\s+endpoint|is\s+not\s+supported\s+(?:at|by)\s+this\s+(?:endpoint|route)|use\s+\S+\s+for\s+/i;
 
+/**
+ * 「这个模型**不能用这条线协议**」—— 与"模型不在这个端点上"（baseURL 指错路由）是两回事：
+ * 前者要改的是**逐模型的 `api` 字段**，后者要改的是 baseURL。
+ *
+ * 2026-11-12 实测事故（用户报 agentrouter 调用报错）：
+ *   `400 {"error":{"message":"Function tools with reasoning_effort are not supported for
+ *    gpt-6-astra in /v1/chat/completions. To use function tools, use /v1/responses or set
+ *    reasoning_effort to 'none'."}}`
+ * 触发面很宽：agentrouter 的 `/v1/messages` 收到带 tools 的请求后，**内部**转成
+ * `/v1/chat/completions` 并自己塞 reasoning_effort —— 于是客户端明明没要推理，一样 400。
+ * 实测该家三款 GPT（gpt-5.6-sol / gpt-6-astra / gpt-6.1-sol）在 `/v1/messages` 上
+ * **只要带 tools 就必然 400**，不带 tools 才 200；同一个模型改走 `/v1/responses` 全通
+ *（含流式、thinking、tool_use→tool_result 回传）。
+ *
+ * 旧实现在这里**全部判据都不命中**（`MODEL_MISSING_RE` 要求 "not supported" 前面 60 字符内
+ * 出现 model，而这里是 "Function tools with reasoning_effort"），于是掉进
+ * 「确定性 4xx → 记为候选失败继续 failover」—— 行为上没错，但日志只说"确定性 4xx"，
+ * 用户完全看不出"该把这家这几个模型的 `api` 改成 openai-responses"。
+ */
+const MODEL_WIRE_UNSUPPORTED_RE = /does\s+not\s+support\s+function\s+tools|function\s+tools\s+(?:are|is)\s+not\s+supported|tools\s+(?:are|is)\s+not\s+supported\s+(?:with|for|in)\s+\S*reasoning|reasoning_effort\s+is\s+not\s+supported|use\s+\/v1\/responses\s+or\s+set\s+reasoning_effort|use\s+\/v1\/responses\s+instead/i;
+
+function isModelWireUnsupported(detail) {
+  return MODEL_WIRE_UNSUPPORTED_RE.test(String(detail || ''));
+}
+
 function isModelNotOnThisEndpoint(detail) {
   return MODEL_NOT_ON_ENDPOINT_RE.test(String(detail || ''));
 }
 
-/** 从这类错误体里抠出上游建议的路径，好让用户能直接照着改 baseURL。 */
+/**
+ * 从这类错误体里抠出上游建议的路径。
+ *
+ * ⚠ 抠出来的是 **URL 路径**（`/v1/responses`），不是本程序配置里该填的枚举值
+ * （`openai-responses`）。两者不是一回事，2026-11-12 审计 M5 就是这条：
+ * 日志与客户端文案把 `wireHint` 说成"把该模型的「上游协议」改成 /v1/responses"，
+ * 而 `gateway-manager.js:validateConfigText` 的 protocol 白名单**不接受** `/v1/responses`
+ * （实测 `protocol:'/v1/responses'` → 保存被拒："供应商 p1 的 protocol 非法"）。
+ * 用户照着提示改，改完保存不上，只会更困惑。
+ *
+ * 所以拆成两个口径：
+ *   · `suggestedEndpointHint` → 上游说的 URL 路径，仅用于**日志/诊断**里描述"上游要什么"；
+ *   · `wireHintApiValue`       → 落到**配置字段里该填的枚举值**，用于给用户的行动建议。
+ */
 function suggestedEndpointHint(detail) {
   const m = /use\s+(\/[^\s"'\\]+)/i.exec(String(detail || ''));
   return m ? m[1] : '';
+}
+
+/**
+ * 把上游建议的 URL 路径翻成本程序配置里合法的 `api` 枚举值。
+ * 对应关系与 `wireOfName` / `validateConfigText` 的白名单一致。
+ * 认不出就回 `openai-responses`（这类报文全部指向"用 responses 端点"）。
+ */
+function wireHintApiValue(detail) {
+  const p = suggestedEndpointHint(detail).toLowerCase();
+  if (p.indexOf('/messages') === 0 || p.indexOf('/v1/messages') === 0) return 'anthropic-messages';
+  if (p.indexOf('/chat/completions') >= 0 || p.indexOf('/completions') === 0) return 'openai-chat';
+  return 'openai-responses';
 }
 
 /**
@@ -7554,9 +7769,17 @@ function withThinkingPlaceholders(body) {
  * @param {object} [info] {budgetExhausted, tried, total, budgetMs}
  */
 function stopFailoverMessage(providerId, model, upstreamStatus, info) {
-  const hint = upstreamStatus === 404
-    ? 'the provider does not offer this model'
-    : 'the request itself may be invalid (parameters / size / context length) — check the gateway log for the upstream detail';
+  // wireUnsupported（2026-11-12，agentrouter 事故）：上游明说"这个模型在这条线协议上不收
+  // tools+推理"。这句话若被翻译成"你的请求参数可能有问题"，用户会去翻自己的请求体 ——
+  // 而真正的处置是**改供应商配置里该模型的「上游协议」**。措辞必须指过去。
+  const wireHint = info && info.wireUnsupported ? String(info.wireHint || 'openai-responses') : '';
+  const hint = wireHint
+    ? `this provider does not accept tools + reasoning on the current endpoint for this model — `
+      + `set this model's upstream protocol to ${wireHint} in the provider settings `
+      + `(or disable reasoning), then retry`
+    : upstreamStatus === 404
+      ? 'the provider does not offer this model'
+      : 'the request itself may be invalid (parameters / size / context length) — check the gateway log for the upstream detail';
   const bits = [`upstream provider "${providerId}" rejected model "${model}" with HTTP ${upstreamStatus}`, hint];
   if (info && info.budgetExhausted) {
     const secs = Math.round(Number(info.budgetMs || 0) / 1000);
@@ -8392,6 +8615,34 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         breakerRecordFail(provider.id, upstream.status, 0, false, bModel);
         return rawMode ? { retryable: upstream.status } : false;
       }
+      if (isModelWireUnsupported(detail)) {
+        // 上游明说"这个模型**在这条线协议上**不支持带 tools"（agentrouter 三款 GPT 实测）。
+        // 处置与"模型不在这个端点上"同构：请求本身没问题，继续 failover、不熔断该家，
+        // 但**必须在日志里说清怎么改** —— 这条 400 的措辞里 already 带着答案，
+        // 旧实现只打一句"确定性 4xx"，用户根本不知道该动 `api` 字段。
+        const hint = suggestedEndpointHint(detail);
+        // ⚠ 给用户看的是**配置里该填的枚举值**，不是上游说的 URL 路径（审计 M5，见 wireHintApiValue）
+        const apiValue = wireHintApiValue(detail);
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"该模型不支持这条线协议"（请求本身没问题：`
+          + `上游/该家把 tools 与 reasoning 一起发给了一个不收的端点）→ 继续 failover（不熔断该家、不冷却账户）；`
+          + `**请在供应商设置里把该模型的「上游协议」(api) 改成 ${apiValue}`
+          + (hint ? `（上游原话提到的路径是 ${hint}，但这里要填的是枚举值 ${apiValue}）` : '')
+          + `**，或退一步把 reasoning 关掉（reasoning_effort: 'none'）`);
+        if (opts.failureSink) opts.failureSink.modelScopeOnly = true;
+        breakerReleaseSlot(provider.id, bModel);
+        // 记一次模型级失败：线协议声明错是**持续**状态，不记的话每条请求都先白打一发
+        //（实测 agentrouter 每次白等 4~6 秒再 failover）。
+        // configClass：这是配置写错、不是故障 —— 用 10 秒固定短冷却，并让 503 文案能说清原因（M15）。
+        breakerRecordFail(provider.id, upstream.status, 0, false, bModel, detail, {
+          configClass: true,
+          configHint: `该模型在这条线协议上不接受 tools + reasoning，请把该模型的「上游协议」(api) 改成 ${apiValue}`,
+        });
+        // wireHint 带出去：单候选 / 全部候选都失败时，客户端看到的是最后这条确定性 4xx，
+        // 那里必须同样说清"该把上游协议改成什么"，否则用户只拿到一句 upstream HTTP 400。
+        return rawMode ? { retryable: upstream.status } : { deterministic4xx: {
+          status: upstream.status, upstreamStatus: upstream.status, wireUnsupported: true, wireHint: apiValue,
+        } };
+      }
       if (isEndpointMismatchByProvider(upstream.status, detail)) {
         const hint = suggestedEndpointHint(detail);
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"模型不在这个端点上"（请求本身没问题，`
@@ -8689,6 +8940,33 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
           + ' → 继续 failover（不熔断该家、不冷却账户）');
         breakerRecordSuccess(provider.id, bModel);
         return rawMode ? { retryable: upstream.status } : false;
+      }
+      // 「该模型不支持这条线协议」（2026-11-12，agentrouter 三款 GPT 实测）。
+      //
+      // ⚠ 这一支必须**也**落在通用 4xx 段，不能只写在上面的 `opts.accountScoped` 块里。
+      //   实测（tests/gateway.test.js 的 agentrouter 用例）：/v1/chat/completions 直通时
+      //   `accountScoped` 为 false，那条分支根本不会被评估，请求直接落到下面的
+      //   「确定性 4xx → 记为候选失败」，用户只看到一句 400 —— 与本次要修的问题一模一样。
+      //   两条路径（账户池 / 非账户池）都得给同一句可执行的提示，否则修了这条漏那条。
+      if (isModelWireUnsupported(detail)) {
+        const hint = suggestedEndpointHint(detail);
+        // ⚠ 给用户看的是**配置里该填的枚举值**，不是上游说的 URL 路径（审计 M5）
+        const apiValue = wireHintApiValue(detail);
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"该模型不支持这条线协议"（请求本身没问题：`
+          + `上游/该家把 tools 与 reasoning 一起发给了一个不收的端点）→ 继续 failover（不熔断该家、不冷却账户）；`
+          + `**请在供应商设置里把该模型的「上游协议」(api) 改成 ${apiValue}`
+          + (hint ? `（上游原话提到的路径是 ${hint}，但这里要填的是枚举值 ${apiValue}）` : '')
+          + `**，或退一步把 reasoning 关掉（reasoning_effort: 'none'）`);
+        if (opts && opts.failureSink) opts.failureSink.modelScopeOnly = true;
+        breakerReleaseSlot(provider.id, bModel);
+        // configClass：配置写错、不是故障 —— 10 秒固定短冷却 + 503 文案带原因（审计 M15）
+        breakerRecordFail(provider.id, upstream.status, 0, false, bModel, detail, {
+          configClass: true,
+          configHint: `该模型在这条线协议上不接受 tools + reasoning，请把该模型的「上游协议」(api) 改成 ${apiValue}`,
+        });
+        return rawMode ? { retryable: upstream.status } : { deterministic4xx: {
+          status: upstream.status, upstreamStatus: upstream.status, wireUnsupported: true, wireHint: apiValue,
+        } };
       }
       const status = DETERMINISTIC_4XX_STATUS[upstream.status] || 400;
       // ⚠ rawMode（Responses 子资源路由：GET/DELETE/cancel）保持**原语义**不变：
@@ -12038,6 +12316,29 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         breakerReleaseSlot(provider.id, bModel);
         return false;
       }
+      // 「该模型不支持这条线协议」（2026-11-12）—— 与 forward() 里那条同源分支。
+      // 这条路是 Anthropic 客户端 → OpenAI 上游，**DSH 走得最多的那条**，
+      // 也是 agentrouter 报错时最常经过的一条（/v1/messages 被翻译成 /v1/chat/completions）。
+      // 不给这条分支的话，用户拿到的是「确定性 4xx」，而那 400 的措辞里本来已经写好了答案。
+      if (isModelWireUnsupported(lastDetail)) {
+        const hint = suggestedEndpointHint(lastDetail);
+        // ⚠ 给用户看的是**配置里该填的枚举值**，不是上游说的 URL 路径（审计 M5）
+        const apiValue = wireHintApiValue(lastDetail);
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"该模型不支持这条线协议"（请求本身没问题：`
+          + `上游/该家把 tools 与 reasoning 一起发给了一个不收的端点）→ 继续 failover（不熔断该家、不冷却账户）；`
+          + `**请在供应商设置里把该模型的「上游协议」(api) 改成 ${apiValue}`
+          + (hint ? `（上游原话提到的路径是 ${hint}，但这里要填的是枚举值 ${apiValue}）` : '')
+          + `**，或退一步把 reasoning 关掉（reasoning_effort: 'none'）`);
+        breakerReleaseSlot(provider.id, bModel);
+        // configClass：配置写错、不是故障 —— 10 秒固定短冷却 + 503 文案带原因（审计 M15）
+        breakerRecordFail(provider.id, upstream.status, 0, false, bModel, lastDetail, {
+          configClass: true,
+          configHint: `该模型在这条线协议上不接受 tools + reasoning，请把该模型的「上游协议」(api) 改成 ${apiValue}`,
+        });
+        return { deterministic4xx: {
+          status: upstream.status, upstreamStatus: upstream.status, wireUnsupported: true, wireHint: apiValue,
+        } };
+      }
       const status = DETERMINISTIC_4XX_STATUS[upstream.status] || 400;
       log(`upstream ${provider.id} 确定性 4xx HTTP ${upstream.status} → 记为候选失败，**继续 failover**（回 ${status}，不回显上游原文）`);
       // 2026-10-15（用户明确要求）：与直通路径同一处修正 —— **不再终止 failover**。
@@ -12421,7 +12722,7 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
       // 全部候选都熔断中（catalog 因熔断未探测 → 归属无法判定）：暂时状态 → 503 + 重试提示（R20）
       log(`[route] ${model}: 全部候选熔断，归属无法判定（${reasonsText}）`);
       logCall('breaker-all', 'fail');
-      return json(res, 503, { error: { message: `all providers for model "${model}" are temporarily in breaker cooldown (network/upstream failures); retry in ~${breakerCooldownSecs(candidates, model)}s or restart the gateway` } });
+      return json(res, 503, { error: { message: breakerAllMessage(candidates, model) } });
     }
     if (eligible.length === 0) {
       // 没有任何候选承载该模型：catalog 未收录 / models 列表不含 → 404 + 排查提示
@@ -12436,7 +12737,7 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
     // 候选存在但全部处于熔断冷却：暂时状态 → 503 + 重试提示（R20）
     log(`[route] ${model}: 候选全部熔断（${reasonsText}）`);
     logCall('breaker-all', 'fail');
-    return json(res, 503, { error: { message: `all providers for model "${model}" are temporarily in breaker cooldown (network/upstream failures); retry in ~${breakerCooldownSecs(eligible, model)}s or restart the gateway` } });
+    return json(res, 503, { error: { message: breakerAllMessage(eligible, model) } });
   }
 
   // 路由模式（S1）：
@@ -12659,6 +12960,8 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
       error: {
         message: stopFailoverMessage(lastDeterministic4xx.providerId, model, lastDeterministic4xx.upstreamStatus, {
           budgetExhausted, tried: triedCount, total: tryOrder.length, budgetMs,
+          wireUnsupported: lastDeterministic4xx.wireUnsupported,
+          wireHint: lastDeterministic4xx.wireHint,
         }),
       },
     });
@@ -12891,7 +13194,7 @@ async function handleMessages(cfg, req, res, body) {
       // 全部候选都熔断中（catalog 因熔断未探测 → 归属无法判定）：暂时状态 → 503（R20），不再误报 404
       log(`[route] ${model}: 全部候选熔断，归属无法判定（${reasonsText}）`);
       logCall('breaker-all', 'fail');
-      return json(res, 503, { type: 'error', error: { type: 'api_error', message: `all providers for model "${model}" are temporarily in breaker cooldown; retry in ~${breakerCooldownSecs(candidates, model)}s or restart the gateway` } });
+      return json(res, 503, { type: 'error', error: { type: 'api_error', message: breakerAllMessage(candidates, model) } });
     }
     if (eligible.length === 0) {
       // catalog 未收录且 models 列表不含 → 404 + 排查提示（只回网关自身的判定码，不回显上游内容）
@@ -12906,7 +13209,7 @@ async function handleMessages(cfg, req, res, body) {
     // 候选存在但全部处于熔断冷却：暂时状态 → 503（R20）
     log(`[route] ${model}: 候选全部熔断（${reasonsText}）`);
     logCall('breaker-all', 'fail');
-    return json(res, 503, { type: 'error', error: { type: 'api_error', message: `all providers for model "${model}" are temporarily in breaker cooldown; retry in ~${breakerCooldownSecs(eligible, model)}s or restart the gateway` } });
+    return json(res, 503, { type: 'error', error: { type: 'api_error', message: breakerAllMessage(eligible, model) } });
   }
 
   let tryOrder = ordered;
@@ -13073,6 +13376,8 @@ async function handleMessages(cfg, req, res, body) {
       type: lastDeterministic4xx.status >= 500 ? 'api_error' : 'invalid_request_error',
       message: stopFailoverMessage(lastDeterministic4xx.providerId, model, lastDeterministic4xx.upstreamStatus, {
         budgetExhausted, tried: triedCount, total: tryOrder.length, budgetMs,
+        wireUnsupported: lastDeterministic4xx.wireUnsupported,
+        wireHint: lastDeterministic4xx.wireHint,
       }),
     } });
   }
@@ -13358,6 +13663,10 @@ async function routeRequest(cfg, req, res) {
       json(res, 200, {
         ok: true,
         accounts: accountPoolSnapshot(cfg),
+        // 模型级熔断（2026-11-12 审计 M4）：账户池那一段只覆盖账户级/供应商级，
+        // 模型级冷却此前在 /health 完全不可见 —— 于是"某模型全不通"在界面上
+        // 看起来像"一切正常但请求 503"。这里只读、只列当前真在冷却的条目。
+        modelBreaker: modelBreakerSnapshot(50),
         proxy: proxyStatus(),
         egress: outletStatus(),
         guards: {
@@ -14036,6 +14345,31 @@ if (process.argv.includes('--write-dsh')) {
   if (logFromArg) LOG_PATH = logFromArg;
   const cfg = loadConfig();
   if (cfg) startServer(cfg);
+  else {
+    // ⚠⚠ 配置读不出来时**必须**以非 0 退出（2026-11-12 审计 M13）。
+    //
+    // 旧实现是 `if (cfg) startServer(cfg);` 就完事 —— 没有 else。于是配置里少一个逗号时：
+    // loadConfig 记一条 log 后 return null，startServer 从未调用，**事件循环里没有任何
+    // 句柄** → 进程"自然结束"，Node 以 **exit code 0** 退出。
+    //
+    // 后果链（已用真实引擎复现）：
+    //   宿主看到 exit 0 → describeExitCode(0) = "正常退出（exit 0）"，
+    //   但 _appQuitting/stopping 都是 false → 归因写 "触发方=**非预期**"
+    //   → 同一行里既说"正常"又说"非预期"；然后 self-heal 每 3 秒重拉一次，
+    //   10 分钟内满 5 次放弃。用户看到的是"网关自己不停重启/闪退"，
+    //   而日志里**没有任何错误**（只有一行 config parse error），也没有 crash dump。
+    //   这正是历史"闪退查不出根因"的一条真实来源。
+    //
+    // 现在：明确以 exit 2 退出（宿主侧 describeExitCode 已把 2 映射为
+    // "命令行/配置错误（引擎的 exit 2）"），并且不再让宿主进入"看起来是正常退出"的歧义。
+    //
+    // 注意 stderr 也写一遍：宿主把引擎的 stderr 收进 app.log 的 pushLog，
+    // 这一行会直接出现在界面的日志页里，用户能立刻看到"配置文件坏了"。
+    const msg = '配置无法加载（--config ' + CONFIG_PATH + '）→ 拒绝以"空配置"启动，进程退出码 2。';
+    try { log(msg); } catch (_) { /* 日志本身失败也要退出 */ }
+    try { console.error('[gateway] ' + msg); } catch (_) { /* 忽略 */ }
+    process.exit(2);
+  }
 }
 
 // 来源：dsh-desktop-github/gateway/model-gateway.mjs（DSH 桌面助手模型网关，随本应用原样分发）
